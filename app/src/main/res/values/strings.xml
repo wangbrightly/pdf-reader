@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PDF 阅读器</string>
+    <string name="open_pdf">打开 PDF</string>
+    <string name="loading">正在处理，请稍候…</string>
+    <string name="pick_file_error">无法打开所选文件</string>
 </resources>
