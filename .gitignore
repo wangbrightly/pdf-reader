@@ -1,0 +1,19 @@
+# 本机 SDK 路径
+local.properties
+
+# 构建产物
+build/
+.gradle/
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+
+# 密钥
+*.jks
+*.keystore
+
+# macOS
+.DS_Store
