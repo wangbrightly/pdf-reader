@@ -19,6 +19,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.os.BundleCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import app.pdfreader.extract.ExtractedImage
@@ -156,6 +157,27 @@ import kotlin.concurrent.thread
  * 完全一样（都是"算出目标 Y 坐标再滚动"，唯一区别是 `smoothScrollTo` 内部自带动画），
  * 但平滑滚动能让用户感知到"页面往哪个方向跳了多远"，瞬间跳转容易让人一下子迷失在
  * 陌生的位置，体验明显更好，值得选。
+ *
+ * ## 配置变化（转屏等）重建后恢复文档（2026-08-19 增量，code review 发现的缺口）
+ *
+ * `MainActivity` 没有 `android:configChanges`，配置变化（转屏、系统字体大小变化等）
+ * 会触发完整的 Activity 销毁重建——如果什么都不做，[currentContent] 这些实例字段
+ * 全部清零，用户正在读的书直接消失，回到"还没打开任何文档"的初始画面。
+ *
+ * 不选择"整份 [PdfContent] 塞进 [onSaveInstanceState] 的 `Bundle`"这个方案——
+ * `Bundle` 走的是进程内 Binder 传输，有大小限制（典型上限约 1MB），一本书的文字+
+ * 图片很容易超标，而且 `PdfContent` 里的 `Bitmap` 本来就不适合塞进 `Bundle`。改成
+ * 只存一样东西：[currentUri]（当前文档的来源 `Uri`，`Uri` 本身是 `Parcelable`，几乎
+ * 不占空间）。重建后的 `onCreate` 读到这个 `Uri` 就直接调 [loadPdf] 重新走一遍抽取
+ * ——效果上等价于"自动帮用户重新打开刚才那份文件"，会比真正的状态保留慢（要重新
+ * 解析 PDF），但实现简单、不依赖 `Bundle` 大小限制，而且滚动位置不需要另外处理：
+ * [onPause] 在 Activity 销毁前已经把阅读进度存过一次（见类注释"阅读进度"一节），
+ * 重新 [loadPdf] 走的是和"手动重新打开这份文件"完全相同的路径，会自动读回那次存的
+ * 进度，不需要专门为"配置变化重建"这条路径写一遍恢复逻辑。
+ *
+ * 用 `savedInstanceState != null` 判断"这是重建，不是真正冷启动"，只在重建时才用
+ * 恢复出来的 `Uri`；真正冷启动时优先看有没有"用……打开"分享过来的 PDF（[IntentUriResolver]）
+ * ——两条路径不会冲突，同一次 `onCreate` 最多只会触发一次 [loadPdf]。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -179,6 +201,12 @@ class MainActivity : AppCompatActivity() {
 
     /** 最近一次成功抽取出的文字段落+图片，供字号/边距变化时重新排版，见类注释。 */
     private var currentContent: PdfContent? = null
+
+    /**
+     * 当前正在显示/加载的文档来源——[loadPdf] 一开始就设置，不等抽取成功。配置变化
+     * 重建时靠这个字段恢复文档，见类注释"配置变化重建后恢复文档"一节。
+     */
+    private var currentUri: Uri? = null
 
     /** 当前显示这份文件的阅读进度 key（[ReadingProgressKey]），没打开任何文件时为 null。 */
     private var currentFileKey: String? = null
@@ -238,8 +266,22 @@ class MainActivity : AppCompatActivity() {
         // "真的是第一次启动"和"只是重建"。
         if (savedInstanceState == null) collapseSettingsPanel()
 
-        // 别的 App"用……打开"分享过来的 PDF：启动时就自动开始抽取，不需要用户再点一次按钮。
-        IntentUriResolver.resolvePdfUri(intent)?.let { uri -> loadPdf(uri) }
+        // 配置变化重建：优先恢复重建前正在看的文档，见类注释"配置变化重建后恢复
+        // 文档"一节。恢复不到（真正冷启动）才看有没有"用……打开"分享过来的 PDF——
+        // 两条路径互斥，这次 onCreate 最多触发一次 loadPdf。
+        val restoredUri = savedInstanceState?.let { BundleCompat.getParcelable(it, KEY_CURRENT_URI, Uri::class.java) }
+        if (restoredUri != null) {
+            loadPdf(restoredUri)
+        } else {
+            // 别的 App"用……打开"分享过来的 PDF：启动时就自动开始抽取，不需要用户再点一次按钮。
+            IntentUriResolver.resolvePdfUri(intent)?.let { uri -> loadPdf(uri) }
+        }
+    }
+
+    /** 见类注释"配置变化重建后恢复文档"一节：只存一个 Uri，重建后靠它重新走一遍 loadPdf。 */
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putParcelable(KEY_CURRENT_URI, currentUri)
     }
 
     /** 离开当前文件（切后台、被系统回收前）时落盘一次阅读进度，见类注释"阅读进度"一节。 */
@@ -249,6 +291,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadPdf(uri: Uri) {
+        currentUri = uri
         // 打开新文件前，先把当前正在显示的文件（如果有）的阅读进度存一次——"打开
         // 另一份 PDF"对上一份文件来说也是"离开"，不用等到 onPause 才存。必须在
         // render(Loading) 清空内容区之前算，不然滚动位置已经被重置成 0。
@@ -793,5 +836,8 @@ class MainActivity : AppCompatActivity() {
          */
         const val BLOCK_SPACING_DP = 24
         const val MAX_ZOOM_MULTIPLIER = 4f
+
+        /** 见类注释"配置变化重建后恢复文档"一节。 */
+        const val KEY_CURRENT_URI = "currentUri"
     }
 }
