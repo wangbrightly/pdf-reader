@@ -76,3 +76,23 @@ Robolectric 的 `nativeruntime-dist-compat` 依赖包约 159MB，走代理连 Ma
 不是安装包或代码问题，是 MIUI/HyperOS 在"开发者选项"里单独放了一个"USB 安装"开关
 （跟"USB 调试"是两个不同开关），没开会拦下所有非应用商店来源的 adb 安装。开发者选项里
 手动打开后重新 `adb install -r` 就通过了。
+
+## 10. 待办（暂缓）：扫描版 PDF 的文字重排——需要 OCR，用户 2026-08-18 决定先不做
+
+扫描 PDF 本质是"页面照片"，没有真正的文字层，`PdfTextExtractor` 抽不出任何文字，
+所以现在这类页面没法重排/调字号——这是预期行为，不是 bug。要支持的话需要接入 OCR
+（光学字符识别），技术路线已经调研过：
+
+- **可行方案**：Google ML Kit 文字识别（`com.google.mlkit:text-recognition` +
+  `text-recognition-chinese`），离线运行、免费、不用联网，CJK 识别效果不错。
+- **前提已确认**：这台测试机上其实**有** Google Play 服务（`adb shell pm list
+  packages | grep google` 能看到 `com.google.android.gms`/`com.google.android.gsf`，
+  包名里还有个"谷歌安装器"，像是手动装上的）——ML Kit 依赖 GMS，这台机器上能跑。
+  但不能想当然认为"小米手机都有 GMS"，换一台机器要重新核实这个前提。
+- **代价**：APK 体积会明显变大（ML Kit 识别包十几 MB 级别）；扫描页要先转图片再逐页
+  识别，比现在的纯文字抽取慢不少；识别质量有上限，不保证 100% 准确，需要保留"认不出
+  就回退成看图片"的降级路径，不能因为识别失败就崩溃或整份文档失败。
+
+用户 2026-08-18 决定"留着以后做"，不是否决，是排期问题——以后要捡起来做的话，先重新
+确认目标机型有没有 GMS，再决定还是走 ML Kit 还是换成不依赖 GMS 的 Tesseract 方案
+（体积更小依赖更少，但识别准确率通常更弱，尤其 CJK）。

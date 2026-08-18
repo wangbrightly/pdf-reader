@@ -27,6 +27,13 @@
     常见）这个按钮会被禁用（isEnabled=false，看起来变灰不可点），而不是隐藏——
     理由见 MainActivity 类注释"目录"一节：按钮位置固定不随文档切换而跳动，禁用态
     本身就足够说明"这份文档没有目录"，不需要再额外弹提示。
+
+    2026-08-18 补：三个滑杆组之间的间距，8dp → 20dp → 40dp（用户试过 20dp 后要求
+    再翻一倍）。用户反馈"3 个菜单的行距太近，不方便选择滑动拉杆"——原来 8dp 时相邻
+    两个 SeekBar 的可触摸区域挨得太近，手指容易碰到旁边那一条，误触/误拖。只调了
+    组间距（label 的 marginTop），组内 label 和自己的 SeekBar 之间紧挨着不变，视觉上
+    "字号"这行和它下面的滑杆是一体的，跟"行距"那组隔开一段明显距离，一眼能分清是
+    三组独立的东西。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/rootLayout"
@@ -96,13 +103,14 @@
             android:layout_height="wrap_content"
             android:min="12"
             android:max="32"
-            android:progress="16" />
+            android:progress="16"
+            android:thumb="@drawable/seekbar_thumb_large" />
 
         <TextView
             android:id="@+id/lineSpacingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp" />
+            android:layout_marginTop="40dp" />
 
         <SeekBar
             android:id="@+id/lineSpacingSeekBar"
@@ -110,13 +118,14 @@
             android:layout_height="wrap_content"
             android:min="0"
             android:max="10"
-            android:progress="2" />
+            android:progress="2"
+            android:thumb="@drawable/seekbar_thumb_large" />
 
         <TextView
             android:id="@+id/paddingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp" />
+            android:layout_marginTop="40dp" />
 
         <SeekBar
             android:id="@+id/paddingSeekBar"
@@ -124,7 +133,8 @@
             android:layout_height="wrap_content"
             android:min="8"
             android:max="32"
-            android:progress="16" />
+            android:progress="16"
+            android:thumb="@drawable/seekbar_thumb_large" />
 
     </LinearLayout>
 
