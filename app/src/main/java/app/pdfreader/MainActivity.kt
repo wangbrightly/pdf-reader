@@ -123,6 +123,8 @@ import kotlin.concurrent.thread
 class MainActivity : AppCompatActivity() {
 
     private lateinit var openButton: Button
+    private lateinit var toggleSettingsButton: Button
+    private lateinit var settingsPanel: View
     private lateinit var progressBar: ProgressBar
     private lateinit var contentContainer: LinearLayout
     private lateinit var contentScrollView: ScrollView
@@ -161,6 +163,8 @@ class MainActivity : AppCompatActivity() {
         applyStatusBarInsetAsPadding()
 
         openButton = findViewById(R.id.openButton)
+        toggleSettingsButton = findViewById(R.id.toggleSettingsButton)
+        settingsPanel = findViewById(R.id.settingsPanel)
         progressBar = findViewById(R.id.progressBar)
         contentContainer = findViewById(R.id.contentContainer)
         contentScrollView = findViewById(R.id.contentScrollView)
@@ -179,6 +183,7 @@ class MainActivity : AppCompatActivity() {
         openButton.setOnClickListener {
             openDocumentLauncher.launch(arrayOf("application/pdf"))
         }
+        toggleSettingsButton.setOnClickListener { toggleSettingsPanel() }
 
         // 别的 App"用……打开"分享过来的 PDF：启动时就自动开始抽取，不需要用户再点一次按钮。
         IntentUriResolver.resolvePdfUri(intent)?.let { uri -> loadPdf(uri) }
@@ -216,7 +221,13 @@ class MainActivity : AppCompatActivity() {
                 buildDisplayBlocks(content, lineMetrics)
             }
             val state = PdfLoadReducer.fromResult(result)
-            runOnUiThread { render(state) }
+            runOnUiThread {
+                render(state)
+                // 只在"打开一份新文件"这条路径自动收起设置面板，给内容腾屏幕——
+                // reflowCurrentParagraphs()（用户正在调字号/边距时触发的重排）不走
+                // 这里，不然用户刚碰一下滑条面板就被收起，体验上会打架。
+                if (state is PdfLoadState.Success) collapseSettingsPanel()
+            }
         }
     }
 
@@ -378,6 +389,22 @@ class MainActivity : AppCompatActivity() {
             val child = contentContainer.getChildAt(i)
             if (child is TextView) action(child)
         }
+    }
+
+    /** 用户点"收起设置"/"展开设置"按钮：切换 [settingsPanel] 可见性，同步按钮文案。 */
+    private fun toggleSettingsPanel() {
+        if (settingsPanel.visibility == View.VISIBLE) collapseSettingsPanel() else expandSettingsPanel()
+    }
+
+    private fun collapseSettingsPanel() {
+        if (settingsPanel.visibility == View.GONE) return
+        settingsPanel.visibility = View.GONE
+        toggleSettingsButton.text = getString(R.string.settings_toggle_show)
+    }
+
+    private fun expandSettingsPanel() {
+        settingsPanel.visibility = View.VISIBLE
+        toggleSettingsButton.text = getString(R.string.settings_toggle_hide)
     }
 
     private fun setupSeekBarListeners() {

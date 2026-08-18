@@ -12,6 +12,13 @@
       不再是贴在一起的一坨。
     - 三个滑杆包进一个带浅色背景的分组容器，视觉上跟"打开 PDF"按钮和下面的内容区分开，
       不需要额外 UI 库，纯靠 background drawable + padding。
+
+    2026-08-18 补：设置面板可折叠。
+    用户反馈"这一页的菜单都在屏幕上，把菜单隐藏起来，提高阅读体验"——settingsPanel
+    整块（三个滑杆）现在可以收起，读文档时不占屏幕；toggleSettingsButton 常驻在
+    "打开 PDF"按钮右边（横排，不额外占一整行高度），随时能展开/收起，"打开 PDF"
+    按钮本身不折叠（换文件随时要用，且本身占地方不大）。折叠/展开的具体触发逻辑
+    （PDF 加载成功后自动收起）在 MainActivity.render() 里。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/rootLayout"
@@ -22,15 +29,35 @@
     android:paddingTop="16dp"
     android:paddingBottom="8dp">
 
-    <Button
-        android:id="@+id/openButton"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:minHeight="52dp"
-        android:text="@string/open_pdf"
-        android:textSize="16sp" />
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/openButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:minHeight="52dp"
+            android:text="@string/open_pdf"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/toggleSettingsButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:minHeight="52dp"
+            android:minWidth="0dp"
+            android:paddingHorizontal="16dp"
+            android:text="@string/settings_toggle_hide"
+            android:textSize="14sp" />
+
+    </LinearLayout>
 
     <LinearLayout
+        android:id="@+id/settingsPanel"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp"

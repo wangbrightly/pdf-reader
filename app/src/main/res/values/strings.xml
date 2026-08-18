@@ -7,4 +7,6 @@
     <string name="font_size_label">字号：%1$dsp</string>
     <string name="line_spacing_label">行距：%1$.1f 倍</string>
     <string name="padding_label">边距：%1$ddp</string>
+    <string name="settings_toggle_hide">收起设置</string>
+    <string name="settings_toggle_show">展开设置</string>
 </resources>
