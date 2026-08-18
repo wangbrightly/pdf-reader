@@ -18,17 +18,21 @@
     2026-08-18 补：设置面板可折叠。
     用户反馈"这一页的菜单都在屏幕上，把菜单隐藏起来，提高阅读体验"——settingsPanel
     整块（三个滑杆）现在可以收起，读文档时不占屏幕；toggleSettingsButton 常驻在
-    "打开 PDF"按钮右边（横排，不额外占一整行高度），随时能展开/收起，"打开 PDF"
+    按钮行最右边（横排，不额外占一整行高度），随时能展开/收起，"打开 PDF"
     按钮本身不折叠（换文件随时要用，且本身占地方不大）。折叠/展开的具体触发逻辑
-    （PDF 加载成功后自动收起）在 MainActivity.render() 里。
+    （PDF 加载成功后自动收起）在 MainActivity.render() 里；2026-08-19 补：冷启动
+    还没打开任何文档时也默认收起（用户反馈"设置菜单默认不展开"），见 onCreate
+    里直接调用 collapseSettingsPanel。
 
     2026-08-18 补：加了 tocButton（目录）。
-    放在 openButton 和 toggleSettingsButton 之间——跟"打开 PDF"一样是"内容导航"类
-    操作（不是设置类），紧挨着放符合就近原则；样式沿用 toggleSettingsButton（同样
-    wrap_content 宽度、不额外占地方，横排不新增一整行高度）。没有大纲的 PDF（很
-    常见）这个按钮会被禁用（isEnabled=false，看起来变灰不可点），而不是隐藏——
+    跟"打开 PDF"一样是"内容导航"类操作（不是设置类）。样式沿用 toggleSettingsButton
+    （同样 wrap_content 宽度、不额外占地方，横排不新增一整行高度）。没有大纲的 PDF
+    （很常见）这个按钮会被禁用（isEnabled=false，看起来变灰不可点），而不是隐藏——
     理由见 MainActivity 类注释"目录"一节：按钮位置固定不随文档切换而跳动，禁用态
     本身就足够说明"这份文档没有目录"，不需要再额外弹提示。
+    2026-08-19 补：挪到按钮行最左边（用户反馈"目录放到左侧"）——原来在 openButton
+    和 toggleSettingsButton 之间，现在排在 openButton 前面，openButton 的
+    layout_weight="1" 跟着从第一个挪到第二个位置，仍然占满剩余空间。
 
     2026-08-18 补：三个滑杆组之间的间距，8dp → 20dp → 40dp（用户试过 20dp 后要求
     再翻一倍）。用户反馈"3 个菜单的行距太近，不方便选择滑动拉杆"——原来 8dp 时相邻
@@ -52,25 +56,25 @@
         android:orientation="horizontal">
 
         <Button
-            android:id="@+id/openButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:minHeight="52dp"
-            android:text="@string/open_pdf"
-            android:textSize="16sp" />
-
-        <Button
             android:id="@+id/tocButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
             android:enabled="false"
             android:minHeight="52dp"
             android:minWidth="0dp"
             android:paddingHorizontal="16dp"
             android:text="@string/toc_button"
             android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/openButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:minHeight="52dp"
+            android:text="@string/open_pdf"
+            android:textSize="16sp" />
 
         <Button
             android:id="@+id/toggleSettingsButton"

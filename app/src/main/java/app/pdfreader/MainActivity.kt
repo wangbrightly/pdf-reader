@@ -224,6 +224,11 @@ class MainActivity : AppCompatActivity() {
         }
         tocButton.setOnClickListener { showOutlineDialog() }
         toggleSettingsButton.setOnClickListener { toggleSettingsPanel() }
+        // 用户反馈"设置菜单默认不展开"——冷启动、还没打开任何 PDF 时也应该是收起状态，
+        // 不只是"加载成功后自动收起"（那是 render() 里已有的逻辑，只覆盖"打开文档"这
+        // 个时机）。直接复用 collapseSettingsPanel，不在 XML 里另外维护一套初始状态，
+        // 避免两处"折叠态"定义不同步。
+        collapseSettingsPanel()
 
         // 别的 App"用……打开"分享过来的 PDF：启动时就自动开始抽取，不需要用户再点一次按钮。
         IntentUriResolver.resolvePdfUri(intent)?.let { uri -> loadPdf(uri) }
