@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    最简单方案：LinearLayout 竖排 = 按钮 + 进度条 + ScrollView 包 TextView。
-    不引入 RecyclerView 等额外列表库（重排结果是连续文字，不是列表项）。
+    最简单方案：LinearLayout 竖排 = 按钮 + 三个设置滑杆（字号/行距/边距，系统自带 SeekBar，
+    不引入额外 UI 库）+ 进度条 + ScrollView 包 TextView。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
@@ -13,6 +13,58 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="@string/open_pdf" />
+
+    <TextView
+        android:id="@+id/fontSizeLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp" />
+
+    <SeekBar
+        android:id="@+id/fontSizeSeekBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:min="12"
+        android:max="32"
+        android:progress="16" />
+
+    <TextView
+        android:id="@+id/lineSpacingLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp" />
+
+    <SeekBar
+        android:id="@+id/lineSpacingSeekBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:min="0"
+        android:max="10"
+        android:progress="2" />
+
+    <TextView
+        android:id="@+id/paddingLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp" />
+
+    <SeekBar
+        android:id="@+id/paddingSeekBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:min="8"
+        android:max="32"
+        android:progress="16" />
 
     <ProgressBar
         android:id="@+id/progressBar"
@@ -33,7 +85,6 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:padding="16dp"
-            android:lineSpacingExtra="4dp"
             android:textIsSelectable="true"
             android:fontFamily="monospace" />
 

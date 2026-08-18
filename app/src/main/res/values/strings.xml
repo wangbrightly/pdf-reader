@@ -4,4 +4,7 @@
     <string name="open_pdf">打开 PDF</string>
     <string name="loading">正在处理，请稍候…</string>
     <string name="pick_file_error">无法打开所选文件</string>
+    <string name="font_size_label">字号：%1$dsp</string>
+    <string name="line_spacing_label">行距：%1$.1f 倍</string>
+    <string name="padding_label">边距：%1$ddp</string>
 </resources>
