@@ -42,3 +42,11 @@ Robolectric 的 `nativeruntime-dist-compat` 依赖包约 159MB，走代理连 Ma
 最早用 `textutil`/`cupsfilter` 生成小测试 PDF，两者背后都是同一套 macOS 系统打印管线，会给某些汉字（恰好是上面第 4 条里出问题的那批字）逐字单独起一个文字对象，PdfBox 的分段启发式应付不了，断行断得很怪，且用 `pdftotext -raw` 交叉核对也是乱的——是 fixture 生成方式本身的问题，不是抽取层的锅。
 
 改用本机已装的 Puppeteer（`~/.claude-tools/webshot`）把一段 HTML 打印成 PDF，文字对象按正常语句连续排布，`pdftotext -raw` 核对正常。现在 `app/src/test/resources/sample-chinese.pdf` 就是这样生成的。这也顺带更贴近真实场景——"网页另存为 PDF"是用户真会遇到的常见 PDF 来源。
+
+## 6. Chromium 打印表格边框，画的是"细长填充矩形"，不是描边直线
+
+做表格检测（2026-08-18 增量）时反编译了 `sample-with-table.pdf` 的 content stream 才发现：Chromium 打印 `<table border>` 的单元格边框，用的是 `re`（画矩形）+ `f`（填充）——每条边框是一个宽或高只有 1pt 的细长矩形，不是常见印象里"用 `m l S` 描一条线"。如果表格检测只处理 `strokePath`（对应 `S`），会完全漏检 Chromium 打印出来的表格。`TableGridDetector`/`PdfTextExtractor.TableGridStreamEngine` 因此同时处理 `appendRectangle`（矩形四条边）和 `fillPath`（不只是 `strokePath`），并且用"线段长度"过滤掉矩形的"厚度"那条短边，只留长边参与网格判断。以后如果还要基于矢量图形做检测，先反编译几个真实来源（浏览器打印/Office 导出/LaTeX）的 content stream 看它们实际画法，不要凭 PDF 规范的"教科书画法"猜。
+
+## 7. PdfBox-Android 的 `PDFGraphicsStreamEngine` 和 `PDFRenderer` 在 Robolectric 下能正常跑，不需要额外配置
+
+`com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine`（自定义图形流引擎，用来拿矢量线段坐标）和 `com.tom_roush.pdfbox.rendering.PDFRenderer`（整页渲染成 `Bitmap`）在现有 Robolectric 4.16.1 环境下直接能跑，用真实含表格的 fixture 验证过（A4 页面 @150 DPI 渲染出 1241×1753 px 的 `Bitmap`，和"210×297mm×150dpi"的理论值吻合），没有触发"Robolectric 默认不支持真实图形栅格化"这类担心——不需要额外开启 `NativeGraphicsMode`/`LegacyGraphicsMode` 之类的配置，跟已有 `PDImageXObject.getImage()`（[4] 节图片抽取用到的 API）同样开箱即用。以后如果要在这个项目里做更多"依赖 PDFBox 图形渲染"的功能，可以直接假设 Robolectric 环境支持，不用先怀疑环境限制。

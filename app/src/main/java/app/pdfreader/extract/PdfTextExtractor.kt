@@ -2,10 +2,15 @@ package app.pdfreader.extract
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Path
+import android.graphics.PointF
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
+import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImage
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
+import com.tom_roush.pdfbox.rendering.PDFRenderer
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
 import java.io.File
@@ -61,8 +66,45 @@ import java.text.Normalizer
  *
  * 单张图片抽取失败（解码异常、格式不支持等）只跳过那一张，不影响其余图片和全部文字，
  * 见 [extractImages] 里的 `runCatching`。
+ *
+ * ## 表格检测（2026-08-18 增量）：疑似表格的整页降级为图片
+ *
+ * 提示词档案第 6 条要求"表格不重排，整体展示，支持双指缩放"——PDF 格式本身没有
+ * "表格"这个结构化概念，"这块内容是不是表格"是个没有标准答案的启发式检测问题
+ * （业界专门做这个的 Camelot/Tabula 都只能做到"启发式+带误判"，见任务描述）。这里
+ * 不追求精确识别表格边界，采用两段降级：
+ *
+ * 1. **检测信号：矢量网格线，不是文字列对齐。** [detectTablePages] 对每一页跑一遍
+ *    [TableGridStreamEngine]（继承 `PDFGraphicsStreamEngine`，能拿到页面 content
+ *    stream 里 `re`/`m l S` 等图形操作符的线段坐标），把线段交给纯逻辑
+ *    [TableGridDetector.looksLikeTable] 判断"这一页是不是有网格"。选网格线而不是
+ *    "文字按列对齐"这个更简单的信号，是因为后者在多栏排版、目录页上误判率明显更高
+ *    （一大段无关文字碰巧在几行里都能切出 3 列对齐点，这种巧合并不罕见）；网格线
+ *    要求"多条横线和多条竖线互相交叉"，普通正文段落、多栏排版、目录页几乎不会画
+ *    出这种矢量图形，误判率天然更低，符合"宁可漏检、不可错杀"的保守策略（见
+ *    [TableGridDetector] 类注释的完整阈值设计理由）。用真实 fixture
+ *    （`sample-with-table.pdf`）反编译验证过：Chromium 打印 `<table border>` 时，
+ *    表格边框是画成"细长填充矩形"而不是描边直线，[TableGridStreamEngine] 对
+ *    `appendRectangle`/`strokePath`/`fillPath` 都做了处理，两种画法都能识别。
+ *
+ * 2. **降级策略：一旦一页疑似有表格，整页都不参与 reflow，改成渲染成一张 Bitmap。**
+ *    检测"表格在页面内的精确边界"（哪几行哪几列真正属于表格、表格前后哪些文字不
+ *    属于表格）本身复杂度和不确定性很高，与"够用的启发式"这个目标不成比例。所以
+ *    一旦命中疑似表格信号，直接把这一整页用 [PDFRenderer.renderImageWithDPI]
+ *    （PdfBox-Android 提供的整页渲染 API，和上游 Apache PDFBox 的 `PDFRenderer`
+ *    同源）渲染成一张 [Bitmap]，这一页原本会抽取出的文字段落全部跳过——**代价**：
+ *    如果这一页里表格和大段正文混排，正文也会跟着变成图片、丢失"重排+调字号"的
+ *    能力，这是把"检测精度"换成"实现简单性和复用度"的妥协（复用现有
+ *    [ExtractedImage]/`DisplayBlock.Image`/双指缩放机制，不需要发明新的展示类型）。
+ *    渲染失败（内存不足、极端复杂页面等）时不强行让整份文档抽取失败，而是让这一页
+ *    退回正常的文字抽取路径——见 [renderTablePageImages] 里的 `runCatching`，这样
+ *    "表格检测/渲染出问题"最坏情况下只是退化成"这页表格没能整页降级、还是按普通
+ *    文字重排"，不会让用户连文字都看不到。
  */
 object PdfTextExtractor {
+
+    /** 整页渲染表格页时使用的 DPI：兼顾清晰度（配合双指缩放放大后仍可读）和内存占用。 */
+    private const val TABLE_PAGE_RENDER_DPI = 150f
 
     /** 见上方 KDoc"已知问题"一节。键是部首补充区码位，值是对应的常用独立汉字。 */
     private val RADICALS_SUPPLEMENT_FIX = mapOf(
@@ -118,12 +160,66 @@ object PdfTextExtractor {
     fun extractContent(context: Context, file: File): PdfContent {
         PDFBoxResourceLoader.init(context.applicationContext ?: context)
         PDDocument.load(file).use { document ->
+            // 先渲染疑似表格页（成功的才计入"跳过文字抽取"名单，见类注释"表格检测"
+            // 一节——渲染失败时宁可让这页退回正常文字抽取，也不让内容整页消失）。
+            val candidatePages = detectTablePages(document)
+            val tablePageImages = renderTablePageImages(document, candidatePages)
+            val renderedTablePages = tablePageImages.keys
+
             val stripper = LineCollectingStripper()
             stripper.getText(document)
-            val paragraphs = linesToParagraphs(stripper.lines)
-            val images = extractImages(document, paragraphs)
-            return PdfContent(paragraphs.map { it.text }, images)
+            val nonTableLines = stripper.lines.filterNot { it.page in renderedTablePages }
+            val paragraphs = linesToParagraphs(nonTableLines)
+            val paragraphPages = paragraphs.map { it.page }
+
+            val inlineImages = extractImages(document, paragraphs, excludePages = renderedTablePages)
+            val tableImages = renderedTablePages.map { pageNo ->
+                ExtractedImage(
+                    bitmap = tablePageImages.getValue(pageNo),
+                    afterParagraphIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo),
+                )
+            }
+            return PdfContent(paragraphs.map { it.text }, inlineImages + tableImages)
         }
+    }
+
+    /**
+     * 对文档每一页跑一遍 [TableGridStreamEngine]，收集"疑似表格"的页码（1-based）。
+     * 单页检测出异常（个别页面 content stream 有解析问题）只跳过那一页的判断，不让
+     * 整份文档的抽取失败——和 [extractImages] 里"单张图片失败不连累其它"是同一种
+     * 降级精神。
+     */
+    private fun detectTablePages(document: PDDocument): Set<Int> {
+        val tablePages = mutableSetOf<Int>()
+        for (pageIndex in 0 until document.numberOfPages) {
+            val page = document.getPage(pageIndex)
+            val looksLikeTable = runCatching {
+                val engine = TableGridStreamEngine(page)
+                engine.processPage(page)
+                TableGridDetector.looksLikeTable(engine.segments)
+            }.getOrDefault(false)
+            if (looksLikeTable) tablePages.add(pageIndex + 1)
+        }
+        return tablePages
+    }
+
+    /**
+     * 把 [candidatePages] 里每一页整页渲染成 [Bitmap]（[TABLE_PAGE_RENDER_DPI]）。
+     * 只有渲染成功的页码才会出现在返回值里——渲染失败的页码不进返回值，调用方
+     * ([extractContent]) 就不会把那一页的文字行排除掉，等价于"这一页没有被判定为
+     * 表格"，见类注释"表格检测"一节的降级说明。
+     */
+    private fun renderTablePageImages(document: PDDocument, candidatePages: Set<Int>): Map<Int, Bitmap> {
+        if (candidatePages.isEmpty()) return emptyMap()
+        val renderer = PDFRenderer(document)
+        val result = mutableMapOf<Int, Bitmap>()
+        for (pageNo in candidatePages) {
+            val bitmap = runCatching {
+                renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
+            }.getOrNull() ?: continue
+            result[pageNo] = bitmap
+        }
+        return result
     }
 
     /** 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。 */
@@ -162,13 +258,21 @@ object PdfTextExtractor {
      * [ImagePlacement] 算出每张图该插在哪个段落之后。单张图片转换失败（`getImage()`
      * 抛异常）只跳过那一张，不让整个文档抽取失败——这是"降级"精神的延续：宁可漏掉
      * 一张图，也不能因为一张坏图让用户连文字都看不到。
+     *
+     * [excludePages] 是已经整页渲染成图片的表格页（见类注释"表格检测"一节）——这些
+     * 页面的内嵌图片已经包含在整页渲染结果里了，不需要再单独抽取一遍、重复显示。
      */
-    private fun extractImages(document: PDDocument, paragraphs: List<Paragraph>): List<ExtractedImage> {
+    private fun extractImages(
+        document: PDDocument,
+        paragraphs: List<Paragraph>,
+        excludePages: Set<Int>,
+    ): List<ExtractedImage> {
         val paragraphPages = paragraphs.map { it.page }
         val images = mutableListOf<ExtractedImage>()
         for (pageIndex in 0 until document.numberOfPages) {
-            val page: PDPage = document.getPage(pageIndex)
             val pageNo = pageIndex + 1
+            if (pageNo in excludePages) continue
+            val page: PDPage = document.getPage(pageIndex)
             val afterIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo)
             val resources = page.resources ?: continue
             for (name in resources.xObjectNames) {
@@ -216,6 +320,96 @@ object PdfTextExtractor {
             val y = textPositions.firstOrNull()?.yDirAdj ?: return
             lines.add(Line(fixRadicalVariants(text), y, currentPageNo))
         }
+    }
+
+    /**
+     * PDFBox 图形流引擎适配层：把一页 content stream 里画路径用的操作符（`m`/`l`/`c`/
+     * `re`/`S`/`f`/`B`……）转成一批 [LineSegment]，交给纯逻辑 [TableGridDetector] 判断。
+     * 只关心"画了哪些直线段"，不关心颜色/线宽/是否真的可见（够用即可，见类注释
+     * "表格检测"一节）。
+     *
+     * 只有在路径被真正"画出来"（[strokePath]/[fillPath]/[fillAndStrokePath]，对应
+     * PDF 的 `S`/`f`/`B` 等操作符）时，累积在 [pendingSegments] 里的线段才会提交进
+     * [segments]；纯粹用于裁剪、从未描边/填充的路径（[endPath]，对应 `n` 操作符）会
+     * 被直接丢弃——这样"看不见的裁剪路径"不会污染网格判断。
+     *
+     * 曲线（[curveTo]）只把终点当作直线的端点纳入路径追踪（用于正确维护"当前点"），
+     * 不生成线段——表格网格线是直线，不会是贝塞尔曲线，忽略曲线本身的走向不影响
+     * 判断，也避免把任意曲线误当成网格线的一部分。
+     */
+    private class TableGridStreamEngine(page: PDPage) : PDFGraphicsStreamEngine(page) {
+        val segments = mutableListOf<LineSegment>()
+        private val pendingSegments = mutableListOf<LineSegment>()
+        private var currentX = 0f
+        private var currentY = 0f
+        private var subpathStartX = 0f
+        private var subpathStartY = 0f
+
+        override fun appendRectangle(p0: PointF, p1: PointF, p2: PointF, p3: PointF) {
+            // `re` 操作符：矩形四条边直接进 pendingSegments，等对应的 stroke/fill
+            // 操作符提交（表格边框在 Chromium 输出里常见的画法就是细长填充矩形，
+            // 见 TableGridDetector 类注释）。
+            pendingSegments.add(LineSegment(p0.x, p0.y, p1.x, p1.y))
+            pendingSegments.add(LineSegment(p1.x, p1.y, p2.x, p2.y))
+            pendingSegments.add(LineSegment(p2.x, p2.y, p3.x, p3.y))
+            pendingSegments.add(LineSegment(p3.x, p3.y, p0.x, p0.y))
+            currentX = p0.x
+            currentY = p0.y
+            subpathStartX = p0.x
+            subpathStartY = p0.y
+        }
+
+        override fun moveTo(x: Float, y: Float) {
+            currentX = x
+            currentY = y
+            subpathStartX = x
+            subpathStartY = y
+        }
+
+        override fun lineTo(x: Float, y: Float) {
+            pendingSegments.add(LineSegment(currentX, currentY, x, y))
+            currentX = x
+            currentY = y
+        }
+
+        override fun curveTo(x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float) {
+            // 只推进"当前点"，不生成线段——见类 KDoc。
+            currentX = x3
+            currentY = y3
+        }
+
+        override fun closePath() {
+            pendingSegments.add(LineSegment(currentX, currentY, subpathStartX, subpathStartY))
+            currentX = subpathStartX
+            currentY = subpathStartY
+        }
+
+        override fun endPath() {
+            // 对应 `n`（只裁剪不画）：丢弃尚未提交的线段，见类 KDoc。
+            pendingSegments.clear()
+        }
+
+        override fun strokePath() {
+            segments.addAll(pendingSegments)
+            pendingSegments.clear()
+        }
+
+        override fun fillPath(windingRule: Path.FillType) {
+            segments.addAll(pendingSegments)
+            pendingSegments.clear()
+        }
+
+        override fun fillAndStrokePath(windingRule: Path.FillType) {
+            segments.addAll(pendingSegments)
+            pendingSegments.clear()
+        }
+
+        override fun getCurrentPoint(): PointF = PointF(currentX, currentY)
+
+        // 表格网格检测不关心裁剪区域、图片、阴影填充，全部当无操作处理。
+        override fun clip(windingRule: Path.FillType) = Unit
+        override fun shadingFill(shadingName: com.tom_roush.pdfbox.cos.COSName) = Unit
+        override fun drawImage(pdImage: PDImage) = Unit
     }
 }
 
