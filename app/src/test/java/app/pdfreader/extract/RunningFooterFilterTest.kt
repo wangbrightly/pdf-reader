@@ -42,8 +42,9 @@ class RunningFooterFilterTest {
             PageTextLine("https://baike.azpdl.net/#/entry/abc-123", page = 1),
             PageTextLine("22/136", page = 1),
         )
-        // 下标 0（日期）、2（网址）、3（页码，跟日期/网址同页）判定为水印；
-        // 下标 1（书名）不处理，见类 KDoc"故意不处理标题行"一节。
+        // 下标 0（日期）、2（网址）、3（页码，跟日期/网址同页）判定为水印；下标 1
+        // （书名）只出现在这一页、不满足"标题行"检测的重复率门槛，不处理，见类 KDoc
+        // "标题行"一节。
         assertEquals(setOf(0, 2, 3), RunningFooterFilter.noiseIndices(lines))
     }
 
@@ -68,5 +69,56 @@ class RunningFooterFilterTest {
     @Test
     fun `空列表返回空集合`() {
         assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(emptyList()))
+    }
+
+    // ---- 标题行（2026-08-19 补）：见 RunningFooterFilter 类 KDoc"标题行"一节 ----
+
+    @Test
+    fun `短文字在多数页一字不差重复出现，判定为运行标题水印`() {
+        // 6 页文档，"幸福生命手册（2025）"在其中 5 页都出现（超过一半），应该被判定
+        // 为运行标题；每页各自的正文段落不重复，不该被误伤。
+        val lines = mutableListOf<PageTextLine>()
+        for (page in 1..6) {
+            if (page != 4) lines.add(PageTextLine("幸福生命手册（2025）", page = page))
+            lines.add(PageTextLine("第${page}页各自不同的正文内容。", page = page))
+        }
+        val titleIndices = lines.indices.filter { lines[it].text == "幸福生命手册（2025）" }.toSet()
+
+        assertEquals(titleIndices, RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
+    fun `重复次数够但占比不到一半，不判定为运行标题（长文档里偶尔重复的分隔符）`() {
+        // 20 页文档，"* * *"这个分隔符只在 4 页出现——次数够 3 次，但占比 4/20=20%
+        // 远低于一半，不该被当成运行标题过滤掉。
+        val lines = mutableListOf<PageTextLine>()
+        for (page in 1..20) {
+            if (page % 5 == 0) lines.add(PageTextLine("* * *", page = page))
+            lines.add(PageTextLine("第${page}页各自不同的正文内容。", page = page))
+        }
+        val separatorIndices = lines.indices.filter { lines[it].text == "* * *" }
+
+        val result = RunningFooterFilter.noiseIndices(lines)
+        separatorIndices.forEach { assertEquals(false, it in result) }
+    }
+
+    @Test
+    fun `占比够但只出现2次，不判定为运行标题（次数门槛没过）`() {
+        // 2 页文档，两页都有同一句短话——占比 100%，但只有 2 个不同页，没到"至少 3 个
+        // 不同页"这个绝对数量门槛，避免短文档里偶然重复两次就被误判。
+        val lines = listOf(
+            PageTextLine("同一句话", page = 1),
+            PageTextLine("同一句话", page = 2),
+        )
+        assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
+    fun `重复的文字太长，不当作标题行处理，就算重复率再高也不过滤`() {
+        val longText = "这是一段刻意写得很长的重复文字，长度超过标题行长度上限，" +
+            "即使在所有页都完整重复出现，也不应该被当成运行标题过滤掉，因为真正的" +
+            "运行标题/页眉一般都很短。"
+        val lines = (1..5).map { PageTextLine(longText, page = it) }
+        assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(lines))
     }
 }

@@ -32,8 +32,16 @@ class PdfTextExtractorFooterNoiseTest {
     // 字符，构造 fixture 时会直接抛 IllegalArgumentException；这条测试只关心
     // RunningFooterFilter 接线对不对（水印过滤、正文保留），不需要覆盖 CJK 场景
     // （CJK 相关逻辑已经有 PdfTextExtractorTest 等专门的测试覆盖）。
-    private val bodyLines = listOf("This", "is", "normal", "body", "text")
     private val pageHeight = 1000f
+
+    /**
+     * 每页正文内容必须不同（带页码），不能像早期版本那样每页写同一句话——2026-08-19
+     * 加了"标题行"检测（见 RunningFooterFilter 类 KDoc）之后，同一句话在所有页
+     * 一字不差重复出现会被当成运行标题过滤掉，这是符合预期的行为，但会让这条测试
+     * 没法区分"正文被误伤"和"正文本来就跟标题长得一样"，所以让每页正文各不相同，
+     * 更接近真实书籍的样子，也让断言更有说服力。
+     */
+    private fun bodyLinesForPage(pageNo: Int) = listOf("This", "is", "page", "$pageNo", "body")
 
     /** yDirAdj≈1000-y_raw；数值本身不重要，重要的是相邻行之间的间距档次。 */
     private val bodyYRaw = listOf(950f, 935f, 920f, 905f, 890f) // 相邻间距 15
@@ -56,7 +64,7 @@ class PdfTextExtractorFooterNoiseTest {
                 stream.showText(text)
                 stream.endText()
             }
-            bodyLines.forEachIndexed { i, text -> writeLine(bodyYRaw[i], text) }
+            bodyLinesForPage(pageNo).forEachIndexed { i, text -> writeLine(bodyYRaw[i], text) }
             writeLine(footerYRaw[0], "2026/7/10 23:21")
             writeLine(footerYRaw[1], "Happy Life Handbook (2025)")
             writeLine(footerYRaw[2], "https://baike.azpdl.net/#/entry/abc-123")
@@ -72,22 +80,20 @@ class PdfTextExtractorFooterNoiseTest {
     }
 
     @Test
-    fun `每页的日期、网址、页码水印被过滤掉，正文段落完整保留`() {
+    fun `每页的日期、网址、页码、重复书名水印都被过滤掉，正文段落完整保留`() {
         val context = RuntimeEnvironment.getApplication()
         val content = PdfTextExtractor.extractContent(context, buildDocument())
 
-        // 每页剩下 2 段：正文 + 标题行——日期/网址/页码这 3 种水印被过滤掉了；标题行
-        // 故意不处理（见 RunningFooterFilter 类 KDoc"故意不处理标题行"一节），所以
-        // 还会剩下，不是"水印全部消失、一个字不剩"。
-        assertEquals(listOf(1, 1, 2, 2, 3, 3), content.paragraphPages)
+        // 每页只剩正文这一段——日期/网址/页码这 3 种水印被过滤掉；标题行
+        // "Happy Life Handbook (2025)" 在全部 3 页一字不差重复出现，满足"标题行"
+        // 检测的长度+跨页重复率两道门槛（见 RunningFooterFilter 类 KDoc"标题行"
+        // 一节），2026-08-19 起也会被过滤，不再是"故意保留"。
+        assertEquals(listOf(1, 2, 3), content.paragraphPages)
         assertEquals(
             listOf(
-                "This is normal body text",
-                "Happy Life Handbook (2025)",
-                "This is normal body text",
-                "Happy Life Handbook (2025)",
-                "This is normal body text",
-                "Happy Life Handbook (2025)",
+                "This is page 1 body",
+                "This is page 2 body",
+                "This is page 3 body",
             ),
             content.paragraphs,
         )
@@ -96,6 +102,7 @@ class PdfTextExtractorFooterNoiseTest {
         assertFalse(joined.contains("2026/7/10"))
         assertFalse(joined.contains("baike.azpdl.net"))
         assertFalse(joined.contains("136"))
+        assertFalse(joined.contains("Happy Life Handbook"))
     }
 
     @Test
