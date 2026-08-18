@@ -136,11 +136,23 @@ class PdfTextExtractorImageOrientationTest {
      */
     private fun referenceLayout(ctm: Matrix): Map<Corner, Corner> {
         // 图片空间的四个角，(x, y) 都是 0..1 的分数坐标。
+        //
+        // 2026-08-19 勘误：这里原来把 Bitmap 的左上角（第 0 行，RED 所在的 TL）直接
+        // 写成图片空间 (0,0)——这是错的。PDF 规范里图片空间的 (0,0) 是单位正方形的
+        // 左下角，图片数据的第 0 行（存储顺序的第一行）对应的是 y=1（单位正方形的
+        // 顶部），最后一行才对应 y=0。也就是说 Bitmap 的"上"对应图片空间的 y=1，不是
+        // y=0。旧写法和当时被测代码里"基准是 a>0、d<0"那个错误假设是同一个坑：两边
+        // 都把"Bitmap 顶部=图片空间原点"当成默认前提，所以两边算出来的结果能对上，
+        // 掩盖了真正的符号错误，直到真机实测"全书上下颠倒"才暴露。
+        //
+        // 用 Python 手写最小 PDF + poppler `pdftoppm` 独立渲染 + PIL 采样像素颜色
+        // 验证过这里的映射方向是对的（见 PdfTextExtractor.orientationMatrixOrNull
+        // KDoc"2026-08-19 勘误"一节的三组 CTM 测试用例）。
         val imageCorners = mapOf(
-            Corner.TL to (0.0 to 0.0),
-            Corner.TR to (1.0 to 0.0),
-            Corner.BL to (0.0 to 1.0),
-            Corner.BR to (1.0 to 1.0),
+            Corner.TL to (0.0 to 1.0),
+            Corner.TR to (1.0 to 1.0),
+            Corner.BL to (0.0 to 0.0),
+            Corner.BR to (1.0 to 0.0),
         )
         val result = mutableMapOf<Corner, Corner>()
         for ((rawCorner, xy) in imageCorners) {
@@ -163,11 +175,14 @@ class PdfTextExtractorImageOrientationTest {
      * `e`/`f` 取值让每种 CTM 摆出来的图片都恰好铺满 100×100 的页面——这样
      * [referenceLayout] 算出来的四个角必然落在四个不同象限，不会有歧义。
      */
+    // 2026-08-19 勘误：原来的标签把 a>0,d<0 标成"不翻转(canonical)"、a>0,d>0 标成
+    // "垂直镜像"——跟真实基准（见 orientationMatrixOrNull KDoc）正好反了，改成正确
+    // 的标签，避免继续误导以后看代码的人。
     private val ctmCases = listOf(
-        "不翻转(canonical)" to Matrix(100f, 0f, 0f, -100f, 0f, 100f),
-        "水平镜像" to Matrix(-100f, 0f, 0f, -100f, 100f, 100f),
-        "垂直镜像" to Matrix(100f, 0f, 0f, 100f, 0f, 0f),
-        "180度旋转" to Matrix(-100f, 0f, 0f, 100f, 100f, 0f),
+        "不翻转(canonical)" to Matrix(100f, 0f, 0f, 100f, 0f, 0f),
+        "水平镜像" to Matrix(-100f, 0f, 0f, 100f, 100f, 0f),
+        "垂直镜像" to Matrix(100f, 0f, 0f, -100f, 0f, 100f),
+        "180度旋转" to Matrix(-100f, 0f, 0f, -100f, 100f, 100f),
         "90度旋转变体1" to Matrix(0f, 100f, 100f, 0f, 0f, 0f),
         "90度旋转变体2" to Matrix(0f, -100f, -100f, 0f, 100f, 100f),
         "90度旋转变体3" to Matrix(0f, 100f, -100f, 0f, 100f, 0f),
@@ -217,9 +232,14 @@ class PdfTextExtractorImageOrientationTest {
         // 上面那条测试只保证"和参照模型一致"，不直接暴露具体颜色顺序——这条补一个
         // 具体断言，双重锁定这套验证方法本身可信：canonical CTM 下不应该做任何
         // 修正，四角应该还是原始位图本来的样子。
+        //
+        // 2026-08-19 勘误：这里原来用的 CTM 是 `a=100>0, d=-100<0`（旧假设里的
+        // "基准"），改成了 `a=100>0, d=100>0`——用 Python 手写 PDF + poppler
+        // `pdftoppm` 独立渲染验证过，`a>0 d>0` 才是"Bitmap 不需要任何修正"的真实
+        // 基准（见 PdfTextExtractor.orientationMatrixOrNull KDoc 的完整说明）。
         val corrected = PdfTextExtractor.applyCtmOrientation(
             buildQuadrantBitmap(),
-            Matrix(100f, 0f, 0f, -100f, 0f, 100f),
+            Matrix(100f, 0f, 0f, 100f, 0f, 0f),
         )
         assertEquals(listOf(Corner.TL, Corner.TR, Corner.BL, Corner.BR), corners(corrected))
     }

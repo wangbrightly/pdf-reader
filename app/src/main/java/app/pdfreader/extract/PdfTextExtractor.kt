@@ -364,8 +364,6 @@ object PdfTextExtractor {
         val result = mutableMapOf<Int, Bitmap>()
         for (pageNo in candidatePages) {
             val bitmap = runCatching {
-                val rotation = document.getPage(pageNo - 1).rotation
-                android.util.Log.d("PdfReaderDebug", "表格页 $pageNo 的 page.rotation=$rotation")
                 renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
             }.getOrNull() ?: continue
             result[pageNo] = bitmap
@@ -444,14 +442,31 @@ object PdfTextExtractor {
      * 见类注释"内嵌图片朝向修正"一节。把 CTM 的线性部分（`a`/`b`/`c`/`d`，忽略跟朝向
      * 无关的平移分量 `e`/`f`）换算成需要施加在 [bitmap] 上的修正矩阵。
      *
-     * 推导：直接显示 `PDImage.getImage()` 拿到的原始 [Bitmap]、不做任何修正，等价于
-     * 已经隐含施加了一个基准变换 `R0 = diag(1,-1)`——PDF 图片空间"原点左上、y 轴向下"
-     * 转成页面空间"y 轴向上"唯一必要的那次翻转，正好也是 `Bitmap` 像素排列顺序本身
-     * 自带的效果，不需要额外计算。如果真实 CTM 在 `R0` 之外还多摆了一层，需要在
-     * `Bitmap` 上补上"多出来的那一层"：`M = R0 · CTM线性部分`，展开是
-     * `M = [[a, c], [-b, -d]]`。
+     * ## 2026-08-19 勘误：原纸面推导的基准假设是反的
      *
-     * 只处理 `M` 是"轴对齐"的情形——`b≈0` 且 `c≈0`（纯翻转，含不翻转）、或 `a≈0` 且
+     * 最初的版本靠纸面推导，假定"不翻转"的基准 CTM 是 `a>0、d<0`（即 `R0=diag(1,-1)`
+     * 要跟 CTM 复合）。真机上一本扫描书全书上下+左右都反了，用这个假设"修完"之后
+     * 依然是反的——说明假设本身就错了，不是又漏了一层。改用真正独立的验证方式：
+     * 不再自己推导数学，用 Python 手写最小 PDF（4 色象限测试图 + 明确指定的 CTM），
+     * 拿 poppler 的 `pdftoppm`（跟 PDFBox 完全独立的另一套 PDF 渲染器）渲染出"标准
+     * 答案"，再用 PIL 采样具体像素颜色，逐个跟本函数的输出比对：
+     *
+     * - CTM `[100 0 0 150 50 50]`（`a>0 d>0`）→ ground truth 证明原始 `Bitmap`
+     *   **不需要任何修正**——也就是说"不翻转"的基准其实是 `a>0、d>0`，不是
+     *   `a>0、d<0`。
+     * - CTM `[100 0 0 -150 50 200]`（`a>0 d<0`）→ ground truth 证明**需要垂直
+     *   翻转**——跟原假设正好相反。
+     * - CTM `[0 100 -100 0 150 50]`（90° 旋转分支）→ ground truth 证明修正矩阵
+     *   应为 `[[0,1],[-1,0]]`，而旧代码在这个输入下算出的是 `[[0,-1],[-1,0]]`
+     *   （`m01` 符号反了，`m10` 是对的）。
+     *
+     * 据此改用的基准和分支逻辑见下面 `when` 分支里的具体判断，不再重复整套矩阵推导——
+     * 这次的教训是"纸面推导容易在符号方向上出错，且不会自证"，往后如果再改这块，
+     * 应该继续用"独立渲染器 + 具体像素采样"这种能被证伪的方式验证，而不是再推一遍
+     * 公式。三份测试 PDF 和 poppler 渲染结果的构造脚本未纳入仓库（纯验证用途，见
+     * commit message）。
+     *
+     * 只处理"轴对齐"的情形——`b≈0` 且 `c≈0`（纯翻转，含不翻转）、或 `a≈0` 且
      * `d≈0`（90°/270° 旋转，可能叠加翻转），覆盖 D4 群全部 8 种朝向；任何其它情形
      * （任意角度旋转/斜切）原样返回、不修正——这是有意的降级范围，见类注释"已知局限"
      * 一节。
@@ -511,16 +526,16 @@ object PdfTextExtractor {
             // 四个分量都接近零：退化矩阵（图片被缩放成几乎不可见），没有意义去修正。
             abs(a) < eps && abs(b) < eps && abs(c) < eps && abs(d) < eps -> return null
             abs(b) < eps && abs(c) < eps -> {
-                // 不旋转，只可能翻转：基准是 a>0、d<0（见上方推导）。
+                // 不旋转，只可能翻转：基准是 a>0、d>0（见上方"2026-08-19 勘误"）。
                 m00 = if (a < 0) -1f else 1f
                 m01 = 0f
                 m10 = 0f
-                m11 = if (d > 0) -1f else 1f
+                m11 = if (d > 0) 1f else -1f
             }
             abs(a) < eps && abs(d) < eps -> {
                 // 90°/270° 旋转（可能叠加翻转）。
                 m00 = 0f
-                m01 = sign(c)
+                m01 = -sign(c)
                 m10 = -sign(b)
                 m11 = 0f
             }
@@ -682,7 +697,8 @@ object PdfTextExtractor {
 
         override fun drawImage(pdImage: PDImage) {
             val bitmap = runCatching { pdImage.image }.getOrNull() ?: return
-            images.add(applyCtmOrientation(bitmap, graphicsState.currentTransformationMatrix))
+            val ctm = graphicsState.currentTransformationMatrix
+            images.add(applyCtmOrientation(bitmap, ctm))
         }
 
         override fun appendRectangle(p0: PointF, p1: PointF, p2: PointF, p3: PointF) = Unit
