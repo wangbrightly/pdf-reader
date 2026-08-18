@@ -86,6 +86,33 @@ class TableGridDetectorTest {
     }
 
     @Test
+    fun `页面上方3条不相关横线和下方3条不相关竖线不构成表格`() {
+        // 真机反馈发现的真实误判场景：一个 10 页文档里 7 页被误判成表格，追查是
+        // 旧逻辑只数"页面里横线够不够多、竖线够不够多"，不管这些线在页面上到底
+        // 长在哪——页眉附近有几条装饰分隔线，页脚附近又有几条不相关的竖线（比如
+        // 多个独立的强调竖条），凑巧各自够 3 条，就被判成"网格"，但这两批线段
+        // 根本不在同一块区域，谈不上"交织成表格"。这条测试的横线全部集中在页面
+        // 顶部（y=650-700），竖线全部集中在页面底部（y=50-100），两批线段的
+        // Y 范围完全不重叠，不应该被判定为表格。
+        val segments = mutableListOf<LineSegment>()
+        for (y in listOf(650f, 675f, 700f)) segments.add(LineSegment(50f, y, 550f, y))
+        for (x in listOf(100f, 300f, 500f)) segments.add(LineSegment(x, 50f, x, 100f))
+
+        assertFalse(TableGridDetector.looksLikeTable(segments))
+    }
+
+    @Test
+    fun `左右两栏排版各自的分隔线不构成表格（横线在左栏、竖线在右栏）`() {
+        // 跟上一条测试同一个精神，换一个方向：横线集中在页面左半边（x=50-250），
+        // 竖线集中在页面右半边（x=400-450），X 范围不重叠，同样不该判定为表格。
+        val segments = mutableListOf<LineSegment>()
+        for (y in listOf(100f, 200f, 300f)) segments.add(LineSegment(50f, y, 250f, y))
+        for (x in listOf(400f, 420f, 450f)) segments.add(LineSegment(x, 500f, x, 700f))
+
+        assertFalse(TableGridDetector.looksLikeTable(segments))
+    }
+
+    @Test
     fun `坐标有细微误差（同一条网格线的两条边缘各差1pt）仍能聚类成同一条线`() {
         // 对应"细长填充矩形画边框"这个真实观察：一条逻辑上的横线，实际由 y=79 和
         // y=80 两条边组成（矩形厚度 1pt），必须聚类成同一条线，不能被错误地当成
