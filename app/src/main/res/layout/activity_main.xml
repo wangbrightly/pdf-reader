@@ -8,6 +8,8 @@
       对 rootLayout 动态加 padding——试过 XML 里写 android:fitsSystemWindows="true"，
       真机截图验证发现在这台设备（安卓走 edge-to-edge 强制内容延伸到状态栏后面）上不生效，
       按钮顶部还是被状态栏文字盖住，改用现在这种主动读 WindowInsets 的写法才是真的避开。
+      2026-08-19 补：同样的机制也覆盖了底部导航栏（三键导航条比手势条高，会挡住内容
+      最后一行）——见 MainActivity.applySystemBarInsetsAsPadding。
     - 根布局加了整体内外边距，按钮和设置区之间、设置区内部三组滑杆之间都加了间距，
       不再是贴在一起的一坨。
     - 三个滑杆包进一个带浅色背景的分组容器，视觉上跟"打开 PDF"按钮和下面的内容区分开，

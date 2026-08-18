@@ -198,7 +198,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        applyStatusBarInsetAsPadding()
+        applySystemBarInsetsAsPadding()
 
         openButton = findViewById(R.id.openButton)
         tocButton = findViewById(R.id.tocButton)
@@ -336,17 +336,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 让根布局的顶部内边距动态加上状态栏高度，避免第一个控件（打开 PDF 按钮）被状态栏
-     * 文字/图标盖住。
+     * 让根布局的顶部/底部内边距动态加上状态栏/导航栏高度，避免内容被系统栏盖住。
      *
      * 2026-08-18 真机截图验证过：XML 里写 `android:fitsSystemWindows="true"` 在这台设备
      * 上不生效——现代安卓（尤其 edge-to-edge 强制生效的版本）默认让内容延伸到系统栏后面，
      * `fitsSystemWindows` 这个老属性覆盖不了这种情况，必须主动监听 [WindowInsetsCompat]
-     * 读出状态栏高度、手动加进 padding。只处理顶部（状态栏）：底部导航栏这台设备是手势
-     * 导航条，不挡到 `contentScrollView`，暂不处理，以后如果发现虚拟按键导航条挡住底部
-     * 内容，再照同样的思路把 `insets.bottom` 也加进 `paddingBottom`。
+     * 读出系统栏高度、手动加进 padding。
+     *
+     * 2026-08-19 补底部：当时只处理了顶部（状态栏），底部判断"这台设备是手势导航条，
+     * 不挡内容"——用户截图反馈底部确实被挡住了，说明这台设备当时用的是三键导航条
+     * （比手势条高得多），或者用户后来切换了导航模式；不管哪种，"读 [WindowInsetsCompat]
+     * 手动加 padding"这个机制本身跟导航模式无关，两种模式下 `navigationBars()` 这个
+     * inset 类型都会返回正确的高度（手势条模式下这个值很小，三键模式下明显更高）——
+     * 直接照顶部同样的思路把 `insets.bottom` 也加进 `paddingBottom`，不需要自己判断
+     * 当前是哪种导航模式。
      */
-    private fun applyStatusBarInsetAsPadding() {
+    private fun applySystemBarInsetsAsPadding() {
         val root = findViewById<View>(R.id.rootLayout)
         val basePaddingLeft = root.paddingLeft
         val basePaddingTop = root.paddingTop
@@ -354,11 +359,12 @@ class MainActivity : AppCompatActivity() {
         val basePaddingBottom = root.paddingBottom
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, windowInsets ->
             val statusBarInset = windowInsets.getInsets(WindowInsetsCompat.Type.statusBars())
+            val navigationBarInset = windowInsets.getInsets(WindowInsetsCompat.Type.navigationBars())
             view.setPadding(
                 basePaddingLeft,
                 basePaddingTop + statusBarInset.top,
                 basePaddingRight,
-                basePaddingBottom,
+                basePaddingBottom + navigationBarInset.bottom,
             )
             windowInsets
         }
