@@ -73,7 +73,7 @@ import kotlin.math.sign
  * 触发过这个路径，改动前的 40 个测试不受影响）。
  *
  * 单张图片抽取失败（解码异常、格式不支持等）只跳过那一张，不影响其余图片和全部文字，
- * 见 [extractImages] 里的 `runCatching`。
+ * 见 [buildInlineImages] 里的 `runCatching`。
  *
  * ## 内嵌图片朝向修正（2026-08-18 增量，真机反馈"部分图片方向不对"）
  *
@@ -110,8 +110,9 @@ import kotlin.math.sign
  * 解码这一层，不在 [applyCtmOrientation] 的翻转/旋转逻辑本身，所以改成"独立参照
  * 模型直接比对纯 CTM 数学"，绕开这两个不相关的坑，见该测试文件顶部注释。
  *
- * **修法**：抽取逻辑不再遍历 `PDResources` 挖图片，改成像 [TableGridStreamEngine]
- * 抓矢量线段那样，用 [ImageDrawStreamEngine]（继承 `PDFGraphicsStreamEngine`）
+ * **修法**：抽取逻辑不再遍历 `PDResources` 挖图片，改成用 [PageContentStreamEngine]
+ * （继承 `PDFGraphicsStreamEngine`，2026-08-19 起同时也是表格检测用的矢量线段
+ * 收集器，见后面"表格检测/图片抽取合并成一次遍历"一节）
  * 处理页面 content stream，在 `drawImage()` 回调里同时拿到图片和"画这张图那一刻"
  * 的 CTM（`graphicsState.currentTransformationMatrix`），交给 [applyCtmOrientation]
  * 换算成需要施加在 `Bitmap` 上的翻转/旋转操作。这个改动顺带修了两个改动前完全没
@@ -133,7 +134,7 @@ import kotlin.math.sign
  * 内所有 CTM（包括图片的），不是"抽取单个图片资源、自己拼位图"这条路径，两者用的
  * 是完全不同的代码，这个判断没有另外找 fixture 验证（renderImageWithDPI 是否正确
  * 处理 CTM 属于 PdfBox-Android 库自身职责范围，不是本项目代码，没有理由重新验证
- * 一个第三方库的核心渲染路径），只是读代码路径确认它和 [extractImages] 走的不是
+ * 一个第三方库的核心渲染路径），只是读代码路径确认它和 [scanPages] 走的不是
  * 同一段逻辑。
  *
  * ## 表格检测（2026-08-18 增量）：疑似表格的整页降级为图片
@@ -143,8 +144,8 @@ import kotlin.math.sign
  * （业界专门做这个的 Camelot/Tabula 都只能做到"启发式+带误判"，见任务描述）。这里
  * 不追求精确识别表格边界，采用两段降级：
  *
- * 1. **检测信号：矢量网格线，不是文字列对齐。** [detectTablePages] 对每一页跑一遍
- *    [TableGridStreamEngine]（继承 `PDFGraphicsStreamEngine`，能拿到页面 content
+ * 1. **检测信号：矢量网格线，不是文字列对齐。** [scanPages] 对每一页跑一遍
+ *    [PageContentStreamEngine]（继承 `PDFGraphicsStreamEngine`，能拿到页面 content
  *    stream 里 `re`/`m l S` 等图形操作符的线段坐标），把线段交给纯逻辑
  *    [TableGridDetector.looksLikeTable] 判断"这一页是不是有网格"。选网格线而不是
  *    "文字按列对齐"这个更简单的信号，是因为后者在多栏排版、目录页上误判率明显更高
@@ -153,7 +154,7 @@ import kotlin.math.sign
  *    出这种矢量图形，误判率天然更低，符合"宁可漏检、不可错杀"的保守策略（见
  *    [TableGridDetector] 类注释的完整阈值设计理由）。用真实 fixture
  *    （`sample-with-table.pdf`）反编译验证过：Chromium 打印 `<table border>` 时，
- *    表格边框是画成"细长填充矩形"而不是描边直线，[TableGridStreamEngine] 对
+ *    表格边框是画成"细长填充矩形"而不是描边直线，[PageContentStreamEngine] 对
  *    `appendRectangle`/`strokePath`/`fillPath` 都做了处理，两种画法都能识别。
  *
  * 2. **降级策略：一旦一页疑似有表格，整页都不参与 reflow，改成渲染成一张 Bitmap。**
@@ -204,6 +205,21 @@ import kotlin.math.sign
  * 故意不处理标题行"见该类 KDoc。过滤发生在 [linesToParagraphs] 之后、其余所有
  * 依赖段落下标的计算（图片插入位置、目录页内定位）之前，这样下标体系从一开始就是
  * "过滤后的段落列表"，不需要在后面的每一处计算里再去处理"要跳过被删掉的段落"。
+ *
+ * ## 表格检测/图片抽取合并成一次遍历（2026-08-19 性能优化）
+ *
+ * 用户反馈加载太慢，真机日志实测一份 136 页文档：检测表格 1.3s + 抽取内嵌图片
+ * 2.6s，两者相加占了总加载时间（4.9s）的大头。根因是这两步各自独立跑一遍
+ * `PDFGraphicsStreamEngine.processPage`——同一份 content stream 的操作符 token
+ * 被完整解析了两遍，一遍只为了收集矢量线段（表格检测），另一遍只为了收集图片。
+ *
+ * 改成 [scanPages]：每页只跑一遍 [PageContentStreamEngine]（合并了原来独立的
+ * `TableGridStreamEngine`/`ImageDrawStreamEngine`），一次遍历同时收集矢量线段和
+ * 图片，返回 [PageScan]（每页各自的线段+图片）。原来 [detectTablePages] 单独判断
+ * "是不是表格"的逻辑现在挪到 [scanPages] 调用方那一行 `filterValues`；原来
+ * `extractImages` 需要"重新解析 content stream 拿图片"的部分不再需要，换成
+ * [buildInlineImages]——纯粹的列表组装（配合 [ImagePlacement] 算插入位置），因为
+ * 图片本身已经在 [scanPages] 阶段收集好了，组装这一步不再有 PDF 解析开销。
  */
 object PdfTextExtractor {
 
@@ -259,16 +275,18 @@ object PdfTextExtractor {
 
     /**
      * 文字段落 + 图片（按页归类插入位置）一次性抽取，只解析一遍 PDF——见类注释
-     * "图片抽取"一节。图片抽取失败不影响这次调用整体成功，见 [extractImages]。
+     * "图片抽取"一节。图片抽取失败不影响这次调用整体成功，见 [buildInlineImages]。
      */
     fun extractContent(context: Context, file: File): PdfContent {
         PDFBoxResourceLoader.init(context.applicationContext ?: context)
         PDDocument.load(file).use { document ->
             val t0 = System.currentTimeMillis()
-            // 先渲染疑似表格页（成功的才计入"跳过文字抽取"名单，见类注释"表格检测"
-            // 一节——渲染失败时宁可让这页退回正常文字抽取，也不让内容整页消失）。
-            val candidatePages = detectTablePages(document)
+            // 表格检测（矢量线段）和图片抽取（Bitmap）合并成一次遍历，见类注释
+            // "表格检测/图片抽取合并成一次遍历"一节——这一步是原来"检测表格"+"抽取
+            // 内嵌图片"两步耗时的大头，合并后省掉重复解析 content stream 的开销。
+            val pageScans = scanPages(document)
             val t1 = System.currentTimeMillis()
+            val candidatePages = pageScans.filterValues { TableGridDetector.looksLikeTable(it.segments) }.keys
             val tablePageImages = renderTablePageImages(document, candidatePages)
             val renderedTablePages = tablePageImages.keys
             val t2 = System.currentTimeMillis()
@@ -290,7 +308,7 @@ object PdfTextExtractor {
             val paragraphPages = paragraphs.map { it.page }
             val paragraphTopYs = paragraphs.map { it.topY }
 
-            val inlineImages = extractImages(document, paragraphs, excludePages = renderedTablePages)
+            val inlineImages = buildInlineImages(pageScans, paragraphPages, excludePages = renderedTablePages)
             val t4 = System.currentTimeMillis()
             val tableImages = renderedTablePages.map { pageNo ->
                 ExtractedImage(
@@ -305,8 +323,8 @@ object PdfTextExtractor {
             android.util.Log.d(
                 "PdfReaderDebug",
                 "页数=${document.numberOfPages} 疑似表格页=${candidatePages.size} " +
-                    "检测表格=${t1 - t0}ms 渲染表格页=${t2 - t1}ms 抽取文字=${t3 - t2}ms " +
-                    "抽取内嵌图片=${t4 - t3}ms 总计=${t4 - t0}ms",
+                    "扫描页面(表格检测+图片抽取)=${t1 - t0}ms 渲染表格页=${t2 - t1}ms " +
+                    "抽取文字=${t3 - t2}ms 组装图片=${t4 - t3}ms 总计=${t4 - t0}ms",
             )
             return PdfContent(
                 paragraphs.map { it.text },
@@ -336,7 +354,7 @@ object PdfTextExtractor {
      * `findDestinationPage` 遇到未知的 destination 类型会抛 `IOException`，或者
      * 目标页解析出来是 `null`——命名目标查不到、既无 destination 又无 GoTo action
      * 都会走到这个分支）只跳过这一项本身，不影响它的兄弟项；即使这一项解析失败，也
-     * 继续递归它的子项——单个目录项的问题不该连累其余目录项，是和 [extractImages]
+     * 继续递归它的子项——单个目录项的问题不该连累其余目录项，是和 [buildInlineImages]
      * 里"单张图片失败不连累其它"同一种降级精神。
      */
     private fun collectOutlineEntries(
@@ -395,24 +413,29 @@ object PdfTextExtractor {
         page.mediaBox.height - top
     }.getOrNull()
 
+    /** 一页 content stream 里同时收集出来的矢量线段（表格检测用）和图片（图片抽取用）。 */
+    private data class PageScan(val segments: List<LineSegment>, val images: List<Bitmap>)
+
     /**
-     * 对文档每一页跑一遍 [TableGridStreamEngine]，收集"疑似表格"的页码（1-based）。
-     * 单页检测出异常（个别页面 content stream 有解析问题）只跳过那一页的判断，不让
-     * 整份文档的抽取失败——和 [extractImages] 里"单张图片失败不连累其它"是同一种
-     * 降级精神。
+     * 对文档每一页跑一遍 [PageContentStreamEngine]，一次遍历同时拿到表格检测用的矢量
+     * 线段和图片抽取用的 [Bitmap] 列表——见类注释"表格检测/图片抽取合并成一次遍历"
+     * 一节（2026-08-19 性能优化）。单页扫描出异常（content stream 解析问题等）只让
+     * 那一页退化成"没有线段、没有图片"（不判定为表格、也不产出内嵌图片），不让整份
+     * 文档的抽取失败——延续原来两个引擎各自的降级精神，合并成一次遍历后用同一个
+     * `runCatching` 覆盖两种情形。
      */
-    private fun detectTablePages(document: PDDocument): Set<Int> {
-        val tablePages = mutableSetOf<Int>()
+    private fun scanPages(document: PDDocument): Map<Int, PageScan> {
+        val result = LinkedHashMap<Int, PageScan>(document.numberOfPages)
         for (pageIndex in 0 until document.numberOfPages) {
             val page = document.getPage(pageIndex)
-            val looksLikeTable = runCatching {
-                val engine = TableGridStreamEngine(page)
+            val scan = runCatching {
+                val engine = PageContentStreamEngine(page)
                 engine.processPage(page)
-                TableGridDetector.looksLikeTable(engine.segments)
-            }.getOrDefault(false)
-            if (looksLikeTable) tablePages.add(pageIndex + 1)
+                PageScan(engine.segments, engine.images)
+            }.getOrDefault(PageScan(emptyList(), emptyList()))
+            result[pageIndex + 1] = scan
         }
-        return tablePages
+        return result
     }
 
     /**
@@ -434,8 +457,10 @@ object PdfTextExtractor {
         return result
     }
 
-    /** 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。 */
-    /** [topY] 是这个段落第一行的 [Line.y]（距页面顶部多少 pt），供目录页内精确定位用。 */
+    /**
+     * 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。
+     * [topY] 是这个段落第一行的 [Line.y]（距页面顶部多少 pt），供目录页内精确定位用。
+     */
     private data class Paragraph(val text: String, val page: Int, val topY: Float)
 
     private fun linesToParagraphs(lines: List<Line>): List<Paragraph> {
@@ -470,35 +495,23 @@ object PdfTextExtractor {
     }
 
     /**
-     * 对每一页跑一遍 [ImageDrawStreamEngine]（跟着 content stream 的 `Do` 操作符走，
-     * 而不是遍历 `PDResources`——见类注释"内嵌图片朝向修正"一节），拿到已经按 CTM
-     * 修正过朝向的 [Bitmap] 列表，配合 [ImagePlacement] 算出这一页的图片该插在哪个
-     * 段落之后。单张图片转换失败（`getImage()` 抛异常，在 [ImageDrawStreamEngine]
-     * 内部处理）只跳过那一张；单页处理异常（content stream 解析问题等）只跳过那一页
-     * 的图片，都不让整个文档抽取失败——延续"降级"精神：宁可漏掉一张图/一页图片，
-     * 也不能因此让用户连文字都看不到。
+     * 把 [scanPages] 已经收集好的图片，配合 [ImagePlacement] 算出每张图片该插在哪个
+     * 段落之后——纯粹的列表组装，不再需要重新解析 content stream（那部分开销已经在
+     * [scanPages] 里付过了），所以这一步很快。
      *
      * [excludePages] 是已经整页渲染成图片的表格页（见类注释"表格检测"一节）——这些
-     * 页面的内嵌图片已经包含在整页渲染结果里了，不需要再单独抽取一遍、重复显示。
+     * 页面的内嵌图片已经包含在整页渲染结果里了，不需要再单独展示一遍。
      */
-    private fun extractImages(
-        document: PDDocument,
-        paragraphs: List<Paragraph>,
+    private fun buildInlineImages(
+        pageScans: Map<Int, PageScan>,
+        paragraphPages: List<Int>,
         excludePages: Set<Int>,
     ): List<ExtractedImage> {
-        val paragraphPages = paragraphs.map { it.page }
         val images = mutableListOf<ExtractedImage>()
-        for (pageIndex in 0 until document.numberOfPages) {
-            val pageNo = pageIndex + 1
+        for ((pageNo, scan) in pageScans) {
             if (pageNo in excludePages) continue
-            val page: PDPage = document.getPage(pageIndex)
             val afterIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo)
-            val pageImages = runCatching {
-                val engine = ImageDrawStreamEngine(page)
-                engine.processPage(page)
-                engine.images
-            }.getOrDefault(emptyList())
-            for (bitmap in pageImages) {
+            for (bitmap in scan.images) {
                 images.add(ExtractedImage(bitmap, afterIndex))
             }
         }
@@ -659,10 +672,18 @@ object PdfTextExtractor {
     }
 
     /**
-     * PDFBox 图形流引擎适配层：把一页 content stream 里画路径用的操作符（`m`/`l`/`c`/
-     * `re`/`S`/`f`/`B`……）转成一批 [LineSegment]，交给纯逻辑 [TableGridDetector] 判断。
-     * 只关心"画了哪些直线段"，不关心颜色/线宽/是否真的可见（够用即可，见类注释
-     * "表格检测"一节）。
+     * PDFBox 图形流引擎适配层：一次遍历同时做两件事——见类注释"表格检测/图片抽取
+     * 合并成一次遍历"一节（2026-08-19 性能优化）：
+     *
+     * 1. 把画路径用的操作符（`m`/`l`/`c`/`re`/`S`/`f`/`B`……）转成一批 [LineSegment]，
+     *    交给纯逻辑 [TableGridDetector] 判断（原来独立的 `TableGridStreamEngine`）。
+     * 2. 处理 `Do`/`BI…EI` 操作符（画图片）——[drawImage] 捕获画这张图那一刻的 CTM
+     *    （`graphicsState.currentTransformationMatrix`），交给 [applyCtmOrientation]
+     *    修正朝向（原来独立的 `ImageDrawStreamEngine`）。
+     *
+     * 这两件事互不干扰：PDF content stream 里矢量路径操作符和图片操作符是分开触发
+     * 不同回调的，合并只是省掉"同一份 content stream 重新解析一遍 token"的开销，
+     * 不改变各自的判断逻辑。
      *
      * 只有在路径被真正"画出来"（[strokePath]/[fillPath]/[fillAndStrokePath]，对应
      * PDF 的 `S`/`f`/`B` 等操作符）时，累积在 [pendingSegments] 里的线段才会提交进
@@ -672,9 +693,13 @@ object PdfTextExtractor {
      * 曲线（[curveTo]）只把终点当作直线的端点纳入路径追踪（用于正确维护"当前点"），
      * 不生成线段——表格网格线是直线，不会是贝塞尔曲线，忽略曲线本身的走向不影响
      * 判断，也避免把任意曲线误当成网格线的一部分。
+     *
+     * 单张图片转换失败（`getImage()` 抛异常）只跳过那一张，不中断整页处理——延续
+     * [buildInlineImages] 一贯的降级精神。
      */
-    private class TableGridStreamEngine(page: PDPage) : PDFGraphicsStreamEngine(page) {
+    private class PageContentStreamEngine(page: PDPage) : PDFGraphicsStreamEngine(page) {
         val segments = mutableListOf<LineSegment>()
+        val images = mutableListOf<Bitmap>()
         private val pendingSegments = mutableListOf<LineSegment>()
         private var currentX = 0f
         private var currentY = 0f
@@ -742,43 +767,14 @@ object PdfTextExtractor {
 
         override fun getCurrentPoint(): PointF = PointF(currentX, currentY)
 
-        // 表格网格检测不关心裁剪区域、图片、阴影填充，全部当无操作处理。
-        override fun clip(windingRule: Path.FillType) = Unit
-        override fun shadingFill(shadingName: com.tom_roush.pdfbox.cos.COSName) = Unit
-        override fun drawImage(pdImage: PDImage) = Unit
-    }
-
-    /**
-     * 内嵌图片抽取所用的图形流引擎：处理页面 content stream 里的 `Do`/`BI…EI` 操作符
-     * （画图片），见类注释"内嵌图片朝向修正"一节。核心是 [drawImage]——捕获画这张图
-     * 那一刻的 CTM（`graphicsState.currentTransformationMatrix`），交给
-     * [applyCtmOrientation] 修正朝向。除 [drawImage] 外的路径相关抽象方法全部
-     * no-op——这个引擎不关心矢量路径（矢量表格检测走的是 [TableGridStreamEngine]，
-     * 职责分开）。
-     *
-     * 单张图片转换失败（`getImage()` 抛异常）只跳过那一张，不中断整页处理——延续
-     * [extractImages] 一贯的降级精神。
-     */
-    private class ImageDrawStreamEngine(page: PDPage) : PDFGraphicsStreamEngine(page) {
-        val images = mutableListOf<Bitmap>()
-
         override fun drawImage(pdImage: PDImage) {
             val bitmap = runCatching { pdImage.image }.getOrNull() ?: return
             val ctm = graphicsState.currentTransformationMatrix
             images.add(applyCtmOrientation(bitmap, ctm))
         }
 
-        override fun appendRectangle(p0: PointF, p1: PointF, p2: PointF, p3: PointF) = Unit
+        // 表格网格检测不关心裁剪区域、阴影填充，当无操作处理。
         override fun clip(windingRule: Path.FillType) = Unit
-        override fun moveTo(x: Float, y: Float) = Unit
-        override fun lineTo(x: Float, y: Float) = Unit
-        override fun curveTo(x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float) = Unit
-        override fun getCurrentPoint(): PointF = PointF(0f, 0f)
-        override fun closePath() = Unit
-        override fun endPath() = Unit
-        override fun strokePath() = Unit
-        override fun fillPath(windingRule: Path.FillType) = Unit
-        override fun fillAndStrokePath(windingRule: Path.FillType) = Unit
         override fun shadingFill(shadingName: com.tom_roush.pdfbox.cos.COSName) = Unit
     }
 }
