@@ -10,6 +10,7 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImage
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
 import com.tom_roush.pdfbox.rendering.PDFRenderer
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
@@ -102,6 +103,32 @@ import java.text.Normalizer
  *    退回正常的文字抽取路径——见 [renderTablePageImages] 里的 `runCatching`，这样
  *    "表格检测/渲染出问题"最坏情况下只是退化成"这页表格没能整页降级、还是按普通
  *    文字重排"，不会让用户连文字都看不到。
+ *
+ * ## 大纲/目录抽取（2026-08-18 增量）：有官方结构就直接读，没有就如实留空
+ *
+ * PDF 格式本身有一套标准的大纲（Outline，常俗称"书签"）结构，不像表格检测那样要
+ * 自己发明启发式——`document.getDocumentCatalog().getDocumentOutline()` 返回
+ * `PDDocumentOutline`（没有大纲时是 `null`，这是很常见的情况，尤其是普通文档/扫描件
+ * 转出来的 PDF），子项通过 `PDOutlineNode.children()`（内部就是按 `getFirstChild()`/
+ * `getNextSibling()` 遍历）拿到 `Iterable<PDOutlineItem>`，标题读 `getTitle()`
+ * （可能是 `null`，见 [OutlineEntry.title] 处理），目标页用
+ * `PDOutlineItem.findDestinationPage(PDDocument)` 解析——已读 PdfBox-Android 上游
+ * 源码确认其行为：destination 为 `null` 且没有可用的 GoTo action 时返回 `null`；
+ * 命名目标在文档编目查不到时也返回 `null`；只有遇到未知的 destination 类型才会抛
+ * `IOException`。这两类"解析不出目标页"的情况都只跳过这一个目录项（[collectOutlineEntries]
+ * 对每一项单独 `runCatching`），不让整份大纲、更不让整份文档的抽取失败——和图片/
+ * 表格抽取失败的降级精神一致。
+ *
+ * `findDestinationPage` 返回的是 `PDPage` 对象本身，不是页码——用
+ * `document.getPages().indexOf(page)` 换算成 0-based 下标，`+1` 得到和
+ * [Line.page]/`Paragraph.page` 同一套编号（1-based）的页码，这样目录项的页码才能
+ * 喂给 [app.pdfreader.ui.OutlineNavigation] 跟段落页码对齐。
+ *
+ * **没有大纲的 PDF 怎么处理**：[extractOutline] 返回空列表，[PdfContent.outline]
+ * 就是空的——不用字体大小/加粗这类启发式去"猜"标题（这类猜测在表格检测那次已经
+ * 证明误判率不低，目录功能给用户的预期是"点了准确跳转"，猜错了比没有更烂，任务
+ * 描述里也明确要求不要这样做）。UI 层（[app.pdfreader.MainActivity]）据此把"目录"
+ * 按钮禁用，如实反映"这份 PDF 没有内嵌目录"这个事实，不假装有目录。
  */
 object PdfTextExtractor {
 
@@ -186,13 +213,58 @@ object PdfTextExtractor {
                     afterParagraphIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo),
                 )
             }
+            // 大纲抽取失败（文档没有大纲、大纲结构异常等）不能让整份文档的抽取失败，
+            // 见类注释"大纲/目录抽取"一节——outer runCatching 是最后一道保险，内部
+            // collectOutlineEntries 对每个目录项也单独兜底。
+            val outline = runCatching { extractOutline(document) }.getOrDefault(emptyList())
             android.util.Log.d(
                 "PdfReaderDebug",
                 "页数=${document.numberOfPages} 疑似表格页=${candidatePages.size} " +
                     "检测表格=${t1 - t0}ms 渲染表格页=${t2 - t1}ms 抽取文字=${t3 - t2}ms " +
                     "抽取内嵌图片=${t4 - t3}ms 总计=${t4 - t0}ms",
             )
-            return PdfContent(paragraphs.map { it.text }, inlineImages + tableImages)
+            return PdfContent(paragraphs.map { it.text }, inlineImages + tableImages, outline, paragraphPages)
+        }
+    }
+
+    /**
+     * 递归遍历 `document.getDocumentCatalog().getDocumentOutline()`，把 `PDOutlineItem`
+     * 树摊平成一份按先序遍历排列的 [OutlineEntry] 列表——具体 API 见类注释"大纲/目录
+     * 抽取"一节。没有大纲（`getDocumentOutline()` 返回 `null`，PDF 里根本没有内嵌
+     * 书签，很常见）时返回空列表，这是"没有大纲"的正常状态，不是错误。
+     */
+    private fun extractOutline(document: PDDocument): List<OutlineEntry> {
+        val root = document.documentCatalog.documentOutline ?: return emptyList()
+        val entries = mutableListOf<OutlineEntry>()
+        collectOutlineEntries(document, root.children(), depth = 0, entries)
+        return entries
+    }
+
+    /**
+     * 单个目录项的处理拆成两个独立的 `runCatching`：解析这一项自己的目标页失败（比如
+     * `findDestinationPage` 遇到未知的 destination 类型会抛 `IOException`，或者
+     * 目标页解析出来是 `null`——命名目标查不到、既无 destination 又无 GoTo action
+     * 都会走到这个分支）只跳过这一项本身，不影响它的兄弟项；即使这一项解析失败，也
+     * 继续递归它的子项——单个目录项的问题不该连累其余目录项，是和 [extractImages]
+     * 里"单张图片失败不连累其它"同一种降级精神。
+     */
+    private fun collectOutlineEntries(
+        document: PDDocument,
+        items: Iterable<PDOutlineItem>,
+        depth: Int,
+        out: MutableList<OutlineEntry>,
+    ) {
+        for (item in items) {
+            runCatching {
+                val page = item.findDestinationPage(document)
+                if (page != null) {
+                    val pageIndex = document.pages.indexOf(page)
+                    if (pageIndex >= 0) {
+                        out.add(OutlineEntry(title = item.title.orEmpty(), pageNumber = pageIndex + 1, depth = depth))
+                    }
+                }
+            }
+            runCatching { collectOutlineEntries(document, item.children(), depth + 1, out) }
         }
     }
 
@@ -228,6 +300,8 @@ object PdfTextExtractor {
         val result = mutableMapOf<Int, Bitmap>()
         for (pageNo in candidatePages) {
             val bitmap = runCatching {
+                val rotation = document.getPage(pageNo - 1).rotation
+                android.util.Log.d("PdfReaderDebug", "表格页 $pageNo 的 page.rotation=$rotation")
                 renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
             }.getOrNull() ?: continue
             result[pageNo] = bitmap
@@ -436,5 +510,29 @@ object PdfTextExtractor {
  */
 data class ExtractedImage(val bitmap: Bitmap, val afterParagraphIndex: Int)
 
-/** [PdfTextExtractor.extractContent] 的返回值：文字段落 + 图片，按"插在哪个段落之后"关联。 */
-data class PdfContent(val paragraphs: List<String>, val images: List<ExtractedImage>)
+/**
+ * 一条大纲（目录/书签）项，来自 PDF 自带的 `PDDocumentOutline` 结构——见
+ * [PdfTextExtractor] 类注释"大纲/目录抽取"一节。
+ *
+ * @param title 目录项标题。
+ * @param pageNumber 跳转目标页码（1-based，和 [PdfContent.paragraphPages] 用同一套
+ *   编号），已经解析、保证能在这份文档里定位到一个真实存在的页。
+ * @param depth 嵌套深度，最外层是 0，子项是 1，子项的子项是 2，以此类推——不限制
+ *   层数，够用即可（见任务描述"至少要能区分一级/二级"）。
+ */
+data class OutlineEntry(val title: String, val pageNumber: Int, val depth: Int)
+
+/**
+ * [PdfTextExtractor.extractContent] 的返回值：文字段落 + 图片，按"插在哪个段落之后"
+ * 关联；[outline] 是大纲（目录）项列表，没有大纲时是空列表；[paragraphPages] 是每个
+ * 段落所在的页码（与 [paragraphs] 一一对应，页码从 1 起），供
+ * [app.pdfreader.ui.OutlineNavigation] 把"目录项指向第几页"换算成"该滚动到哪个
+ * 展示块"——两个新字段都给了默认值 `emptyList()`，不破坏其余不关心大纲/页码的调用方
+ * （目前没有别处直接用位置参数构造 [PdfContent]，但保留默认值让以后新增调用方更安全）。
+ */
+data class PdfContent(
+    val paragraphs: List<String>,
+    val images: List<ExtractedImage>,
+    val outline: List<OutlineEntry> = emptyList(),
+    val paragraphPages: List<Int> = emptyList(),
+)
