@@ -226,6 +226,51 @@ object PdfTextExtractor {
     /** 整页渲染表格页时使用的 DPI：兼顾清晰度（配合双指缩放放大后仍可读）和内存占用。 */
     private const val TABLE_PAGE_RENDER_DPI = 150f
 
+    /**
+     * 内嵌图片解码时，源图片长边超过这个像素数就降采样——见 [subsamplingFactor] KDoc
+     * "为什么是 2000px"一节。
+     */
+    private const val MAX_IMAGE_DIMENSION_PX = 2000
+
+    /**
+     * 内嵌图片长边（`max(width, height)`）超过 [MAX_IMAGE_DIMENSION_PX] 判定为"过大"，
+     * 每次减半算出理论上该降到多少——纯数学，目前没有生产代码调用它，只被单元测试
+     * 覆盖，保留是因为这条判断逻辑本身是对的、以后重新捡起"大图加载提速"这个方向时
+     * 不用重新推一遍。
+     *
+     * ## 真机踩坑：两次尝试都失败了，这个方向先搁置
+     *
+     * 起因：用户反馈一份 258 页、0 张表格页的文档打开要 25 秒，真机日志确认几乎全部
+     * 耗时都在图片解码——`PDImage.getImage()` 默认按源图片原始分辨率整张解码，源图片
+     * 是几千像素见方的扫描页时，解码成本跟屏幕实际显示尺寸（这台设备约 1440px 物理
+     * 像素）完全不成比例。
+     *
+     * - **尝试 1**：用 `PDImage.getImage(Rect, Int)` 这个带降采样参数的重载，指望
+     *   解码阶段就省下大图开销。真机实测这个重载在 subsampling>1 时稳定抛
+     *   `y + height must be <= bitmap.height()`（试过 region 传 `null`、也试过显式传
+     *   整张图的 `Rect`，结果一样）——这份文档全部 258 张图片解码失败，图片整个不见
+     *   了，日志看着"加载快了 16 倍"其实是全丢了，不是真的变快。
+     * - **尝试 2**：改回可靠的 `pdImage.image` 解码到原始分辨率，解码成功后再用
+     *   `Bitmap.createScaledBitmap` 缩小。这次图片都在了（0 失败），但真机实测总耗时
+     *   反而变成 36.3 秒，比原来的 25.4 秒还慢——解码本身仍然是全分辨率（真正的开销
+     *   大头没有省掉），"解码后再缩小"这一步是纯粹叠加的额外成本，没有任何收益。
+     *
+     * 两次都证明"事后补救"（不管是解码阶段的降采样 API 还是解码后再缩小）在这个
+     * PdfBox-Android 版本/这份文档的组合下走不通。目前 [PageContentStreamEngine
+     * .drawImage] 用回最初的 `pdImage.image`，不做任何降采样处理，保证正确性优先，
+     * 加载慢的问题维持原状。真要继续这个方向，下一步大概率要绕开 PdfBox-Android 的
+     * 图片解码封装，改成自己读 `pdImage.createInputStream()` 拿到压缩字节流后用安卓
+     * 原生 `BitmapFactory.decodeStream` + `Options.inSampleSize` 解码——这条路径对
+     * JPEG/JPX 这类压缩格式应该可靠，但对未压缩的原始像素流不适用，需要先判断图片
+     * 编码格式，复杂度明显更高，没有在这次会话里继续往下做。
+     */
+    internal fun subsamplingFactor(width: Int, height: Int): Int {
+        val longSide = maxOf(width, height)
+        var factor = 1
+        while (longSide / factor > MAX_IMAGE_DIMENSION_PX) factor *= 2
+        return factor
+    }
+
     /** 见上方 KDoc"已知问题"一节。键是部首补充区码位，值是对应的常用独立汉字。 */
     private val RADICALS_SUPPLEMENT_FIX = mapOf(
         '⻋' to '车', // C-SIMPLIFIED CART
@@ -432,6 +477,10 @@ object PdfTextExtractor {
                 val engine = PageContentStreamEngine(page)
                 engine.processPage(page)
                 PageScan(engine.segments, engine.images)
+            }.onFailure {
+                // 临时诊断：确认合并成一次遍历之后，是不是有页面在扫描阶段整页失败
+                // （失败会导致这一页的表格线段和图片全部丢失，不是"没有内容"）。
+                android.util.Log.d("PdfReaderDebug", "scanPages 第${pageIndex + 1}页失败：$it")
             }.getOrDefault(PageScan(emptyList(), emptyList()))
             result[pageIndex + 1] = scan
         }
@@ -768,6 +817,9 @@ object PdfTextExtractor {
         override fun getCurrentPoint(): PointF = PointF(currentX, currentY)
 
         override fun drawImage(pdImage: PDImage) {
+            // 2026-08-19：给大图解码提速这件事目前搁置，见 [subsamplingFactor] KDoc
+            // "真机踩坑：两次尝试都失败了"一节——先用回一直可靠的 `pdImage.image`
+            // 原始分辨率解码，不做任何降采样/事后缩小，保证正确性优先。
             val bitmap = runCatching { pdImage.image }.getOrNull() ?: return
             val ctm = graphicsState.currentTransformationMatrix
             images.add(applyCtmOrientation(bitmap, ctm))
