@@ -6,12 +6,15 @@ import android.util.TypedValue
 import android.view.View
 import android.widget.Button
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import app.pdfreader.extract.PdfTextExtractor
+import app.pdfreader.progress.ReadingProgressKey
+import app.pdfreader.progress.ReadingProgressStore
 import app.pdfreader.reflow.LineWidthEstimator
 import app.pdfreader.reflow.reflow
 import app.pdfreader.settings.ReaderSettings
@@ -61,12 +64,32 @@ import kotlin.concurrent.thread
  * 重排逻辑挪到 [SeekBar.OnSeekBarChangeListener.onStopTrackingTouch]（松手那一刻，
  * 整个拖动过程只触发一次），这是 Android 官方 SeekBar 就自带的"防抖"信号，不需要自己
  * 写计时器/Handler.postDelayed 这类防抖代码。
+ *
+ * ## 阅读进度：记比例、存取抽成独立类、onPause 存 / 内容渲染完后恢复
+ *
+ * "记住每个文件的阅读进度"拆成三件事，纯存取逻辑（[ReadingProgressKey] 算文件标识、
+ * [ReadingProgressStore] 存取滚动比例）都不依赖 Activity，可以脱离 UI 单测；这里只是
+ * 接线：
+ *
+ * 1. **存的时机**：[onPause]（不是 [onStop]——`onPause` 保证在 Activity 可能被系统
+ *    回收前调用，是 Android 官方推荐的"落盘不可丢数据"的时机点，`onStop` 在极端场景
+ *    下可能被跳过）。另外 [loadPdf] 打开新文件前也会先存一次——"打开另一份 PDF"
+ *    对上一份文件来说也是"离开"，不等到整个 Activity 暂停才存。
+ * 2. **恢复的时机**：[render] 处理 [PdfLoadState.Success] 时，内容已经赋给
+ *    [contentText]，但布局（测量出 [contentText] 的实际高度）是异步的，滚动目标要
+ *    等布局完成才算得出来，所以用 `contentScrollView.post { ... }` 把恢复动作排到
+ *    下一次布局之后执行，而不是设完文字立刻滚动（那时候高度还是上一次的旧值）。
+ * 3. **字号/边距重排后的位置还原**：[reflowCurrentParagraphs] 触发重排前，先把
+ *    "当前显示位置对应的滚动比例"存进 [pendingScrollRatio]，重排完成后按同一个比例
+ *    恢复——不是精确到像素/行的还原（重排后每行字符数变了，原来第 500 行不一定还是
+ *    第 500 行），是"大致还在全文的同一个位置"这个粒度，足够用且实现简单。
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var openButton: Button
     private lateinit var progressBar: ProgressBar
     private lateinit var contentText: TextView
+    private lateinit var contentScrollView: ScrollView
 
     private lateinit var fontSizeLabel: TextView
     private lateinit var fontSizeSeekBar: SeekBar
@@ -81,6 +104,16 @@ class MainActivity : AppCompatActivity() {
     /** 最近一次成功抽取出的段落，供字号/边距变化时重新 [reflow]，见类注释。 */
     private var currentParagraphs: List<String>? = null
 
+    /** 当前显示这份文件的阅读进度 key（[ReadingProgressKey]），没打开任何文件时为 null。 */
+    private var currentFileKey: String? = null
+
+    /**
+     * 内容渲染完成后要恢复到的滚动比例。[loadPdf] 里从 [ReadingProgressStore] 读出来，
+     * [reflowCurrentParagraphs] 里则是重排前临时记下的"当前位置"，见类注释"阅读进度"一节。
+     * 消费一次（在 [restoreScrollRatioIfNeeded] 里）就清空，避免下一次渲染误用旧值。
+     */
+    private var pendingScrollRatio: Float? = null
+
     private val openDocumentLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             uri?.let { loadPdf(it) }
@@ -93,6 +126,7 @@ class MainActivity : AppCompatActivity() {
         openButton = findViewById(R.id.openButton)
         progressBar = findViewById(R.id.progressBar)
         contentText = findViewById(R.id.contentText)
+        contentScrollView = findViewById(R.id.contentScrollView)
         fontSizeLabel = findViewById(R.id.fontSizeLabel)
         fontSizeSeekBar = findViewById(R.id.fontSizeSeekBar)
         lineSpacingLabel = findViewById(R.id.lineSpacingLabel)
@@ -113,7 +147,17 @@ class MainActivity : AppCompatActivity() {
         IntentUriResolver.resolvePdfUri(intent)?.let { uri -> loadPdf(uri) }
     }
 
+    /** 离开当前文件（切后台、被系统回收前）时落盘一次阅读进度，见类注释"阅读进度"一节。 */
+    override fun onPause() {
+        super.onPause()
+        saveCurrentReadingProgress()
+    }
+
     private fun loadPdf(uri: Uri) {
+        // 打开新文件前，先把当前正在显示的文件（如果有）的阅读进度存一次——"打开
+        // 另一份 PDF"对上一份文件来说也是"离开"，不用等到 onPause 才存。必须在
+        // render(Loading) 清空 contentText 之前算，不然滚动位置已经被重置成 0。
+        saveCurrentReadingProgress()
         render(PdfLoadState.Loading)
         val lineWidthChars = estimateLineWidthChars()
 
@@ -126,6 +170,12 @@ class MainActivity : AppCompatActivity() {
                     file.delete()
                 }
                 currentParagraphs = paragraphs
+                val fileKey = ReadingProgressKey.fromParagraphs(paragraphs)
+                currentFileKey = fileKey
+                // 读过这份文件就恢复到上次的位置；没读过就是 0f（从头开始），不用
+                // 特殊分支——ReadingProgressStore.loadProgress 没记录时返回 null，
+                // 这里兜底成 0f 是唯一需要区分两种语义的地方。
+                pendingScrollRatio = ReadingProgressStore.loadProgress(applicationContext, fileKey) ?: 0f
                 reflow(paragraphs, lineWidthChars)
             }
             val state = PdfLoadReducer.fromResult(result)
@@ -139,6 +189,10 @@ class MainActivity : AppCompatActivity() {
      */
     private fun reflowCurrentParagraphs() {
         val paragraphs = currentParagraphs ?: return
+        // 重排会整块换掉 contentText 的内容，换之前先把"当前显示位置"换算成比例存起来，
+        // 重排完成后按同一个比例还原（不是像素级精确还原，见类注释"阅读进度"一节）。
+        // 必须在 render(Loading) 清空 contentText 之前算。
+        pendingScrollRatio = computeScrollRatio()
         render(PdfLoadState.Loading)
         val lineWidthChars = estimateLineWidthChars()
 
@@ -256,6 +310,41 @@ class MainActivity : AppCompatActivity() {
 
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
+    /** 当前没有打开任何文件（[currentFileKey] 为 null）时什么都不做。 */
+    private fun saveCurrentReadingProgress() {
+        val key = currentFileKey ?: return
+        ReadingProgressStore.saveProgress(applicationContext, key, computeScrollRatio())
+    }
+
+    /**
+     * 把 [contentScrollView] 当前的滚动位置换算成 0.0-1.0 的比例。内容还没撑满屏幕
+     * （不可滚动）或还没完成布局时，[View.getHeight] 量不出可滚动范围，此时按"在最
+     * 顶部"处理，返回 0f——这也是空文档/刚开始加载时的合理默认值。
+     */
+    private fun computeScrollRatio(): Float {
+        val child = contentScrollView.getChildAt(0) ?: return 0f
+        val scrollableRange = child.height - contentScrollView.height
+        if (scrollableRange <= 0) return 0f
+        return (contentScrollView.scrollY.toFloat() / scrollableRange).coerceIn(0f, 1f)
+    }
+
+    /**
+     * 消费一次 [pendingScrollRatio]（读完就清空，避免下一次渲染误用）。用
+     * `contentScrollView.post { ... }` 把滚动动作排到下一次布局完成之后执行——刚
+     * 设完 `contentText.text`，[contentScrollView] 子 View 的高度还是上一次布局的
+     * 旧值，这一刻直接读高度算出来的滚动目标是错的。
+     */
+    private fun restoreScrollRatioIfNeeded() {
+        val ratio = pendingScrollRatio ?: return
+        pendingScrollRatio = null
+        contentScrollView.post {
+            val child = contentScrollView.getChildAt(0) ?: return@post
+            val scrollableRange = child.height - contentScrollView.height
+            val targetScrollY = if (scrollableRange > 0) (ratio * scrollableRange).toInt() else 0
+            contentScrollView.scrollTo(0, targetScrollY)
+        }
+    }
+
     private fun render(state: PdfLoadState) {
         when (state) {
             PdfLoadState.Idle -> {
@@ -270,6 +359,7 @@ class MainActivity : AppCompatActivity() {
             is PdfLoadState.Success -> {
                 progressBar.visibility = View.GONE
                 contentText.text = state.lines.joinToString("\n")
+                restoreScrollRatioIfNeeded()
             }
 
             is PdfLoadState.Error -> {
