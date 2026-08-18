@@ -16,11 +16,13 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import app.pdfreader.extract.ExtractedImage
+import app.pdfreader.extract.OutlineEntry
 import app.pdfreader.extract.PdfContent
 import app.pdfreader.extract.PdfTextExtractor
 import app.pdfreader.progress.ReadingProgressKey
@@ -29,6 +31,7 @@ import app.pdfreader.settings.ReaderSettings
 import app.pdfreader.settings.ReaderSettingsPreferences
 import app.pdfreader.ui.DisplayBlock
 import app.pdfreader.ui.IntentUriResolver
+import app.pdfreader.ui.OutlineNavigation
 import app.pdfreader.ui.PdfLoadReducer
 import app.pdfreader.ui.PdfLoadState
 import java.io.File
@@ -124,10 +127,40 @@ import kotlin.concurrent.thread
  * [computeScrollRatio]/[restoreScrollRatioIfNeeded] 两个方法都是通过
  * `contentScrollView.getChildAt(0)` 泛泛地拿"内容区总高度"，不关心这个子 View 具体是
  * TextView 还是 LinearLayout。
+ *
+ * ## 目录（2026-08-18 增量）：读 PDF 自带的大纲结构，没有就禁用按钮，不瞎猜
+ *
+ * PDF 格式本身有标准的大纲（Outline/书签）结构，抽取逻辑在
+ * [app.pdfreader.extract.PdfTextExtractor]（该类 KDoc"大纲/目录抽取"一节有 API 细节）
+ * ——这里只是接线：[currentContent] 里已经带上了 [PdfContent.outline]，不需要重新抽取。
+ *
+ * **没有大纲时禁用 [tocButton]，而不是隐藏或点击后弹提示**：
+ * 1. 禁用（变灰但位置不变）比隐藏更好——按钮始终在同一个位置，不会因为换了一份
+ *    文档就让旁边的"打开 PDF"/"收起设置"跟着跳动位置，布局更稳定，用户也不用去
+ *    猜"这个功能是不是消失了"。
+ * 2. 禁用比"点击后弹 Toast 提示"更好——按钮本身的禁用态（变灰、点不动）已经是
+ *    Android 的标准视觉语言，能提前说明"这份文档没有目录"，不需要用户先点一下、
+ *    再看到提示才知道，少一次无意义的交互。
+ *
+ * 每次 [render] 处理 [PdfLoadState.Success]/[PdfLoadState.Loading]/[PdfLoadState.Error]
+ * 都会同步一次 [tocButton] 的启用状态（[syncTocButtonEnabled]），依据是
+ * [currentContent]?.[PdfContent.outline] 是否非空——这样字号/边距变化触发的
+ * [reflowCurrentParagraphs] 重建（[currentContent] 不变，大纲当然也不变）不会误把
+ * 按钮状态改错。
+ *
+ * **点击目录项怎么定位到滚动位置**：目录项给的是"第几页"，需要换算成"应该滚动到
+ * [contentContainer] 里第几个子 View"——这个页码→展示块下标的纯逻辑在
+ * [OutlineNavigation]（该类 KDoc 有完整推导），[scrollToOutlineEntry] 算出目标下标后，
+ * 用 `contentContainer.getChildAt(index)` 拿到目标 View，读它的 [View.getTop] 传给
+ * [ScrollView.smoothScrollTo]——选 `smoothScrollTo` 而不是瞬间跳转，是因为实现复杂度
+ * 完全一样（都是"算出目标 Y 坐标再滚动"，唯一区别是 `smoothScrollTo` 内部自带动画），
+ * 但平滑滚动能让用户感知到"页面往哪个方向跳了多远"，瞬间跳转容易让人一下子迷失在
+ * 陌生的位置，体验明显更好，值得选。
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var openButton: Button
+    private lateinit var tocButton: Button
     private lateinit var toggleSettingsButton: Button
     private lateinit var settingsPanel: View
     private lateinit var progressBar: ProgressBar
@@ -168,6 +201,7 @@ class MainActivity : AppCompatActivity() {
         applyStatusBarInsetAsPadding()
 
         openButton = findViewById(R.id.openButton)
+        tocButton = findViewById(R.id.tocButton)
         toggleSettingsButton = findViewById(R.id.toggleSettingsButton)
         settingsPanel = findViewById(R.id.settingsPanel)
         progressBar = findViewById(R.id.progressBar)
@@ -188,6 +222,7 @@ class MainActivity : AppCompatActivity() {
         openButton.setOnClickListener {
             openDocumentLauncher.launch(arrayOf("application/pdf"))
         }
+        tocButton.setOnClickListener { showOutlineDialog() }
         toggleSettingsButton.setOnClickListener { toggleSettingsPanel() }
 
         // 别的 App"用……打开"分享过来的 PDF：启动时就自动开始抽取，不需要用户再点一次按钮。
@@ -502,6 +537,46 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, state.message, Toast.LENGTH_LONG).show()
             }
         }
+        syncTocButtonEnabled()
+    }
+
+    /** [tocButton] 只在当前文档确实有大纲时可点，见类注释"目录"一节。 */
+    private fun syncTocButtonEnabled() {
+        tocButton.isEnabled = currentContent?.outline?.isNotEmpty() == true
+    }
+
+    /**
+     * 弹出目录列表（`AlertDialog.setItems`——系统自带、自动可滚动，不需要引入新的
+     * UI 库/自定义 Adapter）。层级用缩进表示：每深一级前面加一个全角空格，比半角
+     * 空格视觉上更明显。点某一条就调 [scrollToOutlineEntry]。
+     *
+     * [tocButton] 已经在没有大纲时禁用，理论上点不到这里——这里再判空只是防御性
+     * 兜底（比如设置变化触发 [reflowCurrentParagraphs] 的极短暂窗口期），不依赖它。
+     */
+    private fun showOutlineDialog() {
+        val outline = currentContent?.outline
+        if (outline.isNullOrEmpty()) return
+        val items = outline.map { entry -> "　".repeat(entry.depth) + entry.title }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle(R.string.toc_dialog_title)
+            .setItems(items) { _, which -> scrollToOutlineEntry(outline[which]) }
+            .show()
+    }
+
+    /**
+     * 把 [entry] 指向的页码换算成 [contentContainer] 里的展示块下标（[OutlineNavigation]，
+     * 纯逻辑），再平滑滚动过去，见类注释"目录"一节。任何一步算不出确切位置（没有
+     * 段落、下标越界等边界情况）都直接放弃这次滚动，不强行跳到错误位置。
+     */
+    private fun scrollToOutlineEntry(entry: OutlineEntry) {
+        val content = currentContent ?: return
+        val blockIndex = OutlineNavigation.blockIndexForPage(
+            paragraphPages = content.paragraphPages,
+            imageAfterParagraphIndices = content.images.map { it.afterParagraphIndex },
+            targetPage = entry.pageNumber,
+        ) ?: return
+        val target = contentContainer.getChildAt(blockIndex) ?: return
+        contentScrollView.smoothScrollTo(0, target.top)
     }
 
     /** 把 [blocks] 依次渲染成 [contentContainer] 里的子 View：文字段落→TextView，图片→ImageView。 */

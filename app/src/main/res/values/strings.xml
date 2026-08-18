@@ -9,4 +9,6 @@
     <string name="padding_label">边距：%1$ddp</string>
     <string name="settings_toggle_hide">收起设置</string>
     <string name="settings_toggle_show">展开设置</string>
+    <string name="toc_button">目录</string>
+    <string name="toc_dialog_title">目录</string>
 </resources>

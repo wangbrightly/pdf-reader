@@ -19,6 +19,14 @@
     "打开 PDF"按钮右边（横排，不额外占一整行高度），随时能展开/收起，"打开 PDF"
     按钮本身不折叠（换文件随时要用，且本身占地方不大）。折叠/展开的具体触发逻辑
     （PDF 加载成功后自动收起）在 MainActivity.render() 里。
+
+    2026-08-18 补：加了 tocButton（目录）。
+    放在 openButton 和 toggleSettingsButton 之间——跟"打开 PDF"一样是"内容导航"类
+    操作（不是设置类），紧挨着放符合就近原则；样式沿用 toggleSettingsButton（同样
+    wrap_content 宽度、不额外占地方，横排不新增一整行高度）。没有大纲的 PDF（很
+    常见）这个按钮会被禁用（isEnabled=false，看起来变灰不可点），而不是隐藏——
+    理由见 MainActivity 类注释"目录"一节：按钮位置固定不随文档切换而跳动，禁用态
+    本身就足够说明"这份文档没有目录"，不需要再额外弹提示。
 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/rootLayout"
@@ -42,6 +50,18 @@
             android:minHeight="52dp"
             android:text="@string/open_pdf"
             android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/tocButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:enabled="false"
+            android:minHeight="52dp"
+            android:minWidth="0dp"
+            android:paddingHorizontal="16dp"
+            android:text="@string/toc_button"
+            android:textSize="14sp" />
 
         <Button
             android:id="@+id/toggleSettingsButton"
