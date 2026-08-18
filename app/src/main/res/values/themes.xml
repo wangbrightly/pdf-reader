@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        MainActivity 继承 AppCompatActivity，AppCompat 的 setContentView 硬性要求
+        应用主题是 Theme.AppCompat（或其子类），否则 AppCompatDelegateImpl.createSubDecor
+        会直接抛 IllegalStateException 崩溃——这个项目最初没有声明任何主题，用的是系统
+        默认主题，2026-08-18 真机实测直接闪退才发现（之前的测试全是纯逻辑测试，没有一个
+        真正走过 onCreate() 里 setContentView 这条路径，assembleDebug 编译成功不等于
+        运行不崩，见 NOTES.md）。用 NoActionBar 变体是因为布局里没有设计 Toolbar，用带
+        ActionBar 的变体会多一条没用的系统标题栏。
+    -->
+    <style name="Theme.PdfReader" parent="Theme.AppCompat.DayNight.NoActionBar" />
+</resources>

@@ -50,3 +50,29 @@ Robolectric 的 `nativeruntime-dist-compat` 依赖包约 159MB，走代理连 Ma
 ## 7. PdfBox-Android 的 `PDFGraphicsStreamEngine` 和 `PDFRenderer` 在 Robolectric 下能正常跑，不需要额外配置
 
 `com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine`（自定义图形流引擎，用来拿矢量线段坐标）和 `com.tom_roush.pdfbox.rendering.PDFRenderer`（整页渲染成 `Bitmap`）在现有 Robolectric 4.16.1 环境下直接能跑，用真实含表格的 fixture 验证过（A4 页面 @150 DPI 渲染出 1241×1753 px 的 `Bitmap`，和"210×297mm×150dpi"的理论值吻合），没有触发"Robolectric 默认不支持真实图形栅格化"这类担心——不需要额外开启 `NativeGraphicsMode`/`LegacyGraphicsMode` 之类的配置，跟已有 `PDImageXObject.getImage()`（[4] 节图片抽取用到的 API）同样开箱即用。以后如果要在这个项目里做更多"依赖 PDFBox 图形渲染"的功能，可以直接假设 Robolectric 环境支持，不用先怀疑环境限制。
+
+## 8. `gradle assembleDebug` 成功不等于 App 能跑起来——真机装上直接闪退过一次
+
+2026-08-18 装真机（小米，代号 mondrian）第一次打开就闪退。原因：`MainActivity` 继承
+`AppCompatActivity`，AppCompat 的 `setContentView` 硬性要求应用主题是
+`Theme.AppCompat`（或子类），但项目从建骨架起就没声明过任何主题，`AndroidManifest.xml`
+里也没写 `android:theme`，用的是系统默认主题——`AppCompatDelegateImpl.createSubDecor`
+直接抛 `IllegalStateException`。
+
+**为什么一路 TDD 都没抓到**：写过的测试全是纯逻辑（抽取/重排/设置/进度这些），没有一个
+测试真正跑过 `MainActivity.onCreate()` 里 `setContentView` 这条路径——`assembleDebug`
+只验证代码能编译打包，不验证运行时不崩。UI 增量的边界写的是"UI 代码不强求自动化测试
+覆盖，跑一次真实编译验证即可"，这个尺度对纯逻辑够用，但对"Activity 起不起得来"这类
+运行时才暴露的问题不够，**光编译成功不能当作"App 能用"的证据，得真机/模拟器实际跑一次
+才算数**。
+
+修法：加 `res/values/themes.xml` 定义 `Theme.PdfReader`（继承
+`Theme.AppCompat.DayNight.NoActionBar`），`AndroidManifest.xml` 的 `<application>`
+标签加 `android:theme="@style/Theme.PdfReader"`。
+
+## 9. 用 adb 装包到小米手机，"USB 安装"这个开发者选项开关容易漏开
+
+第一次 `adb install` 报 `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`——
+不是安装包或代码问题，是 MIUI/HyperOS 在"开发者选项"里单独放了一个"USB 安装"开关
+（跟"USB 调试"是两个不同开关），没开会拦下所有非应用商店来源的 adb 安装。开发者选项里
+手动打开后重新 `adb install -r` 就通过了。
