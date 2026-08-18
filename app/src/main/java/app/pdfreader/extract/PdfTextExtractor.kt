@@ -10,6 +10,8 @@ import com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImage
+import com.tom_roush.pdfbox.pdmodel.interactive.action.PDActionGoTo
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageXYZDestination
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
 import com.tom_roush.pdfbox.rendering.PDFRenderer
 import com.tom_roush.pdfbox.text.PDFTextStripper
@@ -268,6 +270,7 @@ object PdfTextExtractor {
             val nonTableLines = stripper.lines.filterNot { it.page in renderedTablePages }
             val paragraphs = linesToParagraphs(nonTableLines)
             val paragraphPages = paragraphs.map { it.page }
+            val paragraphTopYs = paragraphs.map { it.topY }
 
             val inlineImages = extractImages(document, paragraphs, excludePages = renderedTablePages)
             val t4 = System.currentTimeMillis()
@@ -287,7 +290,13 @@ object PdfTextExtractor {
                     "检测表格=${t1 - t0}ms 渲染表格页=${t2 - t1}ms 抽取文字=${t3 - t2}ms " +
                     "抽取内嵌图片=${t4 - t3}ms 总计=${t4 - t0}ms",
             )
-            return PdfContent(paragraphs.map { it.text }, inlineImages + tableImages, outline, paragraphPages)
+            return PdfContent(
+                paragraphs.map { it.text },
+                inlineImages + tableImages,
+                outline,
+                paragraphPages,
+                paragraphTopYs,
+            )
         }
     }
 
@@ -324,13 +333,49 @@ object PdfTextExtractor {
                 if (page != null) {
                     val pageIndex = document.pages.indexOf(page)
                     if (pageIndex >= 0) {
-                        out.add(OutlineEntry(title = item.title.orEmpty(), pageNumber = pageIndex + 1, depth = depth))
+                        out.add(
+                            OutlineEntry(
+                                title = item.title.orEmpty(),
+                                pageNumber = pageIndex + 1,
+                                depth = depth,
+                                targetTopY = targetTopYOrNull(item, page),
+                            ),
+                        )
                     }
                 }
             }
             runCatching { collectOutlineEntries(document, item.children(), depth + 1, out) }
         }
     }
+
+    /**
+     * 目录项在目标页内更精确的垂直位置（"距页面顶部多少 pt"，跟 [Line.y]/
+     * [Paragraph.topY] 同一套坐标系——都是 `yDirAdj`，原点在页面左上、往下增大），
+     * 解析不出来就返回 `null`——见 [OutlineNavigation] KDoc"页内精确定位"一节，`null`
+     * 时退化成"只按页跳转"，不是错误。
+     *
+     * `findDestinationPage` 只负责解析出目标页（`PDPage`），不暴露具体的 destination
+     * 对象，所以这里要自己再走一遍"直接 destination，或者包在 GoTo action 里"这两条
+     * 路径——跟 `findDestinationPage` 内部走的是同一套判断，只是它不往外暴露。只处理
+     * `/XYZ` 类型的目标（`PDPageXYZDestination`，PDF 里最常见的"跳到某页某个具体位置"
+     * 写法，Adobe/多数 PDF 生成器的默认导出格式）；`/Fit`/`/FitH` 等其它类型的目标本身
+     * 就没有精确的 Y 坐标，不在这次的修复范围内，走 `null` 退化成按页跳转。
+     *
+     * `top < 0` 当作"没有设置"跳过（返回 `null`）：PDF 规范里 `/XYZ` 数组的 `top`
+     * 字段允许是 PDF null（"保持当前位置不变"），PdfBox-Android 的 `getTop()` 签名是
+     * 基本类型 `int`，读到 PDF null 时会返回 `-1`（实测确认：用
+     * `PDPageXYZDestination()` 不设置 `top` 直接读 `getTop()`，两份不同页高的文档都
+     * 返回 `-1`，不是想当然的 `0`——如果当初直接假设"0=未设置"会导致有大纲的正常
+     * 文档也被误判成"页内坐标全部缺失"）。真实的 `top=0`（指向页面最底部，实践中
+     * 几乎不会出现）会被保留，只有确认是 PDFBox 默认哨兵值的负数才会被跳过。
+     */
+    private fun targetTopYOrNull(item: PDOutlineItem, page: PDPage): Float? = runCatching {
+        val destination = item.destination ?: (item.action as? PDActionGoTo)?.destination
+        val xyz = destination as? PDPageXYZDestination ?: return null
+        val top = xyz.top
+        if (top < 0) return null
+        page.mediaBox.height - top
+    }.getOrNull()
 
     /**
      * 对文档每一页跑一遍 [TableGridStreamEngine]，收集"疑似表格"的页码（1-based）。
@@ -372,11 +417,12 @@ object PdfTextExtractor {
     }
 
     /** 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。 */
-    private data class Paragraph(val text: String, val page: Int)
+    /** [topY] 是这个段落第一行的 [Line.y]（距页面顶部多少 pt），供目录页内精确定位用。 */
+    private data class Paragraph(val text: String, val page: Int, val topY: Float)
 
     private fun linesToParagraphs(lines: List<Line>): List<Paragraph> {
         if (lines.isEmpty()) return emptyList()
-        if (lines.size == 1) return listOf(Paragraph(lines[0].text, lines[0].page))
+        if (lines.size == 1) return listOf(Paragraph(lines[0].text, lines[0].page, lines[0].y))
 
         val gaps = (1 until lines.size).map { lines[it].y - lines[it - 1].y }
         val typicalGap = gaps.sorted()[gaps.size / 2]
@@ -384,8 +430,10 @@ object PdfTextExtractor {
 
         val texts = mutableListOf<StringBuilder>()
         val pages = mutableListOf<Int>()
+        val topYs = mutableListOf<Float>()
         texts.add(StringBuilder(lines[0].text))
         pages.add(lines[0].page)
+        topYs.add(lines[0].y)
 
         for (i in 1 until lines.size) {
             val gap = lines[i].y - lines[i - 1].y
@@ -395,11 +443,12 @@ object PdfTextExtractor {
             if (pageChanged || gap > paragraphThreshold) {
                 texts.add(StringBuilder(lines[i].text))
                 pages.add(lines[i].page)
+                topYs.add(lines[i].y)
             } else {
                 appendLine(texts.last(), lines[i].text)
             }
         }
-        return texts.indices.map { Paragraph(normalizeCjkSpacing(texts[it].toString()), pages[it]) }
+        return texts.indices.map { Paragraph(normalizeCjkSpacing(texts[it].toString()), pages[it], topYs[it]) }
     }
 
     /**
@@ -735,20 +784,27 @@ data class ExtractedImage(val bitmap: Bitmap, val afterParagraphIndex: Int)
  *   编号），已经解析、保证能在这份文档里定位到一个真实存在的页。
  * @param depth 嵌套深度，最外层是 0，子项是 1，子项的子项是 2，以此类推——不限制
  *   层数，够用即可（见任务描述"至少要能区分一级/二级"）。
+ * @param targetTopY 目录项在目标页内的垂直位置（距页面顶部多少 pt，跟
+ *   [PdfContent.paragraphTopY] 同一套坐标系），解析不出来时是 `null`——见
+ *   [PdfTextExtractor.targetTopYOrNull]。`null` 时 [app.pdfreader.ui.OutlineNavigation]
+ *   退化成"只按页跳转"，跳到目标页第一个段落，不是错误。
  */
-data class OutlineEntry(val title: String, val pageNumber: Int, val depth: Int)
+data class OutlineEntry(val title: String, val pageNumber: Int, val depth: Int, val targetTopY: Float? = null)
 
 /**
  * [PdfTextExtractor.extractContent] 的返回值：文字段落 + 图片，按"插在哪个段落之后"
  * 关联；[outline] 是大纲（目录）项列表，没有大纲时是空列表；[paragraphPages] 是每个
- * 段落所在的页码（与 [paragraphs] 一一对应，页码从 1 起），供
- * [app.pdfreader.ui.OutlineNavigation] 把"目录项指向第几页"换算成"该滚动到哪个
- * 展示块"——两个新字段都给了默认值 `emptyList()`，不破坏其余不关心大纲/页码的调用方
- * （目前没有别处直接用位置参数构造 [PdfContent]，但保留默认值让以后新增调用方更安全）。
+ * 段落所在的页码（与 [paragraphs] 一一对应，页码从 1 起）、[paragraphTopY] 是每个
+ * 段落第一行距页面顶部多少 pt（同样与 [paragraphs] 一一对应），两者一起供
+ * [app.pdfreader.ui.OutlineNavigation] 把"目录项指向第几页/页内哪个位置"换算成"该
+ * 滚动到哪个展示块"——新字段都给了默认值 `emptyList()`，不破坏其余不关心大纲/页码的
+ * 调用方（目前没有别处直接用位置参数构造 [PdfContent]，但保留默认值让以后新增调用方
+ * 更安全）。
  */
 data class PdfContent(
     val paragraphs: List<String>,
     val images: List<ExtractedImage>,
     val outline: List<OutlineEntry> = emptyList(),
     val paragraphPages: List<Int> = emptyList(),
+    val paragraphTopY: List<Float> = emptyList(),
 )

@@ -78,4 +78,106 @@ class OutlineNavigationTest {
     fun `没有任何段落时组合计算也返回 null`() {
         assertNull(OutlineNavigation.blockIndexForPage(emptyList(), emptyList(), targetPage = 1))
     }
+
+    // ---- paragraphIndexForDestination：目标页码 + 页内精确位置 → 段落下标 ----
+    // 见类注释"页内精确定位"一节：2026-08-19 增量，修复"目录跳转位置不够准"的反馈。
+
+    @Test
+    fun `目标页内有多个段落时，定位到距目标坐标最近的那一段，不是页首那一段`() {
+        // 第 2 页有 3 个段落，分别在距页顶 100、300、500 pt。目录项目标坐标是 310——
+        // 应该落在坐标 300 那一段（下标 2），而不是页首坐标 100 那一段（下标 1）。
+        val paragraphPages = listOf(1, 2, 2, 2, 3)
+        val paragraphTopY = listOf(50f, 100f, 300f, 500f, 50f)
+        assertEquals(
+            2,
+            OutlineNavigation.paragraphIndexForDestination(
+                paragraphPages,
+                paragraphTopY,
+                targetPage = 2,
+                targetY = 310f,
+            ),
+        )
+    }
+
+    @Test
+    fun `同一页两个不同的目录项应该落到不同的段落（这正是页内定位要解决的问题）`() {
+        // "第三章"和它的"3.1 小节"都在第 2 页——旧的按页跳转会让两个目录项跳到
+        // 完全相同的位置，加了页内坐标之后应该能区分开。
+        val paragraphPages = listOf(1, 2, 2, 2)
+        val paragraphTopY = listOf(50f, 80f, 90f, 400f)
+        val chapterIndex = OutlineNavigation.paragraphIndexForDestination(
+            paragraphPages,
+            paragraphTopY,
+            targetPage = 2,
+            targetY = 82f, // "第三章"标题坐标
+        )
+        val sectionIndex = OutlineNavigation.paragraphIndexForDestination(
+            paragraphPages,
+            paragraphTopY,
+            targetPage = 2,
+            targetY = 395f, // "3.1 小节"标题坐标
+        )
+        assertEquals(1, chapterIndex)
+        assertEquals(3, sectionIndex)
+    }
+
+    @Test
+    fun `targetY 为 null 时退化成按页跳转（页首那一段）`() {
+        val paragraphPages = listOf(1, 2, 2, 2)
+        val paragraphTopY = listOf(50f, 80f, 90f, 400f)
+        assertEquals(
+            1,
+            OutlineNavigation.paragraphIndexForDestination(paragraphPages, paragraphTopY, targetPage = 2, targetY = null),
+        )
+    }
+
+    @Test
+    fun `有 targetY 但目标页恰好没有任何段落时，退化成按页跳转的降级逻辑`() {
+        // 第 2 页整页是表格/图片，没有文字段落——即使目录项带了页内坐标也没地方可用，
+        // 应该跟没有坐标时一样退到第 3 页的第一个段落。
+        val paragraphPages = listOf(1, 1, 3, 3)
+        val paragraphTopY = listOf(50f, 200f, 50f, 200f)
+        assertEquals(
+            2,
+            OutlineNavigation.paragraphIndexForDestination(
+                paragraphPages,
+                paragraphTopY,
+                targetPage = 2,
+                targetY = 120f,
+            ),
+        )
+    }
+
+    // ---- blockIndexForDestination：组合以上 + blockIndexForParagraph，MainActivity 直接用的入口 ----
+
+    @Test
+    fun `组合计算——按页内坐标定位到具体段落，再加上前面插入的图片偏移`() {
+        val paragraphPages = listOf(1, 2, 2)
+        val paragraphTopY = listOf(50f, 80f, 400f)
+        val imageAfterIndices = listOf(-1) // 一张图片插在所有段落之前
+        // targetY=395 应该落到段落下标 2（坐标 400 那一段）→ 展示块下标 2 + 1 = 3。
+        assertEquals(
+            3,
+            OutlineNavigation.blockIndexForDestination(
+                paragraphPages,
+                paragraphTopY,
+                imageAfterIndices,
+                targetPage = 2,
+                targetY = 395f,
+            ),
+        )
+    }
+
+    @Test
+    fun `没有任何段落时组合计算（页内定位版）也返回 null`() {
+        assertNull(
+            OutlineNavigation.blockIndexForDestination(
+                emptyList(),
+                emptyList(),
+                emptyList(),
+                targetPage = 1,
+                targetY = null,
+            ),
+        )
+    }
 }

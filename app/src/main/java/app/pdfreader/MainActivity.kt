@@ -570,10 +570,12 @@ class MainActivity : AppCompatActivity() {
      */
     private fun scrollToOutlineEntry(entry: OutlineEntry) {
         val content = currentContent ?: return
-        val blockIndex = OutlineNavigation.blockIndexForPage(
+        val blockIndex = OutlineNavigation.blockIndexForDestination(
             paragraphPages = content.paragraphPages,
+            paragraphTopY = content.paragraphTopY,
             imageAfterParagraphIndices = content.images.map { it.afterParagraphIndex },
             targetPage = entry.pageNumber,
+            targetY = entry.targetTopY,
         ) ?: return
         val target = contentContainer.getChildAt(blockIndex) ?: return
         contentScrollView.smoothScrollTo(0, target.top)

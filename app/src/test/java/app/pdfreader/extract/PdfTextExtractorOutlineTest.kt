@@ -3,11 +3,14 @@ package app.pdfreader.extract
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
+import com.tom_roush.pdfbox.pdmodel.interactive.action.PDActionGoTo
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDNamedDestination
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageFitDestination
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageXYZDestination
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -89,6 +92,93 @@ class PdfTextExtractorOutlineTest {
             val content = extractFixtureContent(fixture)
             assertTrue("$fixture 不应该有大纲，但 outline=${content.outline}", content.outline.isEmpty())
         }
+    }
+
+    @Test
+    fun `XYZ 类型的目录目标带页内精确坐标，抽取出的 targetTopY 是距页顶的距离`() {
+        // 页高 792pt（US Letter），destination.top=700（PDF 原生坐标，距页底 700pt）
+        // 换算成"距页顶多少 pt"应该是 792-700=92。
+        val file = buildDocumentWithXyzOutline(top = 700)
+        val content = PdfTextExtractor.extractContent(RuntimeEnvironment.getApplication(), file)
+        assertEquals(1, content.outline.size)
+        assertEquals(92f, content.outline.single().targetTopY)
+    }
+
+    @Test
+    fun `目录项的目标包在 GoTo action 里（不是直接 destination）时也能解析出 targetTopY`() {
+        val file = buildDocumentWithXyzOutline(top = 700, viaGoToAction = true)
+        val content = PdfTextExtractor.extractContent(RuntimeEnvironment.getApplication(), file)
+        assertEquals(1, content.outline.size)
+        assertEquals(92f, content.outline.single().targetTopY)
+    }
+
+    @Test
+    fun `非 XYZ 类型的目录目标（比如 Fit）没有页内精确坐标，targetTopY 是 null`() {
+        val file = buildDocumentWithFitOutline()
+        val content = PdfTextExtractor.extractContent(RuntimeEnvironment.getApplication(), file)
+        assertEquals(1, content.outline.size)
+        assertNull(content.outline.single().targetTopY)
+    }
+
+    @Test
+    fun `每个段落的 topY 一并暴露出来，和段落一一对应`() {
+        val content = extractFixtureContent("sample-with-outline.pdf")
+        assertEquals(3, content.paragraphTopY.size)
+    }
+
+    private fun buildDocumentWithXyzOutline(top: Int, viaGoToAction: Boolean = false): File {
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage() // 默认页面尺寸是 US Letter，792pt 高。
+        document.addPage(page)
+
+        val outline = PDDocumentOutline()
+        document.documentCatalog.documentOutline = outline
+
+        val item = PDOutlineItem()
+        item.title = "带页内坐标的标题"
+        val destination = PDPageXYZDestination()
+        destination.page = page
+        destination.top = top
+        if (viaGoToAction) {
+            item.action = PDActionGoTo().apply { setDestination(destination) }
+        } else {
+            item.destination = destination
+        }
+        outline.addLast(item)
+
+        val output = File.createTempFile("xyz-outline-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+        return output
+    }
+
+    private fun buildDocumentWithFitOutline(): File {
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage()
+        document.addPage(page)
+
+        val outline = PDDocumentOutline()
+        document.documentCatalog.documentOutline = outline
+
+        val item = PDOutlineItem()
+        item.title = "没有页内坐标的标题"
+        val destination = PDPageFitDestination()
+        destination.page = page
+        item.destination = destination
+        outline.addLast(item)
+
+        val output = File.createTempFile("fit-outline-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+        return output
     }
 
     @Test
