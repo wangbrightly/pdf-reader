@@ -1,0 +1,81 @@
+package app.pdfreader.ui
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+
+/**
+ * [OutlineNavigation] 的单元测试——"目录项给的页码 → 应该滚动到 contentContainer 里
+ * 第几个 DisplayBlock" 这个纯逻辑，不依赖 Bitmap/PDFBox/任何 Android API，普通 JUnit
+ * 就能跑，不需要 Robolectric。写法和 [app.pdfreader.extract.ImagePlacementTest] 同一
+ * 个路子（[app.pdfreader.extract.ImagePlacement] 解决"图片插在哪个段落之后"，这里
+ * 解决"目录项对应哪个段落、这个段落对应哪个展示块下标"）。
+ */
+class OutlineNavigationTest {
+
+    // ---- paragraphIndexForPage：目标页码 → 段落下标 ----
+
+    @Test
+    fun `目标页有段落时，定位到该页第一个段落`() {
+        // 段落 0、1 在第 1 页，段落 2、3 在第 2 页——目标页 2 应该定位到段落 2（第一个），
+        // 不是段落 3（最后一个），这样目录项点进去正好停在这一页内容的开头。
+        val paragraphPages = listOf(1, 1, 2, 2)
+        assertEquals(2, OutlineNavigation.paragraphIndexForPage(paragraphPages, targetPage = 2))
+    }
+
+    @Test
+    fun `目标页没有段落时，退到下一个有段落的页`() {
+        // 第 2 页整页是表格/图片，没有文字段落——目录项指向第 2 页时，退到第 3 页
+        // 的第一个段落，好过完全不滚动。
+        val paragraphPages = listOf(1, 1, 3, 3)
+        assertEquals(2, OutlineNavigation.paragraphIndexForPage(paragraphPages, targetPage = 2))
+    }
+
+    @Test
+    fun `目标页比最后一个有段落的页还靠后时，退到最后一个段落`() {
+        val paragraphPages = listOf(1, 2)
+        assertEquals(1, OutlineNavigation.paragraphIndexForPage(paragraphPages, targetPage = 5))
+    }
+
+    @Test
+    fun `没有任何段落时返回 null`() {
+        assertNull(OutlineNavigation.paragraphIndexForPage(emptyList(), targetPage = 1))
+    }
+
+    // ---- blockIndexForParagraph：段落下标 → 展示块下标（考虑插在前面的图片）----
+
+    @Test
+    fun `没有图片时，展示块下标等于段落下标`() {
+        assertEquals(0, OutlineNavigation.blockIndexForParagraph(emptyList(), paragraphIndex = 0))
+        assertEquals(2, OutlineNavigation.blockIndexForParagraph(emptyList(), paragraphIndex = 2))
+    }
+
+    @Test
+    fun `插在段落之前的图片会让展示块下标往后移`() {
+        // 一张图片插在段落 -1（最前面）之后，段落 0 对应的展示块下标应该是 1（图片占了 0）。
+        assertEquals(1, OutlineNavigation.blockIndexForParagraph(listOf(-1), paragraphIndex = 0))
+    }
+
+    @Test
+    fun `只有插在目标段落之前的图片才计入偏移，之后的不算`() {
+        // 图片分别插在段落 -1、0、2 之后。定位到段落 1 时，只有 afterIndex=-1、0 两张
+        // 图片排在它前面（各占一个展示块），afterIndex=2 那张图片排在它后面不影响。
+        val imageAfterIndices = listOf(-1, 0, 2)
+        assertEquals(1 + 2, OutlineNavigation.blockIndexForParagraph(imageAfterIndices, paragraphIndex = 1))
+    }
+
+    // ---- blockIndexForPage：组合以上两步，给 MainActivity 直接用的入口 ----
+
+    @Test
+    fun `组合计算——目标页有段落且前面插了图片`() {
+        val paragraphPages = listOf(1, 1, 2, 2)
+        val imageAfterIndices = listOf(-1) // 一张图片插在所有段落之前
+        // 目标页 2 → 段落下标 2（该页第一个段落）→ 展示块下标 2 + 1（前面那张图片）= 3。
+        assertEquals(3, OutlineNavigation.blockIndexForPage(paragraphPages, imageAfterIndices, targetPage = 2))
+    }
+
+    @Test
+    fun `没有任何段落时组合计算也返回 null`() {
+        assertNull(OutlineNavigation.blockIndexForPage(emptyList(), emptyList(), targetPage = 1))
+    }
+}
