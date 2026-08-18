@@ -59,10 +59,14 @@ class PdfTextExtractorImageTest {
     }
 
     @Test
-    fun `图片插在第一段之后、第二段之前`() {
+    fun `同页图片统一插在该页最后一个段落之后（按页归类，不追求页面内精确位置）`() {
         val content = extractFixtureContent()
-        // fixture 结构：第一段 → 图片 → 第二段 → 第三段，图片应该插在段落下标 0 之后。
-        assertEquals(0, content.images.single().afterParagraphIndex)
+        // fixture 是单页 PDF，三段文字和图片都在第 1 页——按页归类的降级方案下，
+        // 图片不追求插在"第一段之后、第二段之前"这种页面内精确位置，而是统一插在
+        // 这一页文字全部结束之后，也就是最后一个段落（下标 2）之后。这正是 SELECTION.md
+        // 第 4 节兜底方案里"把每一页的图片都统一插在这一页对应的文字段落全部结束之后"
+        // 这条更简单的降级路径，见 PdfTextExtractor 类注释"图片抽取"一节。
+        assertEquals(2, content.images.single().afterParagraphIndex)
     }
 
     @Test
@@ -102,12 +106,22 @@ class PdfTextExtractorImageTest {
     }
 
     /**
-     * 用 PDFBox 底层 API 直接拼一个"页面资源里有一张正常图片 + 一张损坏图片"的文档：
-     * 损坏图片的手法是把 Filter 声明成 `/DCTDecode`（JPEG）但塞入完全不是 JPEG 的字节，
-     * `PDImageXObject.getImage()` 解码时会抛 `IOException`，用来验证
-     * [PdfTextExtractor] 对单张图片抽取失败的兜底处理。文字用英文是因为标准 14 字体
-     * （Helvetica）不支持中文字形，写中文会在 `showText` 时直接抛异常——这里只是要
-     * 一段随便什么占位文字来验证"图片抽取失败不连累文字抽取"，不需要是中文。
+     * 用 PDFBox 底层 API 直接拼一个"页面资源里有一张正常图片 + 一张损坏图片"的文档。
+     *
+     * 损坏图片的手法：读了 PdfBox-Android 上游源码（`SampledImageReader.getRGBImage`，
+     * github.com/TomRoush/PdfBox-Android/blob/master/library/.../SampledImageReader.java
+     * 第 181 行）确认——图片对象的底层 COSStream 一个字节都不写，
+     * `PDImageXObject.isEmpty()`（`getStream().getCOSObject().getLength() == 0`）
+     * 会命中，`getImage()` 一开始就抛 `IOException("Image stream is empty")`。
+     * 选这条路径而不是"塞一段乱码字节冒充 JPEG"，是因为 Robolectric 对
+     * `android.graphics.Bitmap`/`BitmapFactory` 的影子实现（Shadow）不会真的按
+     * 图片格式解码校验，塞乱码字节在 Robolectric 环境下往往不会像真机那样抛异常
+     * ——踩过这个坑（第一版用乱码 JPEG 字节实测在这个测试环境下反而"解码成功"）。
+     * `isEmpty()` 这条检查是 PDFBox 自己的纯 Java 逻辑，不经过任何 Android
+     * Bitmap API，不受 Robolectric 影子实现影响，是确定性更强的失败触发方式。
+     * 文字用英文是因为标准 14 字体（Helvetica）不支持中文字形，写中文会在
+     * `showText` 时直接抛异常——这里只是要一段随便什么占位文字来验证"图片抽取
+     * 失败不连累文字抽取"，不需要是中文。
      */
     private fun buildDocumentWithOneValidAndOneCorruptImage(): File {
         val context = RuntimeEnvironment.getApplication()
@@ -148,9 +162,9 @@ class PdfTextExtractorImageTest {
 
     private fun createCorruptImageXObject(document: PDDocument): PDImageXObject {
         val cosStream = document.document.createCOSStream()
-        val out = cosStream.createOutputStream()
-        out.write(ByteArray(32) { it.toByte() }) // 完全不是合法 JPEG 数据的随机字节
-        out.close()
+        // 故意一个字节都不写：COSStream 的 /Length 会是 0，PDImageXObject.isEmpty()
+        // 命中，getImage() 一开始就抛 IOException——见上方方法 KDoc 为什么选这条路。
+        cosStream.createOutputStream().close()
         cosStream.setItem(
             com.tom_roush.pdfbox.cos.COSName.TYPE,
             com.tom_roush.pdfbox.cos.COSName.XOBJECT,
@@ -159,7 +173,6 @@ class PdfTextExtractorImageTest {
             com.tom_roush.pdfbox.cos.COSName.SUBTYPE,
             com.tom_roush.pdfbox.cos.COSName.IMAGE,
         )
-        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.FILTER, com.tom_roush.pdfbox.cos.COSName.DCT_DECODE)
         cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.WIDTH, 10)
         cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.HEIGHT, 10)
         cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.BITS_PER_COMPONENT, 8)

@@ -1,8 +1,11 @@
 package app.pdfreader.extract
 
 import android.content.Context
+import android.graphics.Bitmap
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.PDPage
+import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
 import java.io.File
@@ -37,6 +40,27 @@ import java.text.Normalizer
  * 齿/龙/龟），纯部首用字（钅/饣/纟/讠/辶等，从不单独成字）不收——这类字形只有在
  * PDF 显示的就是它对应的那个独立汉字时才会误命中这个 bug，本身不会在正常文本里
  * 单独出现，收了也用不上。
+ *
+ * ## 图片抽取（2026-08-18 增量）：按页归类的降级方案
+ *
+ * SELECTION.md 第 4 节兜底方案第 3 条要求"图片降级为独立浮动展示……按它们在原页面中
+ * 大致所处的段落位置，插入到对应段落之间"，明确不追求"精确嵌入原位置"。落地成
+ * [extractContent]：遍历每一页 `PDPage.getResources()` 里的 `PDImageXObject`
+ * （`resources.getXObjectNames()` + `isImageXObject(name)` 判断类型），用
+ * `PDImageXObject.getImage()` 直接拿到 `android.graphics.Bitmap`（这是 PdfBox-Android
+ * 提供的现成转换，不需要自己写解码逻辑），"插在哪个段落之后"这个位置判断交给纯逻辑
+ * [ImagePlacement]（该类 KDoc 里详细说明了为什么选"按页归类"而不是"页面内精确
+ * 纵坐标"这个更复杂的方案）。
+ *
+ * 为了让"图片属于第几页"和"段落属于第几页"能对得上，[Line] 多了 [Line.page] 字段
+ * （来自 `PDFTextStripper.getCurrentPageNo()`，本来就有，不需要新的机制），
+ * [linesToParagraphs] 现在跨页时会强制切一次段落——这顺带修了一个潜在 bug：改动前
+ * 只按 y 坐标间距判断段落边界，而 y 坐标每翻一页就从页顶重新开始，理论上会把"上一页
+ * 最后一行"和"下一页第一行"错误拼接成同一段（本项目现有的单页测试 fixture 从未
+ * 触发过这个路径，改动前的 40 个测试不受影响）。
+ *
+ * 单张图片抽取失败（解码异常、格式不支持等）只跳过那一张，不影响其余图片和全部文字，
+ * 见 [extractImages] 里的 `runCatching`。
  */
 object PdfTextExtractor {
 
@@ -83,35 +107,79 @@ object PdfTextExtractor {
         return builder.toString()
     }
 
-    fun extractParagraphs(context: Context, file: File): List<String> {
+    /** 保留原有签名不变：只要文字段落，不要图片，供 [ReadingProgressKey]/reflow 等既有调用方使用。 */
+    fun extractParagraphs(context: Context, file: File): List<String> =
+        extractContent(context, file).paragraphs
+
+    /**
+     * 文字段落 + 图片（按页归类插入位置）一次性抽取，只解析一遍 PDF——见类注释
+     * "图片抽取"一节。图片抽取失败不影响这次调用整体成功，见 [extractImages]。
+     */
+    fun extractContent(context: Context, file: File): PdfContent {
         PDFBoxResourceLoader.init(context.applicationContext ?: context)
         PDDocument.load(file).use { document ->
             val stripper = LineCollectingStripper()
             stripper.getText(document)
-            return linesToParagraphs(stripper.lines)
+            val paragraphs = linesToParagraphs(stripper.lines)
+            val images = extractImages(document, paragraphs)
+            return PdfContent(paragraphs.map { it.text }, images)
         }
     }
 
-    private fun linesToParagraphs(lines: List<Line>): List<String> {
+    /** 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。 */
+    private data class Paragraph(val text: String, val page: Int)
+
+    private fun linesToParagraphs(lines: List<Line>): List<Paragraph> {
         if (lines.isEmpty()) return emptyList()
-        if (lines.size == 1) return listOf(lines[0].text)
+        if (lines.size == 1) return listOf(Paragraph(lines[0].text, lines[0].page))
 
         val gaps = (1 until lines.size).map { lines[it].y - lines[it - 1].y }
         val typicalGap = gaps.sorted()[gaps.size / 2]
         val paragraphThreshold = typicalGap * 1.5f
 
-        val paragraphs = mutableListOf<StringBuilder>()
-        paragraphs.add(StringBuilder(lines[0].text))
+        val texts = mutableListOf<StringBuilder>()
+        val pages = mutableListOf<Int>()
+        texts.add(StringBuilder(lines[0].text))
+        pages.add(lines[0].page)
 
         for (i in 1 until lines.size) {
             val gap = lines[i].y - lines[i - 1].y
-            if (gap > paragraphThreshold) {
-                paragraphs.add(StringBuilder(lines[i].text))
+            val pageChanged = lines[i].page != lines[i - 1].page
+            // 跨页强制切段落：y 坐标每翻一页就从页顶重新开始，纯按 gap 判断在跨页处
+            // 没有意义，见类注释"图片抽取"一节。
+            if (pageChanged || gap > paragraphThreshold) {
+                texts.add(StringBuilder(lines[i].text))
+                pages.add(lines[i].page)
             } else {
-                appendLine(paragraphs.last(), lines[i].text)
+                appendLine(texts.last(), lines[i].text)
             }
         }
-        return paragraphs.map { it.toString() }
+        return texts.indices.map { Paragraph(texts[it].toString(), pages[it]) }
+    }
+
+    /**
+     * 遍历每一页的 `PDResources`，把里面的 `PDImageXObject` 转成 [Bitmap]，配合
+     * [ImagePlacement] 算出每张图该插在哪个段落之后。单张图片转换失败（`getImage()`
+     * 抛异常）只跳过那一张，不让整个文档抽取失败——这是"降级"精神的延续：宁可漏掉
+     * 一张图，也不能因为一张坏图让用户连文字都看不到。
+     */
+    private fun extractImages(document: PDDocument, paragraphs: List<Paragraph>): List<ExtractedImage> {
+        val paragraphPages = paragraphs.map { it.page }
+        val images = mutableListOf<ExtractedImage>()
+        for (pageIndex in 0 until document.numberOfPages) {
+            val page: PDPage = document.getPage(pageIndex)
+            val pageNo = pageIndex + 1
+            val afterIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo)
+            val resources = page.resources ?: continue
+            for (name in resources.xObjectNames) {
+                if (!resources.isImageXObject(name)) continue
+                val bitmap = runCatching {
+                    (resources.getXObject(name) as PDImageXObject).image
+                }.getOrNull() ?: continue
+                images.add(ExtractedImage(bitmap, afterIndex))
+            }
+        }
+        return images
     }
 
     /** 把新的一行接到当前段落末尾：CJK 边界不加空格，其余情况加一个空格。 */
@@ -137,7 +205,8 @@ object PdfTextExtractor {
             code in 0xFF00..0xFFEF
     }
 
-    private data class Line(val text: String, val y: Float)
+    /** 内部用：一行文字 + 纵坐标 + 所在页码（页码从 1 起，来自 `getCurrentPageNo()`）。 */
+    private data class Line(val text: String, val y: Float, val page: Int)
 
     private class LineCollectingStripper : PDFTextStripper() {
         val lines = mutableListOf<Line>()
@@ -145,7 +214,20 @@ object PdfTextExtractor {
         override fun writeString(text: String, textPositions: MutableList<TextPosition>) {
             if (text.isBlank()) return
             val y = textPositions.firstOrNull()?.yDirAdj ?: return
-            lines.add(Line(fixRadicalVariants(text), y))
+            lines.add(Line(fixRadicalVariants(text), y, currentPageNo))
         }
     }
 }
+
+/**
+ * 一张从 PDF 里抽取出来的图片，配合"降级为独立浮动展示"的产品目标（见 [PdfTextExtractor]
+ * 类注释"图片抽取"一节）。
+ *
+ * @param bitmap 已经转换好、可以直接喂给 `ImageView` 显示的位图。
+ * @param afterParagraphIndex 应该插入在 [PdfContent.paragraphs] 的哪个下标之后
+ *   （0-based）；`-1` 表示插在所有段落之前。具体计算逻辑见 [ImagePlacement]。
+ */
+data class ExtractedImage(val bitmap: Bitmap, val afterParagraphIndex: Int)
+
+/** [PdfTextExtractor.extractContent] 的返回值：文字段落 + 图片，按"插在哪个段落之后"关联。 */
+data class PdfContent(val paragraphs: List<String>, val images: List<ExtractedImage>)
