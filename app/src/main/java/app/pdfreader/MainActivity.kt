@@ -27,6 +27,7 @@ import app.pdfreader.extract.PdfTextExtractor
 import app.pdfreader.progress.ReadingProgressKey
 import app.pdfreader.progress.ReadingProgressStore
 import app.pdfreader.reflow.DEFAULT_NON_CJK_WIDTH_RATIO
+import app.pdfreader.reflow.DEFAULT_SPACE_WIDTH_RATIO
 import app.pdfreader.reflow.LineWidthEstimator
 import app.pdfreader.reflow.reflow
 import app.pdfreader.settings.ReaderSettings
@@ -270,6 +271,7 @@ class MainActivity : AppCompatActivity() {
                 listOf(paragraph),
                 lineMetrics.maxLineWidthChars,
                 lineMetrics.nonCjkWidthRatio,
+                lineMetrics.spaceWidthRatio,
             ).joinToString("\n")
             blocks.add(DisplayBlock.Text(reflowedText))
             appendImagesAfter(index)
@@ -317,15 +319,19 @@ class MainActivity : AppCompatActivity() {
         return tempFile
     }
 
-    /** [estimateLineMetrics] 的返回值：reflow 需要的两个数字，见该方法 KDoc。 */
-    private data class LineMetrics(val maxLineWidthChars: Int, val nonCjkWidthRatio: Float)
+    /** [estimateLineMetrics] 的返回值：reflow 需要的三个数字，见该方法 KDoc。 */
+    private data class LineMetrics(
+        val maxLineWidthChars: Int,
+        val nonCjkWidthRatio: Float,
+        val spaceWidthRatio: Float,
+    )
 
     /**
-     * 用屏幕宽度和当前字号/边距设置，估算 [reflow] 需要的两个数字：每行的宽度预算
-     * （[LineWidthEstimator]，纯函数，见其单元测试），以及"拉丁字母/数字相对中文
-     * 字符的宽度比例"（[reflow] 的 `nonCjkWidthRatio` 参数）。
+     * 用屏幕宽度和当前字号/边距设置，估算 [reflow] 需要的三个数字：每行的宽度预算
+     * （[LineWidthEstimator]，纯函数，见其单元测试）、"拉丁字母/数字相对中文字符的
+     * 宽度比例"（`nonCjkWidthRatio`）、"空格相对中文字符的宽度比例"（`spaceWidthRatio`）。
      *
-     * 2026-08-18 真机实测发现两个问题，都在这里改的：
+     * 2026-08-18 真机实测发现三个问题，都在这里改的：
      * 1. 测量字体之前用的是 [Typeface.MONOSPACE]，但显示用的 TextView 已经改成系统
      *    默认字体（见 [createParagraphTextView] 的空格视觉 bug 修复）——测量字体和
      *    显示字体不一致，估算就不准了，这里也同步换成默认字体（不显式设置 typeface），
@@ -333,8 +339,14 @@ class MainActivity : AppCompatActivity() {
      * 2. 之前只测了一个较宽的 CJK 字符宽度，把这个宽度直接当"每个字符"的预算——纯
      *    英文 PDF 因此每行只用了不到一半屏幕宽度就换行（拉丁字符实际宽度大约只有
      *    中文全角字符的一半，用中文的宽度当预算单位，等于把英文字符的预算也砍了
-     *    一半）。现在额外测一个拉丁字符（用"W"，比常见小写字母宽，同样是保守估计，
-     *    不会让预算算多）算出实际比例，传给 [reflow] 的 `nonCjkWidthRatio`。
+     *    一半）。踩过一次坑：一开始只测单个"W"字符的宽度当拉丁字符代表，真机实测
+     *    发现在这台设备的系统默认字体里"W"几乎跟全角中文字符一样宽（57px vs 56px），
+     *    算出来的比例约等于 1，等于没起作用。改成测一整段大小写字母加数字，取平均
+     *    宽度——覆盖了从"i/l"这种窄字符到"W/M"这种宽字符的整个分布，平均值才真正
+     *    代表"一段英文文字大概多宽"。
+     * 3. 空格之前跟字母共用同一个 `nonCjkWidthRatio`，但空格实际显示宽度明显更窄，
+     *    真机反馈"右侧仍有空隙"。这里单独测一次空格的真实宽度，传给 [reflow] 的
+     *    `spaceWidthRatio`，不再用一个通用猜测值。
      */
     private fun estimateLineMetrics(): LineMetrics {
         val paddingPx = dpToPx(currentSettings.paddingDp)
@@ -349,20 +361,20 @@ class MainActivity : AppCompatActivity() {
         val cjkCharWidthPx = measurePaint.measureText("宽")
         val maxLineWidthChars = LineWidthEstimator.estimate(usableWidthPx, cjkCharWidthPx)
 
-        // 踩过的坑：一开始只测单个"W"字符的宽度当拉丁字符代表——真机实测发现在这台
-        // 设备的系统默认字体里，"W"几乎跟全角中文字符一样宽（57px vs 56px），算出来
-        // 的比例约等于 1，等于没起作用（一个字符不能代表"拉丁字符普遍多窄"这件事，
-        // W/M 这类大写字母本来就是拉丁字母表里最宽的极端值）。改成测一整段大小写字母
-        // 加数字，取平均宽度——覆盖了从"i/l"这种窄字符到"W/M"这种宽字符的整个分布，
-        // 平均值才真正代表"一段英文文字大概多宽"。
         val latinSample = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         val latinCharWidthPx = measurePaint.measureText(latinSample) / latinSample.length
-        val nonCjkWidthRatio = if (cjkCharWidthPx > 0f) {
-            (latinCharWidthPx / cjkCharWidthPx).coerceIn(0.1f, 1f)
-        } else {
-            DEFAULT_NON_CJK_WIDTH_RATIO
-        }
-        return LineMetrics(maxLineWidthChars, nonCjkWidthRatio)
+        // 空格前后各加一个基准字符再相减，量出空格自己的实际宽度——直接测一个单独
+        // 的空格字符串，不少字体/measureText 实现会把首尾空白的宽度算成 0。
+        val spaceCharWidthPx = measurePaint.measureText("a a") - measurePaint.measureText("aa")
+
+        fun ratio(widthPx: Float, default: Float) =
+            if (cjkCharWidthPx > 0f) (widthPx / cjkCharWidthPx).coerceIn(0.05f, 1f) else default
+
+        return LineMetrics(
+            maxLineWidthChars = maxLineWidthChars,
+            nonCjkWidthRatio = ratio(latinCharWidthPx, DEFAULT_NON_CJK_WIDTH_RATIO),
+            spaceWidthRatio = ratio(spaceCharWidthPx, DEFAULT_SPACE_WIDTH_RATIO),
+        )
     }
 
     /** 把 [settings] 应用到 [contentContainer] 的外观（目前只有 padding；字号/行距在每个段落 TextView 创建时应用）。 */

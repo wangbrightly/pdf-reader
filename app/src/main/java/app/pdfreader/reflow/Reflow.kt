@@ -27,21 +27,29 @@ package app.pdfreader.reflow
  * 之前的两倍，同时保持"宁可提前换行、不会超宽"这条一直以来的保守原则不变（0.55 是
  * 一个稍微留有余量的估计，不是精确到字体度量的值，因为 [reflow] 本身设计成不依赖
  * 任何具体字体，调用方如果能测出更准的比例可以自己传进来）。
+ *
+ * 修完上面这条，真机反馈右侧仍有明显空隙（全大写段落尤其明显）——空格被当成跟字母
+ * 一样宽（[nonCjkWidthRatio]），但空格实际显示宽度明显更窄，英文平均每 5-6 个字符
+ * 就有一个空格，累积起来是一笔不小的浪费。改成空格用独立的、更窄的 [spaceWidthRatio]
+ * （默认 0.3）。全大写文本本身确实比小写更宽（没有 i/l 这类窄字符拉低平均值），
+ * 这部分空隙是真实的、符合预期的，不是这次要修的问题。
  */
 fun reflow(
     paragraphs: List<String>,
     maxLineWidth: Int,
     nonCjkWidthRatio: Float = DEFAULT_NON_CJK_WIDTH_RATIO,
+    spaceWidthRatio: Float = DEFAULT_SPACE_WIDTH_RATIO,
 ): List<String> {
     require(maxLineWidth > 0) { "maxLineWidth 必须大于 0" }
     require(nonCjkWidthRatio > 0f) { "nonCjkWidthRatio 必须大于 0" }
+    require(spaceWidthRatio > 0f) { "spaceWidthRatio 必须大于 0" }
 
     val result = mutableListOf<String>()
     paragraphs.forEachIndexed { index, paragraph ->
         if (index > 0) {
             result.add("")
         }
-        result.addAll(reflowParagraph(paragraph, maxLineWidth, nonCjkWidthRatio))
+        result.addAll(reflowParagraph(paragraph, maxLineWidth, nonCjkWidthRatio, spaceWidthRatio))
     }
     return result
 }
@@ -49,16 +57,27 @@ fun reflow(
 /** 非 CJK 字符相对一个 CJK 全角字符的宽度权重，见本文件顶部"宽度加权"一节。 */
 const val DEFAULT_NON_CJK_WIDTH_RATIO = 0.55f
 
-private fun charWidth(ch: Char, nonCjkWidthRatio: Float): Float =
-    if (isCjk(ch)) 1f else nonCjkWidthRatio
+/** 空格相对一个 CJK 全角字符的宽度权重，见本文件顶部"宽度加权"一节。 */
+const val DEFAULT_SPACE_WIDTH_RATIO = 0.3f
 
-private fun widthOf(text: String, nonCjkWidthRatio: Float): Float {
+private fun charWidth(ch: Char, nonCjkWidthRatio: Float, spaceWidthRatio: Float): Float = when {
+    isCjk(ch) -> 1f
+    ch.isWhitespace() -> spaceWidthRatio
+    else -> nonCjkWidthRatio
+}
+
+private fun widthOf(text: String, nonCjkWidthRatio: Float, spaceWidthRatio: Float): Float {
     var sum = 0f
-    for (ch in text) sum += charWidth(ch, nonCjkWidthRatio)
+    for (ch in text) sum += charWidth(ch, nonCjkWidthRatio, spaceWidthRatio)
     return sum
 }
 
-private fun reflowParagraph(paragraph: String, maxLineWidth: Int, nonCjkWidthRatio: Float): List<String> {
+private fun reflowParagraph(
+    paragraph: String,
+    maxLineWidth: Int,
+    nonCjkWidthRatio: Float,
+    spaceWidthRatio: Float,
+): List<String> {
     if (paragraph.isEmpty()) {
         return listOf("")
     }
@@ -75,7 +94,7 @@ private fun reflowParagraph(paragraph: String, maxLineWidth: Int, nonCjkWidthRat
     }
 
     for (token in tokens) {
-        val tokenWidth = widthOf(token, nonCjkWidthRatio)
+        val tokenWidth = widthOf(token, nonCjkWidthRatio, spaceWidthRatio)
 
         if (token.isNotEmpty() && token.isBlank()) {
             // 空白 token：只有当前行非空时才可能保留（不让新行以空白开头）。
@@ -102,7 +121,7 @@ private fun reflowParagraph(paragraph: String, maxLineWidth: Int, nonCjkWidthRat
             var remaining = token
             while (remaining.isNotEmpty()) {
                 if (currentLine.isNotEmpty() &&
-                    currentWidth + charWidth(remaining.first(), nonCjkWidthRatio) > maxLineWidth
+                    currentWidth + charWidth(remaining.first(), nonCjkWidthRatio, spaceWidthRatio) > maxLineWidth
                 ) {
                     flushLine()
                 }
@@ -110,7 +129,7 @@ private fun reflowParagraph(paragraph: String, maxLineWidth: Int, nonCjkWidthRat
                 var takeCount = 0
                 var accWidth = 0f
                 for (ch in remaining) {
-                    val w = charWidth(ch, nonCjkWidthRatio)
+                    val w = charWidth(ch, nonCjkWidthRatio, spaceWidthRatio)
                     if (takeCount > 0 && accWidth + w > spaceLeft) break
                     accWidth += w
                     takeCount++
@@ -120,7 +139,7 @@ private fun reflowParagraph(paragraph: String, maxLineWidth: Int, nonCjkWidthRat
                 takeCount = takeCount.coerceAtLeast(1).coerceAtMost(remaining.length)
                 val take = remaining.substring(0, takeCount)
                 currentLine.append(take)
-                currentWidth += widthOf(take, nonCjkWidthRatio)
+                currentWidth += widthOf(take, nonCjkWidthRatio, spaceWidthRatio)
                 remaining = remaining.substring(takeCount)
             }
             continue
