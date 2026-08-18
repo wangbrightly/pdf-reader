@@ -39,6 +39,21 @@ data class LineSegment(val x1: Float, val y1: Float, val x2: Float, val y2: Floa
  * 代价：只有外边框、内部完全没有分隔线的表格（较少见的排版）会被漏检，继续走
  * 文字抽取+重排路径——文字本身仍然可读，只是表格的行列对齐效果会被 reflow 打散，
  * 这与"没检测到表格"时的表现一致，不是新增的坏结果。
+ *
+ * ## 空间重叠检查（2026-08-18 真机实测发现的误判修复）
+ *
+ * 早期版本只数"页面里横线够不够多、竖线够不够多"，不管这些线实际长在页面哪个
+ * 区域——真机反馈一个 10 页文档 7 页被误判成表格：页面上方有几条跟表格无关的
+ * 装饰分隔线（比如章节标题下的横线），下方又有几条不相关的竖线（比如多个独立
+ * 的强调竖条），两批线段各自凑够 [MIN_GRID_LINES] 条，就被判成"网格"，但它们
+ * 根本不在同一块区域，谈不上交织成表格。
+ *
+ * 加了 [regionsOverlap]：横线们的整体 X 范围和竖线们的整体 X 范围要有重叠、
+ * 横线们的整体 Y 范围和竖线们的整体 Y 范围也要有重叠，两个条件都满足才继续判定
+ * 为表格——这对应"一批横线和一批竖线要落在页面上大致同一块地方，才可能是真的
+ * 在交织成网格"这个几何常识。真表格的横线跨越表格宽度、竖线跨越表格高度，
+ * 天然会互相重叠，这条检查不会误伤真表格，只会挡掉"两批线段凑巧都够数、但压根
+ * 不在同一块地方"这种巧合。
  */
 object TableGridDetector {
     /** 判定"这条线段是水平/竖直"的容差：允许因为矩形厚度导致的 1pt 左右偏差。 */
@@ -54,9 +69,32 @@ object TableGridDetector {
     private const val MIN_GRID_LINES = 3
 
     fun looksLikeTable(segments: List<LineSegment>): Boolean {
-        val horizontalYs = segments.filter { it.isHorizontal() }.map { (it.y1 + it.y2) / 2f }
-        val verticalXs = segments.filter { it.isVertical() }.map { (it.x1 + it.x2) / 2f }
-        return clusterCount(horizontalYs) >= MIN_GRID_LINES && clusterCount(verticalXs) >= MIN_GRID_LINES
+        val horizontals = segments.filter { it.isHorizontal() }
+        val verticals = segments.filter { it.isVertical() }
+        val horizontalYs = horizontals.map { (it.y1 + it.y2) / 2f }
+        val verticalXs = verticals.map { (it.x1 + it.x2) / 2f }
+        if (clusterCount(horizontalYs) < MIN_GRID_LINES) return false
+        if (clusterCount(verticalXs) < MIN_GRID_LINES) return false
+        return regionsOverlap(horizontals, verticals)
+    }
+
+    /**
+     * 横线们的整体范围和竖线们的整体范围要在 X、Y 两个方向上都有重叠，才可能是同
+     * 一块表格区域——见类注释"空间重叠检查"一节。
+     */
+    private fun regionsOverlap(horizontals: List<LineSegment>, verticals: List<LineSegment>): Boolean {
+        val hMinX = horizontals.minOf { minOf(it.x1, it.x2) }
+        val hMaxX = horizontals.maxOf { maxOf(it.x1, it.x2) }
+        val hMinY = horizontals.minOf { minOf(it.y1, it.y2) }
+        val hMaxY = horizontals.maxOf { maxOf(it.y1, it.y2) }
+        val vMinX = verticals.minOf { minOf(it.x1, it.x2) }
+        val vMaxX = verticals.maxOf { maxOf(it.x1, it.x2) }
+        val vMinY = verticals.minOf { minOf(it.y1, it.y2) }
+        val vMaxY = verticals.maxOf { maxOf(it.y1, it.y2) }
+
+        val xOverlaps = hMinX <= vMaxX && vMinX <= hMaxX
+        val yOverlaps = vMinY <= hMaxY && hMinY <= vMaxY
+        return xOverlaps && yOverlaps
     }
 
     private fun LineSegment.length(): Float = hypot((x2 - x1).toDouble(), (y2 - y1).toDouble()).toFloat()
