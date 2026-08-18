@@ -2,6 +2,7 @@ package app.pdfreader.extract
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.Path
 import android.graphics.PointF
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -9,13 +10,15 @@ import com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImage
-import com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
 import com.tom_roush.pdfbox.rendering.PDFRenderer
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
+import com.tom_roush.pdfbox.util.Matrix as PdfMatrix
 import java.io.File
 import java.text.Normalizer
+import kotlin.math.abs
+import kotlin.math.sign
 
 /**
  * 从 PDF 文件中抽取正文文字，按段落切分成 [String] 列表，供 [app.pdfreader.reflow.reflow]
@@ -69,6 +72,67 @@ import java.text.Normalizer
  *
  * 单张图片抽取失败（解码异常、格式不支持等）只跳过那一张，不影响其余图片和全部文字，
  * 见 [extractImages] 里的 `runCatching`。
+ *
+ * ## 内嵌图片朝向修正（2026-08-18 增量，真机反馈"部分图片方向不对"）
+ *
+ * **现象**（真机截图观察到，335 页 PDF 里一张"章节索引/问答列表"图片）：页码/竖线
+ * 分隔符左右位置对调、章节号上下顺序颠倒，但截图里汉字字形本身仍是正常方向（不是
+ * 每个字形本身镜像到认不出来那种）——同一份文档里另一张结构类似的图片方向正常，
+ * 说明不是全局性的、每张图都错。诊断日志显示这张图"疑似表格页=0"，即没有走
+ * [renderTablePageImages] 整页渲染那条路，走的是下面说的内嵌图片抽取路径。
+ *
+ * **根因，用构造的 fixture 实测确认，不是纯推理**：`PDImageXObject`
+ * 这类图片资源本身只是原始像素数据，它在页面上究竟怎么摆（缩放/旋转/翻转/位置）
+ * 是由 content stream 里 `Do` 操作符执行那一刻的 CTM（当前变换矩阵，由前面一串
+ * `cm` 累积）决定的——PDF 图片空间的约定是"原点在左上角、y 轴向下"（正好贴合
+ * `Bitmap` 像素排列顺序），页面空间是 y 轴向上，两者之间唯一"必要"的转换是
+ * "上下翻一次"；绝大多数 PDF 生产工具摆放图片时用的 CTM 形如 `[W 0 0 -H x y]`
+ * （即恰好只做这唯一必要的翻转，不多不少），这时候"直接显示 `getImage()`
+ * 拿到的原始 Bitmap，完全不管 CTM"就凑巧是对的——这也是这个 bug 长期不易被
+ * 发现的原因。改动前的实现（遍历 `PDResources` 里的 `PDImageXObject`，直接
+ * `getImage()`）等于无条件假设每张图片都恰好落在这种"标准摆法"里；一旦某张图片
+ * 的 CTM 在这唯一必要的翻转之外还叠了一层翻转/90 度整数倍旋转（比如页面某个坐标轴
+ * 的缩放分量是负的），"原始 Bitmap 直接显示"和"页面上应该看到的样子"就会对不上。
+ * 用 [PdfTextExtractorImageOrientationTest] 程序化验证过：构造一张四色象限测试图，
+ * 分别用 8 种不同 CTM（含水平镜像、垂直镜像、180°旋转、90°/270°旋转及其翻转变体）
+ * 摆放，和一个独立写的"参照模型"（直接用 CTM 的 `a b c d e f` 算每个角在页面上
+ * 该落在哪个象限，不复用 [applyCtmOrientation] 自己的推导代码）比对——两者在全部
+ * 8 种轴对齐 CTM 下都一致。这里没有采用"和 `PDFRenderer` 整页渲染结果比对"这个
+ * 一开始尝试的路子：实测发现在这套 Robolectric + PdfBox-Android 2.0.27.0 工具链下，
+ * 对着一个从零现搭、只有一张图片的最小内存态文档调用 `PDFRenderer.renderImageWithDPI`
+ * 渲染不出图片内容（整页几乎全透明，怀疑是这个版本渲染管线对"没有真实来源文件、
+ * 内容极简"的文档有兼容性问题，没有深挖，跟本次任务无关）；另外用 `ImageIO` 现编的
+ * PNG 经过 `PDImageXObject.createFromByteArray`→`getImage()` 这一圈解码后颜色也会
+ * 错乱（怀疑是这个版本的 PNG 解码路径本身的独立 bug，同样跟本次任务无关，只是
+ * 拖累了"拿真实文件当参照"这条路的可行性）——两个问题都在 fixture 构造/第三方库
+ * 解码这一层，不在 [applyCtmOrientation] 的翻转/旋转逻辑本身，所以改成"独立参照
+ * 模型直接比对纯 CTM 数学"，绕开这两个不相关的坑，见该测试文件顶部注释。
+ *
+ * **修法**：抽取逻辑不再遍历 `PDResources` 挖图片，改成像 [TableGridStreamEngine]
+ * 抓矢量线段那样，用 [ImageDrawStreamEngine]（继承 `PDFGraphicsStreamEngine`）
+ * 处理页面 content stream，在 `drawImage()` 回调里同时拿到图片和"画这张图那一刻"
+ * 的 CTM（`graphicsState.currentTransformationMatrix`），交给 [applyCtmOrientation]
+ * 换算成需要施加在 `Bitmap` 上的翻转/旋转操作。这个改动顺带修了两个改动前完全没
+ * 覆盖的缺口（跟着 content stream 走的自然结果，不是专门加的逻辑）：内嵌图片
+ * （`BI`/`ID`/`EI` 操作符的 `PDInlineImage`，`PDImage` 接口统一了两者）、以及
+ * "同一张图片资源在同一页被 `Do` 多次、每次 CTM 不同"——旧实现按 `PDResources`
+ * 的 name 集合遍历，这两种情况都会漏；新实现天然不会。
+ *
+ * **已知局限（有意的降级范围，不是遗漏）**：[applyCtmOrientation] 只处理"轴对齐"
+ * 的 CTM——不旋转、水平镜像、垂直镜像、180°旋转，以及 90°/270°旋转（含各自再叠一层
+ * 镜像），一共覆盖 D4 群全部 8 种朝向。真正的任意角度旋转或斜切（CTM 的 a/b/c/d
+ * 四个线性分量都明显非零、不满足"两个为零"这个轴对齐条件）不在这次修复范围内，
+ * 原样返回不做任何修正——理由有两条：一是这类摆放在真实 PDF 的"正文插图"场景里
+ * 极罕见（本次真机反馈的现象本身也是镜像/整体倒转的模式，不是任意角度旋转）；
+ * 二是任意角度旋转后的位图边缘必然引入插值，没法再用"取像素点精确比对"这种确定性
+ * 方式验证正确性，复杂度和可验证性都不成比例。[表格检测那条整页渲染路径]
+ * （[renderTablePageImages]，用 [PDFRenderer.renderImageWithDPI]）不受这个 bug
+ * 影响——那是页面级别的渲染 API，由 PdfBox-Android 自己的渲染引擎负责应用页面
+ * 内所有 CTM（包括图片的），不是"抽取单个图片资源、自己拼位图"这条路径，两者用的
+ * 是完全不同的代码，这个判断没有另外找 fixture 验证（renderImageWithDPI 是否正确
+ * 处理 CTM 属于 PdfBox-Android 库自身职责范围，不是本项目代码，没有理由重新验证
+ * 一个第三方库的核心渲染路径），只是读代码路径确认它和 [extractImages] 走的不是
+ * 同一段逻辑。
  *
  * ## 表格检测（2026-08-18 增量）：疑似表格的整页降级为图片
  *
@@ -341,10 +405,13 @@ object PdfTextExtractor {
     }
 
     /**
-     * 遍历每一页的 `PDResources`，把里面的 `PDImageXObject` 转成 [Bitmap]，配合
-     * [ImagePlacement] 算出每张图该插在哪个段落之后。单张图片转换失败（`getImage()`
-     * 抛异常）只跳过那一张，不让整个文档抽取失败——这是"降级"精神的延续：宁可漏掉
-     * 一张图，也不能因为一张坏图让用户连文字都看不到。
+     * 对每一页跑一遍 [ImageDrawStreamEngine]（跟着 content stream 的 `Do` 操作符走，
+     * 而不是遍历 `PDResources`——见类注释"内嵌图片朝向修正"一节），拿到已经按 CTM
+     * 修正过朝向的 [Bitmap] 列表，配合 [ImagePlacement] 算出这一页的图片该插在哪个
+     * 段落之后。单张图片转换失败（`getImage()` 抛异常，在 [ImageDrawStreamEngine]
+     * 内部处理）只跳过那一张；单页处理异常（content stream 解析问题等）只跳过那一页
+     * 的图片，都不让整个文档抽取失败——延续"降级"精神：宁可漏掉一张图/一页图片，
+     * 也不能因此让用户连文字都看不到。
      *
      * [excludePages] 是已经整页渲染成图片的表格页（见类注释"表格检测"一节）——这些
      * 页面的内嵌图片已经包含在整页渲染结果里了，不需要再单独抽取一遍、重复显示。
@@ -361,16 +428,116 @@ object PdfTextExtractor {
             if (pageNo in excludePages) continue
             val page: PDPage = document.getPage(pageIndex)
             val afterIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo)
-            val resources = page.resources ?: continue
-            for (name in resources.xObjectNames) {
-                if (!resources.isImageXObject(name)) continue
-                val bitmap = runCatching {
-                    (resources.getXObject(name) as PDImageXObject).image
-                }.getOrNull() ?: continue
+            val pageImages = runCatching {
+                val engine = ImageDrawStreamEngine(page)
+                engine.processPage(page)
+                engine.images
+            }.getOrDefault(emptyList())
+            for (bitmap in pageImages) {
                 images.add(ExtractedImage(bitmap, afterIndex))
             }
         }
         return images
+    }
+
+    /**
+     * 见类注释"内嵌图片朝向修正"一节。把 CTM 的线性部分（`a`/`b`/`c`/`d`，忽略跟朝向
+     * 无关的平移分量 `e`/`f`）换算成需要施加在 [bitmap] 上的修正矩阵。
+     *
+     * 推导：直接显示 `PDImage.getImage()` 拿到的原始 [Bitmap]、不做任何修正，等价于
+     * 已经隐含施加了一个基准变换 `R0 = diag(1,-1)`——PDF 图片空间"原点左上、y 轴向下"
+     * 转成页面空间"y 轴向上"唯一必要的那次翻转，正好也是 `Bitmap` 像素排列顺序本身
+     * 自带的效果，不需要额外计算。如果真实 CTM 在 `R0` 之外还多摆了一层，需要在
+     * `Bitmap` 上补上"多出来的那一层"：`M = R0 · CTM线性部分`，展开是
+     * `M = [[a, c], [-b, -d]]`。
+     *
+     * 只处理 `M` 是"轴对齐"的情形——`b≈0` 且 `c≈0`（纯翻转，含不翻转）、或 `a≈0` 且
+     * `d≈0`（90°/270° 旋转，可能叠加翻转），覆盖 D4 群全部 8 种朝向；任何其它情形
+     * （任意角度旋转/斜切）原样返回、不修正——这是有意的降级范围，见类注释"已知局限"
+     * 一节。
+     *
+     * 拆成 [orientationMatrixOrNull]（纯矩阵计算，不碰 `Bitmap` 像素）+ 这个函数
+     * （拿到矩阵后调 `Bitmap.createBitmap` 做真正的像素重采样）两步——不是过度设计，
+     * 是被测试逼出来的：写 [PdfTextExtractorImageOrientationTest] 时发现，本机
+     * Robolectric 环境下 `Bitmap.createBitmap(src,x,y,w,h,matrix,filter)` 这个重载
+     * 的影子实现（Shadow）不会真的按 `matrix` 重采样像素，返回的是一张空白位图
+     * （程序化验证过：拿同一个翻转矩阵直接调这个重载，输出全黑，而
+     * `matrix.mapPoints(...)` 这种纯数学、不涉及像素重采样的调用在同一环境下结果
+     * 完全正确）——这是 Robolectric 对 Canvas 像素级绘制这类操作的影子实现精度
+     * 限制，不是真机上的行为（真机上 `Bitmap.createBitmap` 带 `Matrix` 参数是
+     * Android 平台最基础、最成熟的位图变换 API，广泛用于任意图片旋转/翻转场景，
+     * 不需要也没有条件在这个项目里重新验证平台本身的正确性）。拆开之后，
+     * [orientationMatrixOrNull] 这个真正包含"翻转/旋转判断逻辑"的部分可以只用
+     * `mapPoints` 验证（可靠），而"矩阵拿去重采样像素对不对"这一步交给 Android
+     * 平台自己的职责范围。
+     */
+    internal fun applyCtmOrientation(bitmap: Bitmap, ctm: PdfMatrix): Bitmap {
+        val matrix = orientationMatrixOrNull(ctm, bitmap.width, bitmap.height) ?: return bitmap
+        return runCatching {
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        }.getOrDefault(bitmap)
+    }
+
+    /**
+     * 见 [applyCtmOrientation] KDoc：只做矩阵计算，不碰任何 `Bitmap` 像素。返回
+     * `null` 表示"不需要修正"——包括真正的 canonical（无翻转无旋转）、CTM 退化成
+     * 零矩阵、以及非轴对齐（不在本次修复范围内）这三种情况，调用方统一处理成
+     * "原样返回"。
+     *
+     * 用 [PdfTextExtractorImageOrientationTest] 验证过：对 8 种轴对齐 CTM，这个
+     * 函数算出的矩阵用 `mapPoints` 作用在 `Bitmap` 四个角的像素坐标上，得到的
+     * 落点和"从 CTM 独立算出来的预期象限映射"这个参照模型完全一致——见该测试
+     * 文件顶部注释，为什么改成跟参照模型比对而不是跟 `PDFRenderer` 整页渲染比对。
+     *
+     * 可见性是 `internal` 不是 `private`：只是为了让同一模块的单元测试能直接调用、
+     * 独立验证这个函数的翻转/旋转逻辑本身，不代表这是对外公开 API，不违反任务
+     * 边界里"不改现有类公开签名"的要求（这是新函数，不是修改已有签名）。
+     */
+    internal fun orientationMatrixOrNull(ctm: PdfMatrix, width: Int, height: Int): Matrix? {
+        val a = ctm.scaleX
+        val b = ctm.shearY
+        val c = ctm.shearX
+        val d = ctm.scaleY
+        // 判断"是否为零"用相对容差：真实 PDF 里理论上的 0 经过浮点运算常常会留下
+        // 极小残余误差（比如 1e-6 量级），不能用 `== 0f` 精确比较；容差跟着分量本身
+        // 的量级走，避免大尺寸图片（CTM 分量数值本身就是几百上千）把噪声判断成信号。
+        val eps = (1e-3f * maxOf(abs(a), abs(b), abs(c), abs(d))).coerceAtLeast(1e-6f)
+
+        val m00: Float
+        val m01: Float
+        val m10: Float
+        val m11: Float
+        when {
+            // 四个分量都接近零：退化矩阵（图片被缩放成几乎不可见），没有意义去修正。
+            abs(a) < eps && abs(b) < eps && abs(c) < eps && abs(d) < eps -> return null
+            abs(b) < eps && abs(c) < eps -> {
+                // 不旋转，只可能翻转：基准是 a>0、d<0（见上方推导）。
+                m00 = if (a < 0) -1f else 1f
+                m01 = 0f
+                m10 = 0f
+                m11 = if (d > 0) -1f else 1f
+            }
+            abs(a) < eps && abs(d) < eps -> {
+                // 90°/270° 旋转（可能叠加翻转）。
+                m00 = 0f
+                m01 = sign(c)
+                m10 = -sign(b)
+                m11 = 0f
+            }
+            else -> return null // 非轴对齐：不在本次修复范围内，原样返回。
+        }
+        if (m00 == 1f && m01 == 0f && m10 == 0f && m11 == 1f) return null // 无需修正
+
+        val cx = width / 2f
+        val cy = height / 2f
+        return Matrix().apply {
+            setValues(floatArrayOf(m00, m01, 0f, m10, m11, 0f, 0f, 0f, 1f))
+            val mapped = floatArrayOf(cx, cy)
+            mapPoints(mapped)
+            // 旋转/翻转默认绕原点，重新平移一次让图片中心还落在原来的中心位置，
+            // 不然内容会跑出 Bitmap 的可见范围。
+            postTranslate(cx - mapped[0], cy - mapped[1])
+        }
     }
 
     /** 把新的一行接到当前段落末尾：CJK 边界不加空格，其余情况加一个空格。 */
@@ -497,6 +664,39 @@ object PdfTextExtractor {
         override fun clip(windingRule: Path.FillType) = Unit
         override fun shadingFill(shadingName: com.tom_roush.pdfbox.cos.COSName) = Unit
         override fun drawImage(pdImage: PDImage) = Unit
+    }
+
+    /**
+     * 内嵌图片抽取所用的图形流引擎：处理页面 content stream 里的 `Do`/`BI…EI` 操作符
+     * （画图片），见类注释"内嵌图片朝向修正"一节。核心是 [drawImage]——捕获画这张图
+     * 那一刻的 CTM（`graphicsState.currentTransformationMatrix`），交给
+     * [applyCtmOrientation] 修正朝向。除 [drawImage] 外的路径相关抽象方法全部
+     * no-op——这个引擎不关心矢量路径（矢量表格检测走的是 [TableGridStreamEngine]，
+     * 职责分开）。
+     *
+     * 单张图片转换失败（`getImage()` 抛异常）只跳过那一张，不中断整页处理——延续
+     * [extractImages] 一贯的降级精神。
+     */
+    private class ImageDrawStreamEngine(page: PDPage) : PDFGraphicsStreamEngine(page) {
+        val images = mutableListOf<Bitmap>()
+
+        override fun drawImage(pdImage: PDImage) {
+            val bitmap = runCatching { pdImage.image }.getOrNull() ?: return
+            images.add(applyCtmOrientation(bitmap, graphicsState.currentTransformationMatrix))
+        }
+
+        override fun appendRectangle(p0: PointF, p1: PointF, p2: PointF, p3: PointF) = Unit
+        override fun clip(windingRule: Path.FillType) = Unit
+        override fun moveTo(x: Float, y: Float) = Unit
+        override fun lineTo(x: Float, y: Float) = Unit
+        override fun curveTo(x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float) = Unit
+        override fun getCurrentPoint(): PointF = PointF(0f, 0f)
+        override fun closePath() = Unit
+        override fun endPath() = Unit
+        override fun strokePath() = Unit
+        override fun fillPath(windingRule: Path.FillType) = Unit
+        override fun fillAndStrokePath(windingRule: Path.FillType) = Unit
+        override fun shadingFill(shadingName: com.tom_roush.pdfbox.cos.COSName) = Unit
     }
 }
 

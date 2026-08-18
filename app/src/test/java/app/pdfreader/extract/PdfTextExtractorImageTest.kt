@@ -140,11 +140,24 @@ class PdfTextExtractorImageTest {
         contentStream.endText()
         contentStream.close()
 
+        // 2026-08-18 图片朝向修复后，抽取改成跟着 content stream 的 `Do` 操作符走
+        // （见 PdfTextExtractor 类注释"内嵌图片朝向修正"一节），不再只看
+        // `PDResources` 里挂了哪些名字——一张图片只是"挂在资源字典里、从没被
+        // `Do` 画出来"在真实 PDF 里等价于页面上根本看不见这张图，所以这里改成
+        // 真的用 `contentStream.drawImage` 画一次，才能如实模拟"页面上有一张
+        // 正常图片、一张损坏图片都被画出来"这个场景，而不是曾经那种"只挂资源、
+        // 不画"的不真实 fixture。
         val validImage = createValidPngImageXObject(document)
-        page.resources.add(validImage)
-
         val corruptImage = createCorruptImageXObject(document)
-        page.resources.add(corruptImage)
+        val drawStream = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(
+            document,
+            page,
+            com.tom_roush.pdfbox.pdmodel.PDPageContentStream.AppendMode.APPEND,
+            true,
+        )
+        drawStream.drawImage(validImage, 50f, 500f, 40f, 30f)
+        drawStream.drawImage(corruptImage, 50f, 400f, 40f, 30f)
+        drawStream.close()
 
         val output = File.createTempFile("broken-image-doc", ".pdf")
         output.deleteOnExit()
