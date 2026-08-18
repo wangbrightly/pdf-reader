@@ -75,19 +75,29 @@
         android:indeterminate="true"
         android:visibility="gone" />
 
+    <!--
+        contentContainer 取代了原来单个 TextView 的位置：图片浮动展示这个增量要求
+        "图片穿插在大致对应的文字段落之间"，单个 TextView 塞一整段纯文字做不到——
+        改成一个纵向 LinearLayout，按顺序动态塞"文字段落 TextView"和"图片 ImageView"
+        两种子 View（见 MainActivity.renderBlocks）。padding 从原来 contentText 上
+        移到这里，保持"内容离屏幕边缘有一圈留白"的视觉效果不变。
+        注意：MainActivity 的阅读进度滚动比例计算（computeScrollRatio /
+        restoreScrollRatioIfNeeded）依赖 contentScrollView.getChildAt(0) 拿到"内容区
+        总高度"，这两个方法本身不关心子 View 是 TextView 还是 LinearLayout，改动前后
+        行为兼容，不需要跟着改。
+    -->
     <ScrollView
         android:id="@+id/contentScrollView"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1">
 
-        <TextView
-            android:id="@+id/contentText"
+        <LinearLayout
+            android:id="@+id/contentContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:padding="16dp"
-            android:textIsSelectable="true"
-            android:fontFamily="monospace" />
+            android:orientation="vertical"
+            android:padding="16dp" />
 
     </ScrollView>
 
