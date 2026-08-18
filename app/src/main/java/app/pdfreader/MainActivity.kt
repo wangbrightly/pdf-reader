@@ -2,10 +2,8 @@ package app.pdfreader
 
 import android.graphics.Bitmap
 import android.graphics.Matrix
-import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
-import android.text.TextPaint
 import android.util.TypedValue
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -26,10 +24,6 @@ import app.pdfreader.extract.PdfContent
 import app.pdfreader.extract.PdfTextExtractor
 import app.pdfreader.progress.ReadingProgressKey
 import app.pdfreader.progress.ReadingProgressStore
-import app.pdfreader.reflow.DEFAULT_NON_CJK_WIDTH_RATIO
-import app.pdfreader.reflow.DEFAULT_SPACE_WIDTH_RATIO
-import app.pdfreader.reflow.LineWidthEstimator
-import app.pdfreader.reflow.reflow
 import app.pdfreader.settings.ReaderSettings
 import app.pdfreader.settings.ReaderSettingsPreferences
 import app.pdfreader.ui.DisplayBlock
@@ -42,8 +36,8 @@ import kotlin.concurrent.thread
 
 /**
  * 唯一的界面：一个"打开 PDF"按钮 + 字号/行距/边距三个 SeekBar + 进度条 + 可滚动内容区，
- * 串起"选文件 → 抽取（[PdfTextExtractor]）→ 重排（[reflow]）→ 显示"这条链路，并支持
- * 阅读设置连续调节、即时生效、重启后保持，图片穿插在文字段落之间浮动展示。
+ * 串起"选文件 → 抽取（[PdfTextExtractor]）→ 显示"这条链路，并支持阅读设置连续调节、
+ * 即时生效、重启后保持，图片穿插在文字段落之间浮动展示。
  *
  * 两个入口都会走到同一个 [loadPdf]：
  * 1. 点按钮 → [openDocumentLauncher]（Storage Access Framework 文件选择器）。
@@ -51,9 +45,28 @@ import kotlin.concurrent.thread
  *    ACTION_VIEW intent-filter 启动本 Activity，[IntentUriResolver] 从 onCreate 收到的
  *    Intent 里解析出 Uri。
  *
- * 抽取+重排在后台线程跑（可能要几秒），结果统一通过 [PdfLoadReducer] 转成
- * [PdfLoadState] 再回主线程渲染——任何异常（文件不是有效 PDF、密码保护等）都会被
- * [PdfLoadReducer] 兜成 [PdfLoadState.Error]，只弹 Toast，不会让 App 崩溃闪退。
+ * 抽取在后台线程跑（可能要几秒），结果统一通过 [PdfLoadReducer] 转成 [PdfLoadState]
+ * 再回主线程渲染——任何异常（文件不是有效 PDF、密码保护等）都会被 [PdfLoadReducer]
+ * 兜成 [PdfLoadState.Error]，只弹 Toast，不会让 App 崩溃闪退。
+ *
+ * ## 换行交给 TextView 原生排版，不再自己算（2026-08-18 架构性修正）
+ *
+ * 这个项目从最早的 TDD 增量起，"重排"一直是自己写的 `app.pdfreader.reflow.reflow`
+ * 算法：拿屏幕宽度、字体宽度估算出"每行能放几个字符"，手动插 `\n`。一路修了好几轮
+ * 真机反馈的显示问题（等宽字体空格视觉偏宽、英文按中文宽度算预算腰斩、单字符测量
+ * 样本不代表性、空格该用更窄的权重……），每一轮都是在把"自己的估算"往真实值上硬
+ * 凑，直到真机反馈"右侧仍有空隙、还出现单个字母独占一行"，才想清楚：这些问题的
+ * 共同根源是"估算"这件事本身——TextView 自带的排版引擎（StaticLayout）本来就会用
+ * 真实字体在真实像素宽度上精确断行，不需要我们猜。[PdfTextExtractor.linesToParagraphs]
+ * 早就把原始 PDF 里的断行拼接成了连续文字，"重排"真正要做的事到抽取这一步已经做完，
+ * 剩下"按屏幕宽度换行"这一步完全可以交给 TextView 自己——不管中文（Android 对 CJK
+ * 的断行规则本来就支持逐字断行，比我们自己的 tokenizer 更懂"标点不能开头"这类规则）
+ * 还是英文（按单词边界断行是 TextView 的默认行为），都不需要我们插手。
+ *
+ * `reflow`/`LineWidthEstimator` 本身的算法没有错（各自的单元测试还在，继续保留作为
+ * "给定固定宽度的纯逻辑断行"这个能力，以后如果有需要精确控制断行位置的场景还用得
+ * 上），只是不再是"决定屏幕上文字怎么换行"这件事的负责人，[buildDisplayBlocks] 现在
+ * 直接把抽取出的段落原文交给 TextView。
  *
  * ## 图片浮动展示（2026-08-18 增量）：展示层从单个 TextView 换成 LinearLayout 容器
  *
@@ -66,36 +79,27 @@ import kotlin.concurrent.thread
  *
  * [buildDisplayBlocks] 是"文字段落 + 图片"合并成有序展示块列表的地方：图片该插在哪个
  * 段落之后，由 [ExtractedImage.afterParagraphIndex] 决定（计算逻辑在
- * [app.pdfreader.extract.ImagePlacement]，纯逻辑、有独立单元测试）；每个文字段落
- * 单独调用一次 [reflow]（而不是像改动前那样把全部段落一次性传给 [reflow] 再拼成一个
- * 大 TextView）——[reflow] 本身完全没有改动，单独传一个段落跟"混在一大批段落里传"
- * 产出的换行结果是完全一样的（每个段落的换行只取决于段落自己的文字，不会跨段落
- * 影响），这样改只是为了能把每个段落单独塞进自己的 TextView，不影响重排算法本身。
+ * [app.pdfreader.extract.ImagePlacement]，纯逻辑、有独立单元测试）。
  *
- * ## 字号调节的核心逻辑：拖动字号/边距要重新 reflow，不是重新抽取
+ * ## 字号/边距调节：改 View 属性即可，不需要重新抽取，也不用手动重排
  *
  * [PdfTextExtractor.extractContent] 是"从 PDF 文件字节流里解析文字+图片"，很慢（要
  * 解析 PDF 结构、字体映射、逐张解码图片），而且需要重新打开原始文件——
- * [copyToCacheFile] 拷贝出来的临时文件在抽取完成后就删掉了，SAF 返回的 content:// Uri
- * 理论上还能再读一次，但没必要：[reflow] 需要的输入是"阅读顺序正确的段落列表"，这份
- * 数据（连同图片）在第一次抽取成功后不会因为字号变化而改变，改变的只是"每行能放几个
- * 字符"。所以 [loadPdf] 成功后把抽取结果缓存在 [currentContent] 里，字号/边距变化时
- * 只调用 [reflowCurrentParagraphs]——重新算一次 [LineWidthEstimator.estimate]，用新
- * 行宽重新跑 [buildDisplayBlocks]，不重新解析 PDF 文件、不重新解码图片。这比"重新
- * 抽取"更快，也不依赖 content:// Uri 在 App 生命周期内可重复打开这个不一定稳妥的假设。
+ * [copyToCacheFile] 拷贝出来的临时文件在抽取完成后就删掉了。字号/边距变化不需要重新
+ * 抽取：[loadPdf] 成功后把抽取结果缓存在 [currentContent] 里，字号变化只是改
+ * TextView 的 `setTextSize`、边距变化只是改 [contentContainer] 的 padding——两者都会
+ * 让 Android 自动重新排版（见上一节），不需要我们手动重建。[reflowCurrentParagraphs]
+ * 目前仍保留用于边距变化时重建 [DisplayBlock] 列表 + 按比例还原滚动位置这条已测试过
+ * 的路径，但它本身已经不再依赖任何宽度估算。
  *
- * ## 拖动防抖：拖动中只改外观预览，松手才重排
+ * ## 拖动防抖：拖动中只改外观预览
  *
  * [SeekBar.OnSeekBarChangeListener.onProgressChanged] 在拖动过程中会高频触发（每移动
- * 一点像素就回调一次）。如果每次回调都触发一次完整的 [reflowCurrentParagraphs]
- * （分配一个新线程、遍历全部段落重新贪心换行、切回主线程重建容器里全部子 View），
- * 拖动手感会明显卡顿。所以拖动过程中只做轻量的外观预览：遍历 [contentContainer] 里
+ * 一点像素就回调一次）。拖动过程中只做轻量的外观预览：遍历 [contentContainer] 里
  * 现有的 TextView 子 View 直接调 `setTextSize`/`setLineSpacing`（[forEachParagraphTextView]），
  * 或者直接改 [contentContainer] 的 padding——这些都是 View 系统内部的度量+重绘，本身
- * 有节流，不会卡。真正的重排逻辑挪到
- * [SeekBar.OnSeekBarChangeListener.onStopTrackingTouch]（松手那一刻，整个拖动过程只
- * 触发一次），这是 Android 官方 SeekBar 就自带的"防抖"信号，不需要自己写计时器/
- * Handler.postDelayed 这类防抖代码。
+ * 有节流，不会卡，且 Android 会自动据此重新排版，拖动过程本身就是实时正确的预览，
+ * 不是"假装改了、松手才是真的"。
  *
  * ## 阅读进度：记比例、存取抽成独立类、onPause 存 / 内容渲染完后恢复
  *
@@ -111,15 +115,14 @@ import kotlin.concurrent.thread
  *    [contentContainer]，但布局（测量出容器的实际高度）是异步的，滚动目标要
  *    等布局完成才算得出来，所以用 `contentScrollView.post { ... }` 把恢复动作排到
  *    下一次布局之后执行，而不是设完内容立刻滚动（那时候高度还是上一次的旧值）。
- * 3. **字号/边距重排后的位置还原**：[reflowCurrentParagraphs] 触发重排前，先把
- *    "当前显示位置对应的滚动比例"存进 [pendingScrollRatio]，重排完成后按同一个比例
- *    恢复——不是精确到像素/行的还原（重排后每行字符数变了，原来第 500 行不一定还是
- *    第 500 行），是"大致还在全文的同一个位置"这个粒度，足够用且实现简单。
+ * 3. **边距变化重建后的位置还原**：[reflowCurrentParagraphs] 触发重建前，先把
+ *    "当前显示位置对应的滚动比例"存进 [pendingScrollRatio]，重建完成后按同一个比例
+ *    恢复——不是精确到像素/行的还原，是"大致还在全文的同一个位置"这个粒度，足够用
+ *    且实现简单。
  *
  * [computeScrollRatio]/[restoreScrollRatioIfNeeded] 两个方法都是通过
  * `contentScrollView.getChildAt(0)` 泛泛地拿"内容区总高度"，不关心这个子 View 具体是
- * TextView 还是 LinearLayout——contentContainer 取代 contentText 之后这两个方法完全
- * 不需要改，这是本次改动特意确认过的兼容点。
+ * TextView 还是 LinearLayout。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -202,7 +205,6 @@ class MainActivity : AppCompatActivity() {
         // render(Loading) 清空内容区之前算，不然滚动位置已经被重置成 0。
         saveCurrentReadingProgress()
         render(PdfLoadState.Loading)
-        val lineMetrics = estimateLineMetrics()
 
         thread {
             val result = runCatching {
@@ -219,7 +221,7 @@ class MainActivity : AppCompatActivity() {
                 // 特殊分支——ReadingProgressStore.loadProgress 没记录时返回 null，
                 // 这里兜底成 0f 是唯一需要区分两种语义的地方。
                 pendingScrollRatio = ReadingProgressStore.loadProgress(applicationContext, fileKey) ?: 0f
-                buildDisplayBlocks(content, lineMetrics)
+                buildDisplayBlocks(content)
             }
             val state = PdfLoadReducer.fromResult(result)
             runOnUiThread {
@@ -233,8 +235,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 字号/边距变化（松手那一刻）触发：不重新抽取 PDF、不重新解码图片，只用新的行宽
-     * 对已缓存的段落重新跑一次 [buildDisplayBlocks]，见类注释"核心逻辑"一节。
+     * 边距变化（松手那一刻）触发：不重新抽取 PDF、不重新解码图片，用已缓存的段落重建
+     * 一遍 [buildDisplayBlocks]，见类注释"核心逻辑"一节。
+     *
+     * 2026-08-18 补：字号变化不再调用这个方法——[buildDisplayBlocks] 不再手动算换行
+     * 之后，TextView 的 `setTextSize` 本身就会触发系统重新排版（见 [buildDisplayBlocks]
+     * 类注释"架构性修正"一节），不需要我们再手动重建一遍。边距变化会改变
+     * [contentContainer] 的可用宽度，`setPadding` 同样会触发子 View 自动重新排版，
+     * 严格来说这个方法本身也不再必要——保留它只是为了兼容"重排完成后按比例还原滚动
+     * 位置"这条已经测试过的阅读体验（视图不整体重建的话，滚动位置本来就不会跑，但
+     * 保留这一层不算错，只是不再是必需品，暂不动它，等以后有明确理由再简化）。
      */
     private fun reflowCurrentParagraphs() {
         val content = currentContent ?: return
@@ -243,10 +253,9 @@ class MainActivity : AppCompatActivity() {
         // 一节）。必须在 render(Loading) 清空内容区之前算。
         pendingScrollRatio = computeScrollRatio()
         render(PdfLoadState.Loading)
-        val lineMetrics = estimateLineMetrics()
 
         thread {
-            val state = PdfLoadReducer.fromResult(runCatching { buildDisplayBlocks(content, lineMetrics) })
+            val state = PdfLoadReducer.fromResult(runCatching { buildDisplayBlocks(content) })
             runOnUiThread { render(state) }
         }
     }
@@ -254,10 +263,27 @@ class MainActivity : AppCompatActivity() {
     /**
      * 把抽取出的文字段落 + 图片，按"图片插在哪个段落之后"（[ExtractedImage.afterParagraphIndex]，
      * 见 [app.pdfreader.extract.ImagePlacement]）合并成有序的 [DisplayBlock] 列表。
-     * 每个段落单独调用一次 [reflow]，原因见类注释"图片浮动展示"一节；`nonCjkWidthRatio`
-     * 也一并传给 [reflow]，见 [estimateLineMetrics] KDoc"真机实测发现两个问题"一节。
+     *
+     * ## 2026-08-18 架构性修正：不再用 [reflow] 手动算换行，直接交给 TextView 原生排版
+     *
+     * 这个项目从最早的 TDD 增量起，"重排"就是自己写的 [reflow] 算法：拿屏幕宽度、字体
+     * 宽度估算出"每行能放几个字符"，手动在文字里插 `\n`。一路修了好几轮真机反馈的
+     * 显示问题（等宽字体空格视觉偏宽、英文按中文宽度算预算腰斩、单字符测量样本不
+     * 代表性、空格该用更窄的权重……），每一轮都是在把"我们自己的估算"往真实值上
+     * 硬凑。这一次真机反馈"右侧仍有空隙、还出现单个字母'A'独占一行"，逼着往回想了
+     * 一层：**这些问题的共同根源是"估算"这件事本身**——TextView 自带的排版引擎
+     * （StaticLayout）本来就会用真实字体在真实像素宽度上精确断行，不需要猜。
+     * [PdfTextExtractor.linesToParagraphs] 早就把原始 PDF 里的断行拼接成了连续文字
+     * （见其 KDoc），"重排"真正要做的事到这一步已经做完了，剩下"按屏幕宽度换行"这一步
+     * 完全可以交给 TextView 自己——不管是中文（Android 对 CJK 的断行规则本来就支持
+     * 逐字断行，且比我们自己的 tokenizer 更懂标点不能开头这类规则）还是英文
+     * （按单词边界断行是 TextView 的默认行为），都不需要我们插手。
+     *
+     * [reflow]/[LineWidthEstimator] 本身的算法没有错（各自的单元测试还在，继续保留
+     * 作为"给定固定宽度的纯逻辑断行"这个能力，以后如果有需要精确控制断行位置的场景
+     * 还用得上），只是不该再是"决定屏幕上文字怎么换行"这件事的负责人。
      */
-    private fun buildDisplayBlocks(content: PdfContent, lineMetrics: LineMetrics): List<DisplayBlock> {
+    private fun buildDisplayBlocks(content: PdfContent): List<DisplayBlock> {
         val imagesByAfterIndex = content.images.groupBy { it.afterParagraphIndex }
         val blocks = mutableListOf<DisplayBlock>()
 
@@ -267,13 +293,7 @@ class MainActivity : AppCompatActivity() {
 
         appendImagesAfter(-1) // 插在所有段落之前的图片。
         content.paragraphs.forEachIndexed { index, paragraph ->
-            val reflowedText = reflow(
-                listOf(paragraph),
-                lineMetrics.maxLineWidthChars,
-                lineMetrics.nonCjkWidthRatio,
-                lineMetrics.spaceWidthRatio,
-            ).joinToString("\n")
-            blocks.add(DisplayBlock.Text(reflowedText))
+            blocks.add(DisplayBlock.Text(paragraph))
             appendImagesAfter(index)
         }
         return blocks
@@ -317,64 +337,6 @@ class MainActivity : AppCompatActivity() {
             tempFile.outputStream().use { output -> inputStream.copyTo(output) }
         }
         return tempFile
-    }
-
-    /** [estimateLineMetrics] 的返回值：reflow 需要的三个数字，见该方法 KDoc。 */
-    private data class LineMetrics(
-        val maxLineWidthChars: Int,
-        val nonCjkWidthRatio: Float,
-        val spaceWidthRatio: Float,
-    )
-
-    /**
-     * 用屏幕宽度和当前字号/边距设置，估算 [reflow] 需要的三个数字：每行的宽度预算
-     * （[LineWidthEstimator]，纯函数，见其单元测试）、"拉丁字母/数字相对中文字符的
-     * 宽度比例"（`nonCjkWidthRatio`）、"空格相对中文字符的宽度比例"（`spaceWidthRatio`）。
-     *
-     * 2026-08-18 真机实测发现三个问题，都在这里改的：
-     * 1. 测量字体之前用的是 [Typeface.MONOSPACE]，但显示用的 TextView 已经改成系统
-     *    默认字体（见 [createParagraphTextView] 的空格视觉 bug 修复）——测量字体和
-     *    显示字体不一致，估算就不准了，这里也同步换成默认字体（不显式设置 typeface），
-     *    量出来的宽度才是 TextView 实际会用的宽度。
-     * 2. 之前只测了一个较宽的 CJK 字符宽度，把这个宽度直接当"每个字符"的预算——纯
-     *    英文 PDF 因此每行只用了不到一半屏幕宽度就换行（拉丁字符实际宽度大约只有
-     *    中文全角字符的一半，用中文的宽度当预算单位，等于把英文字符的预算也砍了
-     *    一半）。踩过一次坑：一开始只测单个"W"字符的宽度当拉丁字符代表，真机实测
-     *    发现在这台设备的系统默认字体里"W"几乎跟全角中文字符一样宽（57px vs 56px），
-     *    算出来的比例约等于 1，等于没起作用。改成测一整段大小写字母加数字，取平均
-     *    宽度——覆盖了从"i/l"这种窄字符到"W/M"这种宽字符的整个分布，平均值才真正
-     *    代表"一段英文文字大概多宽"。
-     * 3. 空格之前跟字母共用同一个 `nonCjkWidthRatio`，但空格实际显示宽度明显更窄，
-     *    真机反馈"右侧仍有空隙"。这里单独测一次空格的真实宽度，传给 [reflow] 的
-     *    `spaceWidthRatio`，不再用一个通用猜测值。
-     */
-    private fun estimateLineMetrics(): LineMetrics {
-        val paddingPx = dpToPx(currentSettings.paddingDp)
-        val usableWidthPx = resources.displayMetrics.widthPixels - 2 * paddingPx
-        val measurePaint = TextPaint().apply {
-            textSize = TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_SP,
-                currentSettings.fontSizeSp.toFloat(),
-                resources.displayMetrics,
-            )
-        }
-        val cjkCharWidthPx = measurePaint.measureText("宽")
-        val maxLineWidthChars = LineWidthEstimator.estimate(usableWidthPx, cjkCharWidthPx)
-
-        val latinSample = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        val latinCharWidthPx = measurePaint.measureText(latinSample) / latinSample.length
-        // 空格前后各加一个基准字符再相减，量出空格自己的实际宽度——直接测一个单独
-        // 的空格字符串，不少字体/measureText 实现会把首尾空白的宽度算成 0。
-        val spaceCharWidthPx = measurePaint.measureText("a a") - measurePaint.measureText("aa")
-
-        fun ratio(widthPx: Float, default: Float) =
-            if (cjkCharWidthPx > 0f) (widthPx / cjkCharWidthPx).coerceIn(0.05f, 1f) else default
-
-        return LineMetrics(
-            maxLineWidthChars = maxLineWidthChars,
-            nonCjkWidthRatio = ratio(latinCharWidthPx, DEFAULT_NON_CJK_WIDTH_RATIO),
-            spaceWidthRatio = ratio(spaceCharWidthPx, DEFAULT_SPACE_WIDTH_RATIO),
-        )
     }
 
     /** 把 [settings] 应用到 [contentContainer] 的外观（目前只有 padding；字号/行距在每个段落 TextView 创建时应用）。 */
@@ -559,15 +521,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 2026-08-18 真机实测发现：这里之前跟 [estimateLineWidthChars] 的测量用同一支
-     * `Typeface.MONOSPACE`，用户反馈"没有断句的汉字之间有多个空格，看起来像换行"——
-     * 排查用真实 PDF 逐字符核实过，插入的确实只有一个 U+0020 空格（[normalizeCjkSpacing]
-     * 没有 bug），问题在等宽字体本身：它的空格字形紧挨着全角中文字符时视觉上显得偏宽，
-     * 像两个空格连在一起。改用系统默认字体显示——CJK 字符在任何字体里本来就是全角
-     * （这是 Unicode 东亚宽度属性决定的，不是等宽字体特有的效果），等宽字体真正影响的
-     * 只是拉丁字母/数字的宽度，对 CJK 为主的文本影响不大；[estimateLineWidthChars] 那支
-     * 独立的 TextPaint 继续用 MONOSPACE 测量（本来就跟显示用的字体是两回事，互不影响），
-     * 行宽估算的"保守"性质（宁可提前换行也不超宽）不受这个改动影响。
+     * 2026-08-18 真机实测发现：这里之前用 `Typeface.MONOSPACE` 显示，用户反馈"没有
+     * 断句的汉字之间有多个空格，看起来像换行"——排查用真实 PDF 逐字符核实过，插入的
+     * 确实只有一个 U+0020 空格（[normalizeCjkSpacing] 没有 bug），问题在等宽字体本身：
+     * 它的空格字形紧挨着全角中文字符时视觉上显得偏宽，像两个空格连在一起。改用系统
+     * 默认字体显示——CJK 字符在任何字体里本来就是全角（这是 Unicode 东亚宽度属性
+     * 决定的，不是等宽字体特有的效果），等宽字体真正影响的只是拉丁字母/数字的宽度，
+     * 对 CJK 为主的文本影响不大。
      */
     private fun createParagraphTextView(text: String): TextView =
         TextView(this).apply {
@@ -640,8 +600,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private companion object {
-        /** 展示块（文字段落/图片）之间的纵向间距，还原改动前段落之间的视觉留白。 */
-        const val BLOCK_SPACING_DP = 12
+        /**
+         * 展示块（文字段落/图片）之间的纵向间距。2026-08-18 从 12dp 调到 24dp——用户
+         * 反馈"想让段与段之间的间隔更明显"，字号/行距还能再调，这个值先给个明显但不
+         * 夸张的量，以后想再调可以考虑做成第四个可调设置项。
+         */
+        const val BLOCK_SPACING_DP = 24
         const val MAX_ZOOM_MULTIPLIER = 4f
     }
 }
