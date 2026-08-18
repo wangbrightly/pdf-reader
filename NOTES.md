@@ -127,3 +127,23 @@ Robolectric 的 `nativeruntime-dist-compat` 依赖包约 159MB，走代理连 Ma
 
 **往后再改这类朝向/坐标问题，别再纯靠纸面推导，也别造一个"独立模型"就假设它真的独立
 ——用第三方成熟工具（不同代码库、不同作者）产出的结果当地面真相，才是真的独立验证。**
+
+## 12. 待办：配置变化（转屏等）会导致 Activity 重建，当前打开的文档整个丢失
+
+**现象**（code-review 2026-08-19 发现，不是真机反馈）：`MainActivity` 没有
+`android:configChanges`，也没有 `onSaveInstanceState`/`ViewModel` 之类的状态保存
+机制——只要发生配置变化（最常见是转屏，也可能是系统字体大小变化等），Activity 会
+被完整销毁重建，`currentContent`（已经抽取好的文字/图片/大纲）、当前滚动位置、
+当前打开的文件全部丢失，回到"还没打开任何文档"的初始画面。
+
+**没有直接证据这台测试机上真的触发过**（这台设备大概率锁定竖屏阅读，转屏路径可能
+根本走不到），是 code-review 通读代码时发现的结构性缺口，先记录、不是本次会话
+处理的问题范围。
+
+**以后要修的话**：思路是给 `currentDocumentUri`（或者已抽取的 `PdfContent` +
+阅读进度）加一层保存/恢复——最简单的做法是 `onSaveInstanceState` 里存文件 Uri，
+`onCreate` 检测到 `savedInstanceState` 非空时用同一个 Uri 重新走一遍
+`loadPdf()`（相当于"重新打开"，不需要真的序列化整份 `PdfContent`，重新抽取一遍
+即可，配合已有的阅读进度记忆机制自动滚回原位置）；更完整的做法是用 ViewModel
+持有 `currentContent`，配置变化时直接复用不用重新抽取，但复杂度更高，没有明确
+证据表明当前场景需要这个量级的方案。
