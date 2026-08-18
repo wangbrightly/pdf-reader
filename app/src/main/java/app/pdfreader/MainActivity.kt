@@ -587,17 +587,31 @@ class MainActivity : AppCompatActivity() {
      * [baseScale] 的额外倍数）限制在 1x-[MAX_ZOOM_MULTIPLIER] 之间，避免越缩越小
      * 看不清或越缩越大失真。
      *
-     * 2026-08-18 真机反馈"图片和表格缩放有问题"——排查是放大之后卡住了，图片超出
-     * 屏幕的部分完全看不到也挪不动，只能缩回去重来，等于"能放大、不能看"。原来的
-     * 实现只处理了双指捏合，没有处理放大后的单指拖动。现在分两种状态：
-     * - **没放大（倍数=1）**：单指触摸原样放行（返回 false），事件继续往上传给
-     *   [contentScrollView] 处理正常的上下滚动——这条沿用了原来的设计，不这样区分的话
-     *   手指落在图片上就没法上下滑动看后面的内容了。
-     * - **已放大（倍数>1）**：单指拖动改成平移图片内容（[Matrix.postTranslate]），不再
-     *   放行给 ScrollView——这才是"缩放之后还能看到图片其他部分"的关键。平移范围用
-     *   [clampTranslation] 限制，不让图片边缘被拖到 ImageView 可视区域内侧、露出图片
-     *   外的空白。缩小回 1x 后自动恢复成"单指滚动整页"的行为，不需要额外的按钮或手势
-     *   去"退出缩放模式"。
+     * 2026-08-18 真机反馈两轮：第一轮"放大之后卡住、看不到超出屏幕的部分"，加了
+     * 平移支持；第二轮加完平移后反馈"图片和表格完全没有缩放了"——排查是平移那版的
+     * 触摸分发逻辑有一个经典坑：手指刚按下（`ACTION_DOWN`）那一刻，因为还不知道
+     * 会不会变成双指捏合，旧写法在这一刻直接"放行"（`onTouch` 返回 false，让事件
+     * 继续往上传给 [contentScrollView]）——但 Android 的规则是：一个 View 如果在
+     * `ACTION_DOWN` 这一刻就放行了，后续同一串手势的事件（包括第二根手指按下的
+     * `ACTION_POINTER_DOWN`）根本不会再送到这个 View，双指捏合从源头上就检测不到，
+     * 不是"检测到了但没反应"，是"压根没收到手指事件"。
+     *
+     * 改用 Android 官方推荐处理"可缩放视图嵌在可滚动容器里"这种场景的标准写法——
+     * [android.view.ViewParent.requestDisallowInterceptTouchEvent]：按下时先"拦下"
+     * 整个手势不让外层 [contentScrollView] 抢（保证后续的第二根手指、拖动都能收到），
+     * 判断出"没放大、单指、不是捏合"这种该交给外层滚动的情况，再主动把拦截权限还
+     * 回去（传 false），外层 [contentScrollView] 才会接手继续走正常的上下滚动。
+     *
+     * - **没放大（倍数=1）+ 单指拖动**：判定为"想滚动整页"，交还拦截权限给
+     *   [contentScrollView]。
+     * - **已放大（倍数>1）+ 单指拖动**：平移图片内容（[Matrix.postTranslate]），
+     *   继续拦着不放。平移范围用 [clampTranslation] 限制，不让图片边缘被拖到
+     *   ImageView 可视区域内侧、露出图片外的空白。
+     * - **出现第二根手指**：不管当前有没有放大，都判定为捏合，继续拦着，交给
+     *   [ScaleGestureDetector] 处理。
+     *
+     * 缩小回 1x 后自动恢复成"单指滚动整页"的行为，不需要额外的按钮或手势去
+     * "退出缩放模式"。
      */
     private fun ImageView.enablePinchZoom(baseScale: Float, bitmapWidth: Int, bitmapHeight: Int) {
         var zoomMultiplier = 1f
@@ -634,28 +648,44 @@ class MainActivity : AppCompatActivity() {
             },
         )
 
-        setOnTouchListener { _, event ->
+        setOnTouchListener { view, event ->
             scaleDetector.onTouchEvent(event)
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     lastTouchX = event.x
                     lastTouchY = event.y
+                    // 先拦下整个手势，保证后续第二根手指按下、拖动这些事件都能收到——
+                    // 见类 KDoc"真机反馈两轮"一节，这是修"完全没有缩放"这个回归的关键。
+                    view.parent?.requestDisallowInterceptTouchEvent(true)
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    // 出现第二根手指，确定是捏合，继续拦着不放。
+                    view.parent?.requestDisallowInterceptTouchEvent(true)
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    // 已放大、单指、且不是正在捏合的那一下（捏合本身也会报 MOVE，
-                    // 交给 scaleDetector 处理，这里不重复平移）才走拖动平移。
-                    if (zoomMultiplier > 1f && event.pointerCount == 1 && !scaleDetector.isInProgress) {
-                        translateX += event.x - lastTouchX
-                        translateY += event.y - lastTouchY
-                        clampTranslation()
-                        applyMatrix()
-                        lastTouchX = event.x
-                        lastTouchY = event.y
+                    // 捏合本身也会报 MOVE，交给 scaleDetector 处理，这里只处理单指的
+                    // 情况，不重复处理。
+                    if (event.pointerCount == 1 && !scaleDetector.isInProgress) {
+                        if (zoomMultiplier > 1f) {
+                            translateX += event.x - lastTouchX
+                            translateY += event.y - lastTouchY
+                            clampTranslation()
+                            applyMatrix()
+                            lastTouchX = event.x
+                            lastTouchY = event.y
+                        } else {
+                            // 没放大、单指、也不是捏合：判定为想滚动整页，把拦截权限
+                            // 还给外层 contentScrollView。
+                            view.parent?.requestDisallowInterceptTouchEvent(false)
+                        }
                     }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    view.parent?.requestDisallowInterceptTouchEvent(false)
                 }
                 else -> Unit
             }
-            zoomMultiplier > 1f || event.pointerCount > 1 || scaleDetector.isInProgress
+            true
         }
     }
 
