@@ -26,6 +26,7 @@ import app.pdfreader.extract.PdfContent
 import app.pdfreader.extract.PdfTextExtractor
 import app.pdfreader.progress.ReadingProgressKey
 import app.pdfreader.progress.ReadingProgressStore
+import app.pdfreader.reflow.DEFAULT_NON_CJK_WIDTH_RATIO
 import app.pdfreader.reflow.LineWidthEstimator
 import app.pdfreader.reflow.reflow
 import app.pdfreader.settings.ReaderSettings
@@ -195,7 +196,7 @@ class MainActivity : AppCompatActivity() {
         // render(Loading) 清空内容区之前算，不然滚动位置已经被重置成 0。
         saveCurrentReadingProgress()
         render(PdfLoadState.Loading)
-        val lineWidthChars = estimateLineWidthChars()
+        val lineMetrics = estimateLineMetrics()
 
         thread {
             val result = runCatching {
@@ -212,7 +213,7 @@ class MainActivity : AppCompatActivity() {
                 // 特殊分支——ReadingProgressStore.loadProgress 没记录时返回 null，
                 // 这里兜底成 0f 是唯一需要区分两种语义的地方。
                 pendingScrollRatio = ReadingProgressStore.loadProgress(applicationContext, fileKey) ?: 0f
-                buildDisplayBlocks(content, lineWidthChars)
+                buildDisplayBlocks(content, lineMetrics)
             }
             val state = PdfLoadReducer.fromResult(result)
             runOnUiThread { render(state) }
@@ -230,10 +231,10 @@ class MainActivity : AppCompatActivity() {
         // 一节）。必须在 render(Loading) 清空内容区之前算。
         pendingScrollRatio = computeScrollRatio()
         render(PdfLoadState.Loading)
-        val lineWidthChars = estimateLineWidthChars()
+        val lineMetrics = estimateLineMetrics()
 
         thread {
-            val state = PdfLoadReducer.fromResult(runCatching { buildDisplayBlocks(content, lineWidthChars) })
+            val state = PdfLoadReducer.fromResult(runCatching { buildDisplayBlocks(content, lineMetrics) })
             runOnUiThread { render(state) }
         }
     }
@@ -241,9 +242,10 @@ class MainActivity : AppCompatActivity() {
     /**
      * 把抽取出的文字段落 + 图片，按"图片插在哪个段落之后"（[ExtractedImage.afterParagraphIndex]，
      * 见 [app.pdfreader.extract.ImagePlacement]）合并成有序的 [DisplayBlock] 列表。
-     * 每个段落单独调用一次 [reflow]，原因见类注释"图片浮动展示"一节。
+     * 每个段落单独调用一次 [reflow]，原因见类注释"图片浮动展示"一节；`nonCjkWidthRatio`
+     * 也一并传给 [reflow]，见 [estimateLineMetrics] KDoc"真机实测发现两个问题"一节。
      */
-    private fun buildDisplayBlocks(content: PdfContent, lineWidthChars: Int): List<DisplayBlock> {
+    private fun buildDisplayBlocks(content: PdfContent, lineMetrics: LineMetrics): List<DisplayBlock> {
         val imagesByAfterIndex = content.images.groupBy { it.afterParagraphIndex }
         val blocks = mutableListOf<DisplayBlock>()
 
@@ -253,7 +255,11 @@ class MainActivity : AppCompatActivity() {
 
         appendImagesAfter(-1) // 插在所有段落之前的图片。
         content.paragraphs.forEachIndexed { index, paragraph ->
-            val reflowedText = reflow(listOf(paragraph), lineWidthChars).joinToString("\n")
+            val reflowedText = reflow(
+                listOf(paragraph),
+                lineMetrics.maxLineWidthChars,
+                lineMetrics.nonCjkWidthRatio,
+            ).joinToString("\n")
             blocks.add(DisplayBlock.Text(reflowedText))
             appendImagesAfter(index)
         }
@@ -300,32 +306,52 @@ class MainActivity : AppCompatActivity() {
         return tempFile
     }
 
+    /** [estimateLineMetrics] 的返回值：reflow 需要的两个数字，见该方法 KDoc。 */
+    private data class LineMetrics(val maxLineWidthChars: Int, val nonCjkWidthRatio: Float)
+
     /**
-     * 用屏幕宽度和当前字号/边距设置，估算 reflow 用的"每行字符数"。核心换算逻辑在
-     * [LineWidthEstimator]（纯函数，见其单元测试），这里只负责用 Android API 量出
-     * 两个输入：可用宽度像素、单字符宽度像素。用一个较宽的 CJK 字符测宽度，是保守
-     * 估计（英文字符更窄，实际能容纳的英文字符数会略多于估算值，不会超宽，只会更
-     * 保守地提前换行，可接受）。
+     * 用屏幕宽度和当前字号/边距设置，估算 [reflow] 需要的两个数字：每行的宽度预算
+     * （[LineWidthEstimator]，纯函数，见其单元测试），以及"拉丁字母/数字相对中文
+     * 字符的宽度比例"（[reflow] 的 `nonCjkWidthRatio` 参数）。
      *
-     * 改动前是读 `contentText.paint`（一个真实存在的 TextView 当前已生效的字体/内
-     * 边距）；改动后展示层没有单一固定的 TextView 了（每个段落各有一个，动态创建），
-     * 所以改成直接用 [currentSettings] 构造一支独立的测量用 [TextPaint]——数值上和
-     * 改动前完全等价（[currentSettings] 就是"当前生效设置"的唯一真相来源，改动前
-     * contentText 的实际字号/边距也是从它应用过去的），但不再依赖某个具体 View 实例。
+     * 2026-08-18 真机实测发现两个问题，都在这里改的：
+     * 1. 测量字体之前用的是 [Typeface.MONOSPACE]，但显示用的 TextView 已经改成系统
+     *    默认字体（见 [createParagraphTextView] 的空格视觉 bug 修复）——测量字体和
+     *    显示字体不一致，估算就不准了，这里也同步换成默认字体（不显式设置 typeface），
+     *    量出来的宽度才是 TextView 实际会用的宽度。
+     * 2. 之前只测了一个较宽的 CJK 字符宽度，把这个宽度直接当"每个字符"的预算——纯
+     *    英文 PDF 因此每行只用了不到一半屏幕宽度就换行（拉丁字符实际宽度大约只有
+     *    中文全角字符的一半，用中文的宽度当预算单位，等于把英文字符的预算也砍了
+     *    一半）。现在额外测一个拉丁字符（用"W"，比常见小写字母宽，同样是保守估计，
+     *    不会让预算算多）算出实际比例，传给 [reflow] 的 `nonCjkWidthRatio`。
      */
-    private fun estimateLineWidthChars(): Int {
+    private fun estimateLineMetrics(): LineMetrics {
         val paddingPx = dpToPx(currentSettings.paddingDp)
         val usableWidthPx = resources.displayMetrics.widthPixels - 2 * paddingPx
         val measurePaint = TextPaint().apply {
-            typeface = Typeface.MONOSPACE
             textSize = TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_SP,
                 currentSettings.fontSizeSp.toFloat(),
                 resources.displayMetrics,
             )
         }
-        val charWidthPx = measurePaint.measureText("宽")
-        return LineWidthEstimator.estimate(usableWidthPx, charWidthPx)
+        val cjkCharWidthPx = measurePaint.measureText("宽")
+        val maxLineWidthChars = LineWidthEstimator.estimate(usableWidthPx, cjkCharWidthPx)
+
+        // 踩过的坑：一开始只测单个"W"字符的宽度当拉丁字符代表——真机实测发现在这台
+        // 设备的系统默认字体里，"W"几乎跟全角中文字符一样宽（57px vs 56px），算出来
+        // 的比例约等于 1，等于没起作用（一个字符不能代表"拉丁字符普遍多窄"这件事，
+        // W/M 这类大写字母本来就是拉丁字母表里最宽的极端值）。改成测一整段大小写字母
+        // 加数字，取平均宽度——覆盖了从"i/l"这种窄字符到"W/M"这种宽字符的整个分布，
+        // 平均值才真正代表"一段英文文字大概多宽"。
+        val latinSample = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        val latinCharWidthPx = measurePaint.measureText(latinSample) / latinSample.length
+        val nonCjkWidthRatio = if (cjkCharWidthPx > 0f) {
+            (latinCharWidthPx / cjkCharWidthPx).coerceIn(0.1f, 1f)
+        } else {
+            DEFAULT_NON_CJK_WIDTH_RATIO
+        }
+        return LineMetrics(maxLineWidthChars, nonCjkWidthRatio)
     }
 
     /** 把 [settings] 应用到 [contentContainer] 的外观（目前只有 padding；字号/行距在每个段落 TextView 创建时应用）。 */
@@ -493,11 +519,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 2026-08-18 真机实测发现：这里之前跟 [estimateLineWidthChars] 的测量用同一支
+     * `Typeface.MONOSPACE`，用户反馈"没有断句的汉字之间有多个空格，看起来像换行"——
+     * 排查用真实 PDF 逐字符核实过，插入的确实只有一个 U+0020 空格（[normalizeCjkSpacing]
+     * 没有 bug），问题在等宽字体本身：它的空格字形紧挨着全角中文字符时视觉上显得偏宽，
+     * 像两个空格连在一起。改用系统默认字体显示——CJK 字符在任何字体里本来就是全角
+     * （这是 Unicode 东亚宽度属性决定的，不是等宽字体特有的效果），等宽字体真正影响的
+     * 只是拉丁字母/数字的宽度，对 CJK 为主的文本影响不大；[estimateLineWidthChars] 那支
+     * 独立的 TextPaint 继续用 MONOSPACE 测量（本来就跟显示用的字体是两回事，互不影响），
+     * 行宽估算的"保守"性质（宁可提前换行也不超宽）不受这个改动影响。
+     */
     private fun createParagraphTextView(text: String): TextView =
         TextView(this).apply {
             this.text = text
             setTextIsSelectable(true)
-            typeface = Typeface.MONOSPACE
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
