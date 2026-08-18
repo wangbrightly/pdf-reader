@@ -195,6 +195,15 @@ import kotlin.math.sign
  * 证明误判率不低，目录功能给用户的预期是"点了准确跳转"，猜错了比没有更烂，任务
  * 描述里也明确要求不要这样做）。UI 层（[app.pdfreader.MainActivity]）据此把"目录"
  * 按钮禁用，如实反映"这份 PDF 没有内嵌目录"这个事实，不假装有目录。
+ *
+ * ## 页眉页脚水印过滤（2026-08-19 增量）
+ *
+ * 真机反馈一份"网页打印成 PDF"的文档，抽取出来的文字里夹着浏览器自动加的页眉页脚：
+ * 打印时间、文档标题、来源网址、页码计数，几乎每页都有，读起来很打扰。用
+ * [RunningFooterFilter]（纯逻辑，独立测试）识别、过滤掉——具体识别规则和"为什么
+ * 故意不处理标题行"见该类 KDoc。过滤发生在 [linesToParagraphs] 之后、其余所有
+ * 依赖段落下标的计算（图片插入位置、目录页内定位）之前，这样下标体系从一开始就是
+ * "过滤后的段落列表"，不需要在后面的每一处计算里再去处理"要跳过被删掉的段落"。
  */
 object PdfTextExtractor {
 
@@ -268,7 +277,16 @@ object PdfTextExtractor {
             stripper.getText(document)
             val t3 = System.currentTimeMillis()
             val nonTableLines = stripper.lines.filterNot { it.page in renderedTablePages }
-            val paragraphs = linesToParagraphs(nonTableLines)
+            val rawParagraphs = linesToParagraphs(nonTableLines)
+            // 见 RunningFooterFilter 类注释：过滤掉"浏览器打印 PDF 自带的页眉页脚水印"
+            // （纯网址/纯日期时间一行，以及跟它们同页出现的纯页码计数一行），不是书本身
+            // 的正文——过滤发生在这里（linesToParagraphs 之后），后面所有基于段落下标
+            // 的计算（图片插入位置、目录页内定位）都直接用过滤后的结果，不需要额外
+            // 处理"下标要跳过被删掉的段落"这种麻烦。
+            val footerNoiseIndices = RunningFooterFilter.noiseIndices(
+                rawParagraphs.map { PageTextLine(it.text, it.page) },
+            )
+            val paragraphs = rawParagraphs.filterIndexed { index, _ -> index !in footerNoiseIndices }
             val paragraphPages = paragraphs.map { it.page }
             val paragraphTopYs = paragraphs.map { it.topY }
 
