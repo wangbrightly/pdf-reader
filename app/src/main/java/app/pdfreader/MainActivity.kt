@@ -228,7 +228,15 @@ class MainActivity : AppCompatActivity() {
         // 不只是"加载成功后自动收起"（那是 render() 里已有的逻辑，只覆盖"打开文档"这
         // 个时机）。直接复用 collapseSettingsPanel，不在 XML 里另外维护一套初始状态，
         // 避免两处"折叠态"定义不同步。
-        collapseSettingsPanel()
+        //
+        // 只在 savedInstanceState == null（真正的冷启动，不是横竖屏切换等配置变化
+        // 触发的 Activity 重建）时收起——2026-08-19 code review 发现的问题：这行
+        // 一开始没加判断，导致用户读到一半展开设置调字号、转一下屏幕（或任何触发
+        // 重建的配置变化），设置面板会被强制收起，跟当时正在做的事对不上。
+        // savedInstanceState 在配置变化重建时框架会自动给一个非空 Bundle（哪怕本
+        // Activity 没有覆写 onSaveInstanceState 主动存任何东西），可以用它可靠区分
+        // "真的是第一次启动"和"只是重建"。
+        if (savedInstanceState == null) collapseSettingsPanel()
 
         // 别的 App"用……打开"分享过来的 PDF：启动时就自动开始抽取，不需要用户再点一次按钮。
         IntentUriResolver.resolvePdfUri(intent)?.let { uri -> loadPdf(uri) }
