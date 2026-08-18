@@ -33,11 +33,17 @@ import java.io.File
 @RunWith(RobolectricTestRunner::class)
 class PdfTextExtractorTest {
 
-    /** 写入 fixture-source.txt 的原始文本，按空行切成的三段——断言的“期望值”依据。 */
+    /**
+     * 写入 fixture-source.txt 的原始文本，按空行切成的三段——断言的"期望值"依据。
+     *
+     * 2026-08-18 补：中文和数字/字母之间加了 [normalizeCjkSpacing]，这里的期望值已经
+     * 按新规则更新（比如"工作。PDF阅读器"变成"工作。 PDF 阅读器"）——原始 fixture 文本
+     * 本身没变，变的是抽取出来以后的规范化结果，详见 [PdfTextExtractor] 类注释。
+     */
     private val knownParagraphs = listOf(
-        "本文档用于测试中文文字提取功能是否正常工作。PDF阅读器项目需要验证从PDF文件中抽取的中文文字不会出现乱码或空白字符。",
-        "测试内容包括常见汉字、标点符号（例如逗号、句号、问号？还有感叹号！）以及阿拉伯数字12345和百分号100%。这段文字大约有一百五十字左右，涵盖了日常说明性文字的基本特征，比如时间、地点、人物、事件等要素。",
-        "例如：2026年8月17日，工程师在北京完成了这份测试文档的编写工作，用来验证PdfBox-Android库对中文字体的解析能力是否可靠。",
+        "本文档用于测试中文文字提取功能是否正常工作。 PDF 阅读器项目需要验证从 PDF 文件中抽取的中文文字不会出现乱码或空白字符。",
+        "测试内容包括常见汉字、标点符号（例如逗号、句号、问号？还有感叹号！）以及阿拉伯数字 12345 和百分号 100%。这段文字大约有一百五十字左右，涵盖了日常说明性文字的基本特征，比如时间、地点、人物、事件等要素。",
+        "例如： 2026 年 8 月 17 日，工程师在北京完成了这份测试文档的编写工作，用来验证 PdfBox-Android 库对中文字体的解析能力是否可靠。",
     )
 
     private fun extractFixtureParagraphs(): List<String> {
@@ -66,12 +72,13 @@ class PdfTextExtractorTest {
         val paragraphs = extractFixtureParagraphs()
         val fullText = paragraphs.joinToString("")
 
-        // 挑几个跨越标点、数字、常见汉字的片段做包含性断言。
+        // 挑几个跨越标点、数字、常见汉字的片段做包含性断言（间距按 normalizeCjkSpacing
+        // 规则更新过，见 knownParagraphs 上方注释）。
         assertTrue(fullText.contains("本文档用于测试中文文字提取功能"))
         assertTrue(fullText.contains("标点符号（例如逗号、句号、问号？还有感叹号！）"))
-        assertTrue(fullText.contains("阿拉伯数字12345和百分号100%"))
-        assertTrue(fullText.contains("2026年8月17日"))
-        assertTrue(fullText.contains("PdfBox-Android库对中文字体的解析能力是否可靠"))
+        assertTrue(fullText.contains("阿拉伯数字 12345 和百分号 100%"))
+        assertTrue(fullText.contains("2026 年 8 月 17 日"))
+        assertTrue(fullText.contains("PdfBox-Android 库对中文字体的解析能力是否可靠"))
     }
 
     @Test

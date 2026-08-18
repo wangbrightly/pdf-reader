@@ -29,7 +29,9 @@ import java.text.Normalizer
  *
  * 合并行内文字时，中日韩字符之间不加空格（本来就没有词间空格），其余情况插入一个
  * 空格，避免英文断行处的单词被硬连在一起——这条判断规则和 [app.pdfreader.reflow] 里
- * 的 CJK 断行逻辑保持同一套认知模型。
+ * 的 CJK 断行逻辑保持同一套认知模型。段落文字最终成型后还会跑一遍 [normalizeCjkSpacing]
+ * 统一规范化间距（去掉中文字符间的多余空格、给中文和数字/字母之间补上恰好一个空格），
+ * 见该函数 KDoc"用户真机实测反馈"一节。
  *
  * ## 已知问题：部首变体字符替换（2026-08-18 用真实中文 PDF 实测发现）
  *
@@ -250,7 +252,7 @@ object PdfTextExtractor {
                 appendLine(texts.last(), lines[i].text)
             }
         }
-        return texts.indices.map { Paragraph(texts[it].toString(), pages[it]) }
+        return texts.indices.map { Paragraph(normalizeCjkSpacing(texts[it].toString()), pages[it]) }
     }
 
     /**
