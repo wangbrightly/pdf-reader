@@ -5,6 +5,7 @@ import android.graphics.Matrix
 import android.net.Uri
 import android.os.Bundle
 import android.util.TypedValue
+import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.widget.Button
@@ -542,19 +543,32 @@ class MainActivity : AppCompatActivity() {
         }
 
     /**
-     * 创建一个铺满可用宽度、支持双指缩放的图片 ImageView。初始按"撑满可用宽度、
-     * 高度按比例自适应"显示（等价于 `adjustViewBounds` + `FIT_CENTER` 的视觉效果），
-     * 但用 `ScaleType.MATRIX` 手动摆放，配合 [enablePinchZoom] 做双指缩放——用
-     * MATRIX 而不是直接改 View 本身的 `scaleX`/`scaleY`，是因为 MATRIX 缩放只在
+     * 创建一个铺满可用宽度、支持双指缩放 + 缩放后拖动平移的图片 ImageView。初始按
+     * "撑满可用宽度、高度按比例自适应"显示（等价于 `adjustViewBounds` + `FIT_CENTER`
+     * 的视觉效果），但用 `ScaleType.MATRIX` 手动摆放，配合 [enablePinchZoom] 做手势——
+     * 用 MATRIX 而不是直接改 View 本身的 `scaleX`/`scaleY`，是因为 MATRIX 缩放只在
      * ImageView 自己固定的矩形范围内放大图片内容（超出部分裁掉，效果类似放大镜看
      * 图片的一角），不会让放大后的内容视觉上盖住上下相邻的文字段落；改 View 的
      * `scaleX`/`scaleY` 则会让整个 View 连同它的边界一起变大，在纵向滚动的
-     * LinearLayout 里会盖住邻居，观感更差。这是"够用即可、不做完整图片查看器"这个
-     * 范围下的简单实现，不支持双指缩放之外的拖拽平移。
+     * LinearLayout 里会盖住邻居，观感更差。
      */
     private fun createImageView(bitmap: Bitmap): ImageView {
-        val paddingPx = dpToPx(currentSettings.paddingDp)
-        val usableWidthPx = (resources.displayMetrics.widthPixels - 2 * paddingPx).coerceAtLeast(1)
+        // 踩过的坑（2026-08-18 真机反馈"图片右侧显示不全"）：这里原来用
+        // `屏幕宽度 - 2×contentContainer 自己的 padding` 算可用宽度，漏算了外层
+        // rootLayout 自己还有一圈 16dp 的水平 padding（见 activity_main.xml）——
+        // 算出来的可用宽度比 ImageView 实际能拿到的真实宽度宽了那一截，图片被按偏大
+        // 的宽度整体放大，超出 ImageView 真实边界的部分（右侧）就被裁掉了。改成直接
+        // 读 contentContainer 自己量出来的真实宽度（它是 ImageView 的直接父容器，
+        // ImageView 是 MATCH_PARENT，contentContainer 的"宽度减自己的 padding"就是
+        // ImageView 真实能用的宽度，不需要再手动拼凑各层 padding）；contentContainer
+        // 还没走过布局（宽度是 0）这种极端情况才退回旧的估算公式兜底。
+        val measuredWidthPx = contentContainer.width - contentContainer.paddingLeft - contentContainer.paddingRight
+        val usableWidthPx = if (measuredWidthPx > 0) {
+            measuredWidthPx
+        } else {
+            val paddingPx = dpToPx(currentSettings.paddingDp)
+            resources.displayMetrics.widthPixels - 2 * paddingPx
+        }.coerceAtLeast(1)
         val fitScale = if (bitmap.width > 0) usableWidthPx.toFloat() / bitmap.width else 1f
         val displayHeightPx = (bitmap.height * fitScale).toInt().coerceAtLeast(1)
 
@@ -563,39 +577,85 @@ class MainActivity : AppCompatActivity() {
             setImageBitmap(bitmap)
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, displayHeightPx)
             imageMatrix = Matrix().apply { postScale(fitScale, fitScale) }
-            enablePinchZoom(fitScale)
+            enablePinchZoom(fitScale, bitmap.width, bitmap.height)
         }
     }
 
     /**
      * 给一个已经用 `ScaleType.MATRIX` + [baseScale]（撑满宽度的初始缩放）摆好初始
-     * 状态的 ImageView 接上双指缩放手势。缩放倍数（相对 [baseScale] 的额外倍数）
-     * 限制在 1x-[MAX_ZOOM_MULTIPLIER] 之间，避免越缩越小看不清或越缩越大失真。
+     * 状态的 ImageView 接上"双指缩放 + 缩放后单指拖动平移"手势。缩放倍数（相对
+     * [baseScale] 的额外倍数）限制在 1x-[MAX_ZOOM_MULTIPLIER] 之间，避免越缩越小
+     * 看不清或越缩越大失真。
      *
-     * 只有出现第二根手指（真正在做捏合手势）时才消费触摸事件——单指触摸原样放行
-     * （返回 false），让事件继续往上传给 [contentScrollView] 处理正常的上下滚动；
-     * 不这样区分的话，手指落在图片上就没法上下滑动看后面的内容了。
+     * 2026-08-18 真机反馈"图片和表格缩放有问题"——排查是放大之后卡住了，图片超出
+     * 屏幕的部分完全看不到也挪不动，只能缩回去重来，等于"能放大、不能看"。原来的
+     * 实现只处理了双指捏合，没有处理放大后的单指拖动。现在分两种状态：
+     * - **没放大（倍数=1）**：单指触摸原样放行（返回 false），事件继续往上传给
+     *   [contentScrollView] 处理正常的上下滚动——这条沿用了原来的设计，不这样区分的话
+     *   手指落在图片上就没法上下滑动看后面的内容了。
+     * - **已放大（倍数>1）**：单指拖动改成平移图片内容（[Matrix.postTranslate]），不再
+     *   放行给 ScrollView——这才是"缩放之后还能看到图片其他部分"的关键。平移范围用
+     *   [clampTranslation] 限制，不让图片边缘被拖到 ImageView 可视区域内侧、露出图片
+     *   外的空白。缩小回 1x 后自动恢复成"单指滚动整页"的行为，不需要额外的按钮或手势
+     *   去"退出缩放模式"。
      */
-    private fun ImageView.enablePinchZoom(baseScale: Float) {
-        val matrix = Matrix().apply { postScale(baseScale, baseScale) }
+    private fun ImageView.enablePinchZoom(baseScale: Float, bitmapWidth: Int, bitmapHeight: Int) {
         var zoomMultiplier = 1f
-        val detector = ScaleGestureDetector(
+        var translateX = 0f
+        var translateY = 0f
+        var lastTouchX = 0f
+        var lastTouchY = 0f
+
+        fun clampTranslation() {
+            val scale = baseScale * zoomMultiplier
+            val maxTranslateX = ((bitmapWidth * scale - width) / 2f).coerceAtLeast(0f)
+            val maxTranslateY = ((bitmapHeight * scale - height) / 2f).coerceAtLeast(0f)
+            translateX = translateX.coerceIn(-maxTranslateX, maxTranslateX)
+            translateY = translateY.coerceIn(-maxTranslateY, maxTranslateY)
+        }
+
+        fun applyMatrix() {
+            val scale = baseScale * zoomMultiplier
+            imageMatrix = Matrix().apply {
+                postScale(scale, scale)
+                postTranslate(translateX, translateY)
+            }
+        }
+
+        val scaleDetector = ScaleGestureDetector(
             context,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
-                    val nextMultiplier = (zoomMultiplier * detector.scaleFactor)
-                        .coerceIn(1f, MAX_ZOOM_MULTIPLIER)
-                    val appliedFactor = nextMultiplier / zoomMultiplier
-                    zoomMultiplier = nextMultiplier
-                    matrix.postScale(appliedFactor, appliedFactor, detector.focusX, detector.focusY)
-                    imageMatrix = matrix
+                    zoomMultiplier = (zoomMultiplier * detector.scaleFactor).coerceIn(1f, MAX_ZOOM_MULTIPLIER)
+                    clampTranslation()
+                    applyMatrix()
                     return true
                 }
             },
         )
+
         setOnTouchListener { _, event ->
-            detector.onTouchEvent(event)
-            event.pointerCount > 1 || detector.isInProgress
+            scaleDetector.onTouchEvent(event)
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastTouchX = event.x
+                    lastTouchY = event.y
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    // 已放大、单指、且不是正在捏合的那一下（捏合本身也会报 MOVE，
+                    // 交给 scaleDetector 处理，这里不重复平移）才走拖动平移。
+                    if (zoomMultiplier > 1f && event.pointerCount == 1 && !scaleDetector.isInProgress) {
+                        translateX += event.x - lastTouchX
+                        translateY += event.y - lastTouchY
+                        clampTranslation()
+                        applyMatrix()
+                        lastTouchX = event.x
+                        lastTouchY = event.y
+                    }
+                }
+                else -> Unit
+            }
+            zoomMultiplier > 1f || event.pointerCount > 1 || scaleDetector.isInProgress
         }
     }
 
