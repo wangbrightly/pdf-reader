@@ -162,25 +162,36 @@ object PdfTextExtractor {
     fun extractContent(context: Context, file: File): PdfContent {
         PDFBoxResourceLoader.init(context.applicationContext ?: context)
         PDDocument.load(file).use { document ->
+            val t0 = System.currentTimeMillis()
             // 先渲染疑似表格页（成功的才计入"跳过文字抽取"名单，见类注释"表格检测"
             // 一节——渲染失败时宁可让这页退回正常文字抽取，也不让内容整页消失）。
             val candidatePages = detectTablePages(document)
+            val t1 = System.currentTimeMillis()
             val tablePageImages = renderTablePageImages(document, candidatePages)
             val renderedTablePages = tablePageImages.keys
+            val t2 = System.currentTimeMillis()
 
             val stripper = LineCollectingStripper()
             stripper.getText(document)
+            val t3 = System.currentTimeMillis()
             val nonTableLines = stripper.lines.filterNot { it.page in renderedTablePages }
             val paragraphs = linesToParagraphs(nonTableLines)
             val paragraphPages = paragraphs.map { it.page }
 
             val inlineImages = extractImages(document, paragraphs, excludePages = renderedTablePages)
+            val t4 = System.currentTimeMillis()
             val tableImages = renderedTablePages.map { pageNo ->
                 ExtractedImage(
                     bitmap = tablePageImages.getValue(pageNo),
                     afterParagraphIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo),
                 )
             }
+            android.util.Log.d(
+                "PdfReaderDebug",
+                "页数=${document.numberOfPages} 疑似表格页=${candidatePages.size} " +
+                    "检测表格=${t1 - t0}ms 渲染表格页=${t2 - t1}ms 抽取文字=${t3 - t2}ms " +
+                    "抽取内嵌图片=${t4 - t3}ms 总计=${t4 - t0}ms",
+            )
             return PdfContent(paragraphs.map { it.text }, inlineImages + tableImages)
         }
     }
