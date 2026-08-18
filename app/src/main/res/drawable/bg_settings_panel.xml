@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    设置滑杆分组的背景：半透明灰 + 圆角，在浅色/深色两种主题下都能读出"这是一个独立
+    分组"的效果，不用另外区分 values-night（用带透明度的中性灰，不是纯色，深色模式下
+    也不会显得突兀）。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#1F888888" />
+    <corners android:radius="12dp" />
+</shape>

@@ -19,6 +19,8 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import app.pdfreader.extract.ExtractedImage
 import app.pdfreader.extract.PdfContent
 import app.pdfreader.extract.PdfTextExtractor
@@ -155,6 +157,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        applyStatusBarInsetAsPadding()
 
         openButton = findViewById(R.id.openButton)
         progressBar = findViewById(R.id.progressBar)
@@ -255,6 +258,35 @@ class MainActivity : AppCompatActivity() {
             appendImagesAfter(index)
         }
         return blocks
+    }
+
+    /**
+     * 让根布局的顶部内边距动态加上状态栏高度，避免第一个控件（打开 PDF 按钮）被状态栏
+     * 文字/图标盖住。
+     *
+     * 2026-08-18 真机截图验证过：XML 里写 `android:fitsSystemWindows="true"` 在这台设备
+     * 上不生效——现代安卓（尤其 edge-to-edge 强制生效的版本）默认让内容延伸到系统栏后面，
+     * `fitsSystemWindows` 这个老属性覆盖不了这种情况，必须主动监听 [WindowInsetsCompat]
+     * 读出状态栏高度、手动加进 padding。只处理顶部（状态栏）：底部导航栏这台设备是手势
+     * 导航条，不挡到 `contentScrollView`，暂不处理，以后如果发现虚拟按键导航条挡住底部
+     * 内容，再照同样的思路把 `insets.bottom` 也加进 `paddingBottom`。
+     */
+    private fun applyStatusBarInsetAsPadding() {
+        val root = findViewById<View>(R.id.rootLayout)
+        val basePaddingLeft = root.paddingLeft
+        val basePaddingTop = root.paddingTop
+        val basePaddingRight = root.paddingRight
+        val basePaddingBottom = root.paddingBottom
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, windowInsets ->
+            val statusBarInset = windowInsets.getInsets(WindowInsetsCompat.Type.statusBars())
+            view.setPadding(
+                basePaddingLeft,
+                basePaddingTop + statusBarInset.top,
+                basePaddingRight,
+                basePaddingBottom,
+            )
+            windowInsets
+        }
     }
 
     /** SAF 返回的 content:// Uri 不一定能直接当 File 打开，先拷贝到本 App 的缓存目录。 */
