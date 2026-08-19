@@ -390,7 +390,7 @@ object PdfTextExtractor {
             // 表格检测（矢量线段）和图片抽取（Bitmap）合并成一次遍历，见类注释
             // "表格检测/图片抽取合并成一次遍历"一节——这一步是原来"检测表格"+"抽取
             // 内嵌图片"两步耗时的大头，合并后省掉重复解析 content stream 的开销。
-            val pageScans = scanPages(document)
+            val pageScans = scanPages(document, decodeImages = true)
             val t1 = System.currentTimeMillis()
             // 见类注释"表格区域裁剪"一节：不再是"这一页像不像表格"的布尔值，而是
             // "表格在这一页的大致包围盒"——只裁剪渲染表格本身，不连累同页正文。
@@ -552,29 +552,32 @@ object PdfTextExtractor {
     }.getOrNull()
 
     /** 一页 content stream 里同时收集出来的矢量线段（表格检测用）和图片（图片抽取用）。 */
-    private data class PageScan(val segments: List<LineSegment>, val images: List<Bitmap>)
+    /**
+     * [hasImages] 是"这一页有没有 `Do` 图片操作符"，不管 [decodeImages] 开没开都会
+     * 记录（很便宜，只是个布尔标记）；[images] 只在 `decodeImages=true` 时才会真的
+     * 有内容——见 [PageContentStreamEngine] KDoc。
+     */
+    private data class PageScan(val segments: List<LineSegment>, val images: List<Bitmap>, val hasImages: Boolean)
 
     /**
      * 对文档每一页跑一遍 [PageContentStreamEngine]，一次遍历同时拿到表格检测用的矢量
-     * 线段和图片抽取用的 [Bitmap] 列表——见类注释"表格检测/图片抽取合并成一次遍历"
-     * 一节（2026-08-19 性能优化）。单页扫描出异常（content stream 解析问题等）只让
-     * 那一页退化成"没有线段、没有图片"（不判定为表格、也不产出内嵌图片），不让整份
-     * 文档的抽取失败——延续原来两个引擎各自的降级精神，合并成一次遍历后用同一个
-     * `runCatching` 覆盖两种情形。
+     * 线段和（[decodeImages] 为真时）图片抽取用的 [Bitmap] 列表——见类注释"表格检测/
+     * 图片抽取合并成一次遍历"一节（2026-08-19 性能优化）。单页扫描出异常（content
+     * stream 解析问题等）只让那一页退化成"没有线段、没有图片"（不判定为表格、也不
+     * 产出内嵌图片），不让整份文档的抽取失败——延续原来两个引擎各自的降级精神，
+     * 合并成一次遍历后用同一个 `runCatching` 覆盖两种情形。
      */
-    private fun scanPages(document: PDDocument): Map<Int, PageScan> {
+    private fun scanPages(document: PDDocument, decodeImages: Boolean): Map<Int, PageScan> {
         val result = LinkedHashMap<Int, PageScan>(document.numberOfPages)
         for (pageIndex in 0 until document.numberOfPages) {
             val page = document.getPage(pageIndex)
             val scan = runCatching {
-                val engine = PageContentStreamEngine(page)
+                val engine = PageContentStreamEngine(page, decodeImages)
                 engine.processPage(page)
-                PageScan(engine.segments, engine.images)
+                PageScan(engine.segments, engine.images, engine.hasImages)
             }.onFailure {
-                // 临时诊断：确认合并成一次遍历之后，是不是有页面在扫描阶段整页失败
-                // （失败会导致这一页的表格线段和图片全部丢失，不是"没有内容"）。
                 android.util.Log.d("PdfReaderDebug", "scanPages 第${pageIndex + 1}页失败：$it")
-            }.getOrDefault(PageScan(emptyList(), emptyList()))
+            }.getOrDefault(PageScan(emptyList(), emptyList(), false))
             result[pageIndex + 1] = scan
         }
         return result
@@ -933,10 +936,20 @@ object PdfTextExtractor {
      *
      * 单张图片转换失败（`getImage()` 抛异常）只跳过那一张，不中断整页处理——延续
      * [buildInlineImages] 一贯的降级精神。
+     *
+     * [decodeImages] 是 2026-08-19"按需加载"增量补的开关：[Session] 的即时可用阶段
+     * （见 [Session] KDoc）只需要知道"这一页有没有图片"（用于占位），不需要真的解码
+     * 出 [Bitmap]——`pdImage.image`/[decodeJpegWithNativeSubsampling] 这一步本身就是
+     * 图片解码里最耗时的部分，`decodeImages=false` 时直接跳过，只记一下
+     * [hasImages]，图片矢量线段（表格检测用）不受影响，两者是内容流里两种不同的
+     * 操作符，互不干扰。
      */
-    private class PageContentStreamEngine(page: PDPage) : PDFGraphicsStreamEngine(page) {
+    private class PageContentStreamEngine(page: PDPage, private val decodeImages: Boolean) :
+        PDFGraphicsStreamEngine(page) {
         val segments = mutableListOf<LineSegment>()
         val images = mutableListOf<Bitmap>()
+        var hasImages = false
+            private set
         private val pendingSegments = mutableListOf<LineSegment>()
         private var currentX = 0f
         private var currentY = 0f
@@ -1005,6 +1018,8 @@ object PdfTextExtractor {
         override fun getCurrentPoint(): PointF = PointF(currentX, currentY)
 
         override fun drawImage(pdImage: PDImage) {
+            hasImages = true
+            if (!decodeImages) return
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
             // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
             // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。
