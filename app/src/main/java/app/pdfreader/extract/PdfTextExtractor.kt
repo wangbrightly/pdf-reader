@@ -574,7 +574,7 @@ object PdfTextExtractor {
             val scan = runCatching {
                 val engine = PageContentStreamEngine(page, decodeImages)
                 engine.processPage(page)
-                PageScan(engine.segments, engine.images, engine.hasImages)
+                PageScan(engine.segments, ImageStripStitcher.stitchIfTiled(engine.images), engine.hasImages)
             }.onFailure {
                 android.util.Log.d("PdfReaderDebug", "scanPages 第${pageIndex + 1}页失败：$it")
             }.getOrDefault(PageScan(emptyList(), emptyList(), false))
@@ -1194,7 +1194,7 @@ object PdfTextExtractor {
             return runCatching {
                 val engine = PageContentStreamEngine(page, decodeImages = true)
                 engine.processPage(page)
-                engine.images
+                ImageStripStitcher.stitchIfTiled(engine.images)
             }.getOrDefault(emptyList())
         }
 
