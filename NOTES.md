@@ -128,7 +128,7 @@ Robolectric 的 `nativeruntime-dist-compat` 依赖包约 159MB，走代理连 Ma
 **往后再改这类朝向/坐标问题，别再纯靠纸面推导，也别造一个"独立模型"就假设它真的独立
 ——用第三方成熟工具（不同代码库、不同作者）产出的结果当地面真相，才是真的独立验证。**
 
-## 12. 待办：配置变化（转屏等）会导致 Activity 重建，当前打开的文档整个丢失
+## 12. 已修：配置变化（转屏等）会导致 Activity 重建，当前打开的文档整个丢失
 
 **现象**（code-review 2026-08-19 发现，不是真机反馈）：`MainActivity` 没有
 `android:configChanges`，也没有 `onSaveInstanceState`/`ViewModel` 之类的状态保存
@@ -136,14 +136,53 @@ Robolectric 的 `nativeruntime-dist-compat` 依赖包约 159MB，走代理连 Ma
 被完整销毁重建，`currentContent`（已经抽取好的文字/图片/大纲）、当前滚动位置、
 当前打开的文件全部丢失，回到"还没打开任何文档"的初始画面。
 
-**没有直接证据这台测试机上真的触发过**（这台设备大概率锁定竖屏阅读，转屏路径可能
-根本走不到），是 code-review 通读代码时发现的结构性缺口，先记录、不是本次会话
-处理的问题范围。
+**修法**（commit `6026899`）：`onSaveInstanceState` 里只存一个 `currentUri`
+（`Uri` 是 `Parcelable`，体积小，不受 `Bundle` 大小限制），`onCreate` 检测到
+`savedInstanceState` 非空时用这个 `Uri` 重新走一遍 `loadPdf()`——相当于自动帮
+用户重新打开刚才那份文件，会比真正的状态保留慢（要重新抽取），但实现简单；滚动
+位置不用额外处理，`onPause` 在销毁前已经存过一次阅读进度，重新 `loadPdf` 走的是
+和"手动重新打开"完全相同的路径，自动读回那次存的位置。
 
-**以后要修的话**：思路是给 `currentDocumentUri`（或者已抽取的 `PdfContent` +
-阅读进度）加一层保存/恢复——最简单的做法是 `onSaveInstanceState` 里存文件 Uri，
-`onCreate` 检测到 `savedInstanceState` 非空时用同一个 Uri 重新走一遍
-`loadPdf()`（相当于"重新打开"，不需要真的序列化整份 `PdfContent`，重新抽取一遍
-即可，配合已有的阅读进度记忆机制自动滚回原位置）；更完整的做法是用 ViewModel
-持有 `currentContent`，配置变化时直接复用不用重新抽取，但复杂度更高，没有明确
-证据表明当前场景需要这个量级的方案。
+**真机验证**：adb 关闭自动旋转、强制转横屏，截图确认文档没有消失、还停留在转屏前
+的大致位置；logcat 确认 `extractContent` 确实被重新调用了一次（不是系统侥幸保留
+了视图状态），转回竖屏正常。这处改动涉及 Activity 生命周期，Robolectric 测不了，
+用这种方式验证，没有另外写自动化测试。
+
+## 13. 已修（部分）：大图加载慢——反编译 PdfBox-Android 找到根因，JPEG 走安卓原生解码
+
+**现象**：一份 258 页、图片较多的文档打开要 25 秒，真机日志确认几乎全部耗时在图片
+解码——`PDImage.getImage()` 默认按源图片原始分辨率整张解码，源图片是几千像素见方
+的扫描页/照片时，解码成本跟屏幕实际显示尺寸完全不成比例。
+
+**前两次尝试都失败了**（教训见下）：
+1. 用 `PDImage.getImage(Rect, Int)` 降采样重载：真机实测 `subsampling>1` 时稳定
+   抛 `y + height must be <= bitmap.height()`，全部图片解码失败、静默丢图，日志
+   显示的"快了 16 倍"其实是图片全没了。
+2. 解码完整图后 `Bitmap.createScaledBitmap` 事后缩小：图片都在了，但真机实测总
+   耗时反而变成 36.3 秒，比原来还慢——真正的开销大头（全分辨率解码本身）没有省
+   掉，事后缩小是纯粹叠加的额外成本。
+
+**根因**（反编译 PdfBox-Android 2.0.27.0 字节码找到的，不是猜的）：
+`getImage()`/`getImage(Rect,Int)` 最终都调用同一个内部方法
+`SampledImageReader.getRGBImage(...)`，只是传的 `subsampling` 参数不同——尝试 1
+踩到的异常是这个内部方法本身处理 `subsampling>1` 的 bug，不管怎么调用外层 API 都
+绕不开。
+
+**第三次尝试成功**：完全绕开 PdfBox-Android 的图片解码，只对 JPEG（`getSuffix()
+=="jpg"`，反编译确认内容流最后一层过滤器是 `DCTDecode` 时才返回这个值）生效——用
+`PDImage.createInputStream(listOf("DCTDecode","DCT"))` 拿到停在 DCT 解码之前的
+原始 JPEG 字节（反编译确认这个重载的语义就是"遇到列表里的过滤器名字就停手"），交给
+安卓自带的 `BitmapFactory.decodeByteArray` + `Options.inSampleSize` 解码——平台
+自带、久经考验，跟 `SampledImageReader` 不共享任何代码，不会被同一个 bug 影响。
+任何一步失败都回退到 `pdImage.image`，不会丢图。
+
+**真机验证**（同一份 258 页文档）：25.4s → 16.2s（提速约 36%），0 张图片解码失败，
+截图确认多张扫描地图/人物照片正常清晰显示。
+
+**"部分"修好的意思**：只覆盖 JPEG 编码的图片，PNG/TIFF/JBIG2 等其它格式仍然走原来
+较慢但可靠的 `pdImage.image` 路径——JPEG 是真实场景里最常见的大图来源（扫描页/
+照片），但不是唯一来源，遇到非 JPEG 大图较多的文档，这次的提速覆盖不到。
+
+**这次投入的调查方法值得记录**：前两次都是"看起来解决了"就装机验证，第三次先反编译
+库的字节码找到真正的根因和正确的 API 用法，再动手实现——同一个问题反复失败之后，
+停下来往底层查一层，往往比继续在上层试各种参数组合更快找到真正能用的方案。
