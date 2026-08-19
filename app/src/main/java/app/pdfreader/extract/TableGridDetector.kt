@@ -79,7 +79,7 @@ data class TableRegion(val minX: Float, val minY: Float, val maxX: Float, val ma
  * 区域"——多表格分离聚类是明显更复杂的算法，真实文档一页出现多个分离表格本身
  * 也比较少见，这次不做，跟本类一贯的"保守但简单"原则一致。
  *
- * ## 行列间距均匀性检查（2026-08-19 真机连续两次实测发现的新误判修复）
+ * ## 行列间距均匀性检查（2026-08-19 加上，同一天真机又测出会漏检真表格，撤回了）
  *
  * 表格区域裁剪上线后真机连续测出两份文档的新误判，都不是"空间不重叠"这种情况
  * （横竖线确实落在同一块区域），而是页面自带的装饰元素（页边距装饰边框、章节
@@ -88,21 +88,26 @@ data class TableRegion(val minX: Float, val minY: Float, val maxX: Float, val ma
  * （贡献 2 条相距极远的横线），中间又零散地混进几条不相关的分隔线，横线数够了，
  * 竖线同理，包围盒因此摊开到几乎整个页面，把标题和好几段正文都裁进了"表格"图片。
  *
- * 关键区别：**真表格的行列间距大致均匀（行高/列宽即使不完全相等，也不会相差
- * 悬殊），装饰元素+零散分隔线的间距通常很不均匀**——一两条挨得很远的边框线之间
- * 夹着一大段空白，中间又有几条挤在一起的无关线段。[hasUniformSpacing] 把横线
- * （竖线同理）按聚类中心排序算出相邻间距，要求"最大间距不超过间距中位数的
- * [MAX_GAP_TO_MEDIAN_RATIO] 倍"——真表格哪怕表头行比数据行高出不少，这个比例
- * 通常也在 2 倍以内；装饰边框+零散线段这种"一头一尾+中间几条挤在一起"的分布，
- * 最大间距往往是中位数的好几倍，能被这条规则挡住。
+ * 当时的修法：加一条"行列间距要大致均匀"的规则（要求最大间距不超过间距中位数的
+ * 2 倍），思路是"真表格的行高/列宽不会相差悬殊，装饰元素+零散分隔线的间距通常
+ * 很不均匀"。真机验证过这条规则确实挡住了那两次误判。
  *
- * 用中位数而不是平均数：平均数会被那一两个超大间距本身拉高，中位数更能代表"正常
- * 间距应该是多少"，不会被要检测的那个异常值污染。
+ * **同一天晚些时候真机又测出反例，这条规则本身撤回了**：一份技术规格数据表
+ * （频响特性表，行业内常见排版）真机测出线段分布是"两条不相关的线挤在一起（比如
+ * 标题下的分隔线）+ 后面一段真正均匀的表格行"，整页的间距被这两条不相关的线拉得
+ * 不均匀，规则把真表格也一起挡掉了，表格因此被错误地当成普通文字来排版。
  *
- * **代价**：column 宽度极其悬殊的表格（比如一栏是窄的序号列、紧挨着一栏是很宽的
- * 说明文字列）可能被误判成"不够均匀"而漏检，退化成按文字重排——跟本类一贯的
- * "宁可漏检、不可错杀"原则一致，用户明确要求"要误判都误判成文字，结果要一致"，
- * 这次收紧就是照这个方向走的。
+ * 尝试过"先按位置分组、只检查最密集那一组的均匀性"这个修法，但验证时发现：这个
+ * 修法在数学上没法把"真表格 + 一条不相关的线"和"纯装饰线凑巧挤在一起"这两种情况
+ * 分开——本类已有的一条测试用例（"页边距装饰边框+零散分隔线"）构造出的坐标分布，
+ * 和真机这次遇到的真表格坐标分布，形状是一样的（一小撮紧挨着的线 + 一条离得很远
+ * 的线），单看线段位置的数字分不出哪个是真表格、哪个是装饰线，要分清楚必须引入
+ * 新的信息（比如线段长度、离页面边缘的距离），工作量和不确定性都明显更大。
+ *
+ * 权衡下来，用户选择撤回这条规则，接受"装饰线+零散分隔线可能被重新误判成表格"
+ * 这个风险，换回"更多真表格能被正确识别"——两个方向的误判都会发生，选哪个方向
+ * 犯错是产品判断，不是纯技术判断，这次的选择记在这里供以后参考，不代表以后遇到
+ * 同类问题都该照这个方向选。
  */
 object TableGridDetector {
     /** 判定"这条线段是水平/竖直"的容差：允许因为矩形厚度导致的 1pt 左右偏差。 */
@@ -117,9 +122,6 @@ object TableGridDetector {
     /** 至少要有这么多条互相独立的横线 + 竖线，才判定为"网格"而不是"边框"。 */
     private const val MIN_GRID_LINES = 3
 
-    /** 见类注释"行列间距均匀性检查"一节。 */
-    private const val MAX_GAP_TO_MEDIAN_RATIO = 2f
-
     fun looksLikeTable(segments: List<LineSegment>): Boolean = tableRegionOrNull(segments) != null
 
     /**
@@ -133,7 +135,6 @@ object TableGridDetector {
         val verticalXs = verticals.map { (it.x1 + it.x2) / 2f }
         if (clusterCount(horizontalYs) < MIN_GRID_LINES) return null
         if (clusterCount(verticalXs) < MIN_GRID_LINES) return null
-        if (!hasUniformSpacing(horizontalYs) || !hasUniformSpacing(verticalXs)) return null
 
         val hMinX = horizontals.minOf { minOf(it.x1, it.x2) }
         val hMaxX = horizontals.maxOf { maxOf(it.x1, it.x2) }
@@ -167,11 +168,7 @@ object TableGridDetector {
     /** 单链聚类（single-linkage）：排序后相邻值差距超过容差才算新的一簇。 */
     private fun clusterCount(values: List<Float>): Int = clusters(values).size
 
-    /**
-     * 单链聚类，返回每一簇的代表值（簇内取平均）——[clusterCount] 只要簇的数量，
-     * [hasUniformSpacing] 还需要簇的具体位置来算间距，两者共用这个实现，不重复
-     * 写一遍聚类逻辑。
-     */
+    /** 单链聚类，返回每一簇的代表值（簇内取平均）——[clusterCount] 只需要簇的数量。 */
     private fun clusters(values: List<Float>): List<Float> {
         if (values.isEmpty()) return emptyList()
         val sorted = values.sorted()
@@ -184,20 +181,5 @@ object TableGridDetector {
             }
         }
         return groups.map { it.average().toFloat() }
-    }
-
-    /** 见类注释"行列间距均匀性检查"一节。 */
-    private fun hasUniformSpacing(values: List<Float>): Boolean {
-        val centers = clusters(values)
-        if (centers.size < 2) return false
-        val gaps = (1 until centers.size).map { centers[it] - centers[it - 1] }
-        val sortedGaps = gaps.sorted()
-        val median = if (sortedGaps.size % 2 == 0) {
-            (sortedGaps[sortedGaps.size / 2 - 1] + sortedGaps[sortedGaps.size / 2]) / 2f
-        } else {
-            sortedGaps[sortedGaps.size / 2]
-        }
-        if (median <= 0f) return false
-        return gaps.max() <= median * MAX_GAP_TO_MEDIAN_RATIO
     }
 }

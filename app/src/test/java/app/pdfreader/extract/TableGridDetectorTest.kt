@@ -132,26 +132,26 @@ class TableGridDetectorTest {
         assertTrue(TableGridDetector.looksLikeTable(segments))
     }
 
-    // ---- 行列间距均匀性检查：2026-08-19 真机连续两次实测发现的误判修复，
-    // 见类 KDoc"行列间距均匀性检查"一节 ----
+    // ---- 行列间距均匀性检查：2026-08-19 加上、同一天又撤回，见类 KDoc 对应小节 ----
 
     @Test
-    fun `页边距装饰边框+零散分隔线（横竖线数够但间距悬殊）不判定为表格`() {
-        // 模拟真机实测到的真实模式：3 条线挤在页面顶部附近（装饰边框+一两条零散
-        // 分隔线），第 4 条远在页面底部（装饰边框的另一边），横竖线数都够
-        // MIN_GRID_LINES，也互相重叠，但间距极不均匀——不该被判定为表格。
+    fun `页边距装饰边框+零散分隔线（横竖线数够、间距悬殊）现在会被判定为表格——已知的、用户接受的回归`() {
+        // 这条测试曾经断言 assertFalse（"行列间距均匀性检查"上线时新增），现在
+        // 反过来断言 assertTrue——不是这条测试本身错了，是它验证的那条规则被撤回
+        // 了：真机测出这条规则会连带挡掉真表格（同一种线段分布，真表格和装饰线在
+        // 数字上长得一样，分不清），用户明确选择接受"装饰线可能被误判成表格"这个
+        // 回归，换回"更多真表格能被正确识别"，见 TableGridDetector 类 KDoc。
         val segments = mutableListOf<LineSegment>()
         for (y in listOf(40f, 45f, 50f, 700f)) segments.add(LineSegment(0f, y, 550f, y))
         for (x in listOf(100f, 105f, 110f, 500f)) segments.add(LineSegment(x, 0f, x, 750f))
 
-        assertFalse(TableGridDetector.looksLikeTable(segments))
-        assertEquals(null, TableGridDetector.tableRegionOrNull(segments))
+        assertTrue(TableGridDetector.looksLikeTable(segments))
     }
 
     @Test
-    fun `表头行比数据行略高的正常表格（间距不完全相等但比例温和）仍判定为表格`() {
-        // 表头行 50pt 高，数据行 30pt 高——间距不均匀但幅度温和（真实表格常见），
-        // 不该被"行列间距均匀性检查"误伤。
+    fun `表头行比数据行略高的正常表格（间距不完全相等）判定为表格`() {
+        // 表头行 50pt 高，数据行 30pt 高——间距不完全相等，真实表格常见，
+        // 网格线数量够、空间重叠，判定为表格。
         val horizontalYs = listOf(0f, 50f, 80f, 110f, 140f) // 相邻间距 50,30,30,30。
         val verticalXs = listOf(0f, 200f, 400f, 600f)
         val segments = mutableListOf<LineSegment>()
