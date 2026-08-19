@@ -21,6 +21,24 @@ class RunningFooterFilterTest {
     }
 
     @Test
+    fun `网址后面紧跟页码计数（同一段）判定为水印`() {
+        // 真机反馈：有的文档里网址行和页码计数行间距太小，被合并成了同一段，
+        // 见 RunningFooterFilter 类 KDoc"网址后面紧跟页码计数"一节。
+        val lines = listOf(
+            PageTextLine("https://baike.azpdl.net/#/entry/3f9dd707-3549-46d6-b860-dab7d3d90e9a 5/136", page = 1),
+        )
+        assertEquals(setOf(0), RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
+    fun `网址+页码计数前后还有其它文字就不判定为水印`() {
+        val lines = listOf(
+            PageTextLine("详情见 https://example.com/xxx 5/136 这一节说明", page = 1),
+        )
+        assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
     fun `网址前后有其它文字就不算纯网址行，不判定为水印`() {
         val lines = listOf(PageTextLine("详情见 https://example.com 这一节", page = 1))
         assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(lines))

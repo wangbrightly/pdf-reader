@@ -21,6 +21,12 @@ data class PageTextLine(val text: String, val page: Int)
  *   其它文字"，这种样式本身就足够罕见，不需要再叠加"要出现很多次才算"的门槛。
  * - 纯日期时间一行（[DATE_TIME_ONLY]）：同上，一整段只有"年/月/日 时:分"这几个数字
  *   和分隔符，正常正文不会长这样。
+ * - 网址后面紧跟页码计数（[URL_WITH_TRAILING_COUNTER]，2026-08-19 真机反馈补）：同一份
+ *   "网页打印成 PDF"来源的文档，不同文档/不同页footer 的行间距不一样，有的文档里网址
+ *   行和页码计数行的垂直间距小于段落切分阈值，被 [PdfTextExtractor.linesToParagraphs]
+ *   合并成了同一段（`appendLine` 在网址和数字之间插一个空格），变成
+ *   `https://example.com/xxx 5/136` 这样一整段——跟纯网址一样，一段话"只有网址+页码
+ *   计数、没有其它文字"这个样式本身也足够罕见，不需要额外门槛，无条件当水印处理。
  * - 纯"当前页/总页数"一行（[PAGE_COUNTER_ONLY]）：**这一种单独出现有真实的误判
  *   风险**——数学题、菜谱里的分数（"3/4 杯面粉"）单独成段并不罕见。所以这一种不是
  *   无条件过滤，而是加了个上下文条件：只有当**同一页**上还存在纯网址或纯日期时间
@@ -49,6 +55,7 @@ data class PageTextLine(val text: String, val page: Int)
 object RunningFooterFilter {
     private val URL_ONLY = Regex("""^https?://\S+$""")
     private val DATE_TIME_ONLY = Regex("""^\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}(:\d{2})?$""")
+    private val URL_WITH_TRAILING_COUNTER = Regex("""^https?://\S+\s+\d+/\d+$""")
     private val PAGE_COUNTER_ONLY = Regex("""^\d+/\d+$""")
 
     /** 见类注释"标题行"一节。 */
@@ -60,7 +67,7 @@ object RunningFooterFilter {
     fun noiseIndices(lines: List<PageTextLine>): Set<Int> {
         val urlOrDateIndices = lines.indices.filter { index ->
             val text = lines[index].text.trim()
-            URL_ONLY.matches(text) || DATE_TIME_ONLY.matches(text)
+            URL_ONLY.matches(text) || DATE_TIME_ONLY.matches(text) || URL_WITH_TRAILING_COUNTER.matches(text)
         }
         val pagesWithUrlOrDate = urlOrDateIndices.mapTo(mutableSetOf()) { lines[it].page }
         val counterIndices = lines.indices.filter { index ->
