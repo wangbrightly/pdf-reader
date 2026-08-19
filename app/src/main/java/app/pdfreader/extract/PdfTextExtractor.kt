@@ -2,6 +2,7 @@ package app.pdfreader.extract
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.Path
 import android.graphics.PointF
@@ -235,11 +236,10 @@ object PdfTextExtractor {
 
     /**
      * 内嵌图片长边（`max(width, height)`）超过 [MAX_IMAGE_DIMENSION_PX] 判定为"过大"，
-     * 每次减半算出理论上该降到多少——纯数学，目前没有生产代码调用它，只被单元测试
-     * 覆盖，保留是因为这条判断逻辑本身是对的、以后重新捡起"大图加载提速"这个方向时
-     * 不用重新推一遍。
+     * 每次减半算出理论上该降到多少——纯数学，见 [decodeJpegWithNativeSubsampling]
+     * KDoc"第三次尝试"一节，这次真的用上了。
      *
-     * ## 真机踩坑：两次尝试都失败了，这个方向先搁置
+     * ## 真机踩坑：前两次尝试都失败了
      *
      * 起因：用户反馈一份 258 页、0 张表格页的文档打开要 25 秒，真机日志确认几乎全部
      * 耗时都在图片解码——`PDImage.getImage()` 默认按源图片原始分辨率整张解码，源图片
@@ -256,14 +256,17 @@ object PdfTextExtractor {
      *   反而变成 36.3 秒，比原来的 25.4 秒还慢——解码本身仍然是全分辨率（真正的开销
      *   大头没有省掉），"解码后再缩小"这一步是纯粹叠加的额外成本，没有任何收益。
      *
-     * 两次都证明"事后补救"（不管是解码阶段的降采样 API 还是解码后再缩小）在这个
-     * PdfBox-Android 版本/这份文档的组合下走不通。目前 [PageContentStreamEngine
-     * .drawImage] 用回最初的 `pdImage.image`，不做任何降采样处理，保证正确性优先，
-     * 加载慢的问题维持原状。真要继续这个方向，下一步大概率要绕开 PdfBox-Android 的
-     * 图片解码封装，改成自己读 `pdImage.createInputStream()` 拿到压缩字节流后用安卓
-     * 原生 `BitmapFactory.decodeStream` + `Options.inSampleSize` 解码——这条路径对
-     * JPEG/JPX 这类压缩格式应该可靠，但对未压缩的原始像素流不适用，需要先判断图片
-     * 编码格式，复杂度明显更高，没有在这次会话里继续往下做。
+     * 两次都证明"事后补救"（不管是解码阶段的降采样 API 还是解码后再缩小）走不通，
+     * 但没有解释**为什么** `getImage(Rect, Int)` 会炸——反编译 PdfBox-Android
+     * 2.0.27.0 的 `PDImageXObject` 字节码找到了根因：`getImage()`/`getImage(Rect,Int)`
+     * 这两个公开方法最终都会调用同一个内部方法
+     * `SampledImageReader.getRGBImage(PDImage, Rect, int subsampling, COSArray)`，
+     * 唯一区别是传给它的 `subsampling` 参数值——也就是说尝试 1 踩到的那个异常，
+     * 根子是 `SampledImageReader` 这个内部类处理 `subsampling>1` 时本身有 bug，
+     * 不是"传参方式不对"，我传 `null` 还是显式 `Rect` 都会走到同一段有问题的代码，
+     * 这条路径本身在这个版本上不可靠，不值得再花时间调传参方式。
+     *
+     * 详见 [decodeJpegWithNativeSubsampling] KDoc"第三次尝试"一节。
      */
     internal fun subsamplingFactor(width: Int, height: Int): Int {
         val longSide = maxOf(width, height)
@@ -271,6 +274,50 @@ object PdfTextExtractor {
         while (longSide / factor > MAX_IMAGE_DIMENSION_PX) factor *= 2
         return factor
     }
+
+    /**
+     * ## 第三次尝试：绕开 PdfBox-Android 的图片解码封装，JPEG 图片直接用安卓原生解码器
+     *
+     * 前两次尝试都在用 PdfBox-Android 自己的解码路径（`SampledImageReader`）打转，
+     * 见 [subsamplingFactor] KDoc"真机踩坑"一节确认的根因——那条内部路径处理
+     * `subsampling>1` 本身有 bug，不管怎么调用都绕不开。这次换一条完全独立的路径：
+     *
+     * 1. `PDImage.getSuffix()`（反编译确认过：内容流的最后一层过滤器是 `DCTDecode`
+     *    时返回 `"jpg"`，是 JPEG 编码——真实 PDF 里内嵌图片，尤其是扫描页，用 JPEG
+     *    压缩非常普遍）判断是不是 JPEG；不是就直接返回 `null`，调用方回退到安全的
+     *    `pdImage.image`。
+     * 2. 是 JPEG 的话，用 `PDImage.createInputStream(listOf("DCTDecode", "DCT"))`
+     *    拿到"解码到 DCTDecode 这一步为止、不应用 DCTDecode 本身"的字节流——反编译
+     *    确认过 `PDStream.createInputStream(List<String> stopFilters)` 的语义就是
+     *    "遇到名字在这个列表里的过滤器就停手，返回目前为止解码出来的字节"，`DCTDecode`
+     *    是 JPEG 压缩这层过滤器的标准名字（`"DCT"` 是它的缩写形式，内嵌图片里两种
+     *    写法都可能出现），停在这一步意味着拿到的就是**完整、未经改动的原始 JPEG
+     *    字节**，可以直接交给安卓自己的 `BitmapFactory.decodeByteArray` 解码——这是
+     *    一条跟 `SampledImageReader` 完全独立、平台自带、久经考验的解码路径，不共享
+     *    任何代码，不会被同一个 bug 影响。
+     * 3. `BitmapFactory.Options.inSampleSize` 设成 [subsamplingFactor] 算出来的倍数
+     *    ——这一步是安卓平台自己的标准降采样机制，从图源本身按倍数跳过采样点直接
+     *    解码，是真的在解码阶段省时间/省内存，不是"解码完整图再事后缩小"（尝试 2
+     *    证明过后者没有收益）。
+     *
+     * 任何一步失败（`suffix` 不是 `"jpg"`、`createInputStream` 抛异常、
+     * `decodeByteArray` 解码不出来）都返回 `null`，调用方 [PageContentStreamEngine
+     * .drawImage] 回退到 `pdImage.image`——降级精神跟本类其它地方一致：这个优化路径
+     * 走不通，最坏结果是退回"没有提速但正确"的原始行为，不会让图片本身消失或出错。
+     *
+     * 只处理 JPEG（`suffix=="jpg"`）不处理 PNG/TIFF/JBIG2 等其它格式：JPEG 是真实
+     * 场景里最常见的大图来源（扫描页/照片），`BitmapFactory` 对 JPEG 的支持最成熟
+     * 可靠；PNG 通常是无损压缩、体积和这里要解决的"大图"问题关联度较低，TIFF/JBIG2
+     * 在不同安卓版本上的原生解码支持不稳定，没有把握，不在这次的范围内。
+     */
+    private fun decodeJpegWithNativeSubsampling(pdImage: PDImage): Bitmap? = runCatching {
+        if (pdImage.suffix != "jpg") return null
+        val subsampling = subsamplingFactor(pdImage.width, pdImage.height)
+        if (subsampling <= 1) return null
+        val bytes = pdImage.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
+        val options = BitmapFactory.Options().apply { inSampleSize = subsampling }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }.getOrNull()
 
     /** 见上方 KDoc"已知问题"一节。键是部首补充区码位，值是对应的常用独立汉字。 */
     private val RADICALS_SUPPLEMENT_FIX = mapOf(
@@ -818,10 +865,12 @@ object PdfTextExtractor {
         override fun getCurrentPoint(): PointF = PointF(currentX, currentY)
 
         override fun drawImage(pdImage: PDImage) {
-            // 2026-08-19：给大图解码提速这件事目前搁置，见 [subsamplingFactor] KDoc
-            // "真机踩坑：两次尝试都失败了"一节——先用回一直可靠的 `pdImage.image`
-            // 原始分辨率解码，不做任何降采样/事后缩小，保证正确性优先。
-            val bitmap = runCatching { pdImage.image }.getOrNull() ?: return
+            // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
+            // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
+            // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。
+            val bitmap = decodeJpegWithNativeSubsampling(pdImage)
+                ?: runCatching { pdImage.image }.getOrNull()
+                ?: return
             val ctm = graphicsState.currentTransformationMatrix
             images.add(applyCtmOrientation(bitmap, ctm))
         }
