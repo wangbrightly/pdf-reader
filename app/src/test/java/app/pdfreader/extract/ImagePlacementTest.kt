@@ -57,4 +57,65 @@ class ImagePlacementTest {
         val index = ImagePlacement.afterParagraphIndex(paragraphPages = emptyList(), imagePage = 1)
         assertEquals(-1, index)
     }
+
+    // ---- afterParagraphIndexForRegion：2026-08-19 增量，见类注释"表格区域裁剪"配套一节 ----
+
+    @Test
+    fun `表格前后都有正文时，表格图片插在表格开始位置之前那个段落之后`() {
+        // 第 2 页有 3 段正文，分别在距页顶 50、80、400——表格区域从 90 开始，应该
+        // 插在下标 1（坐标 80）之后，不是这一页最后一段（下标 2，坐标 400）之后。
+        val paragraphPages = listOf(1, 2, 2, 2)
+        val paragraphTopY = listOf(50f, 50f, 80f, 400f)
+        val index = ImagePlacement.afterParagraphIndexForRegion(
+            paragraphPages,
+            paragraphTopY,
+            page = 2,
+            regionTopY = 90f,
+        )
+        assertEquals(2, index)
+    }
+
+    @Test
+    fun `表格在页面最开头（表格上方没有正文）时，图片插在前一页最后一个段落之后`() {
+        val paragraphPages = listOf(1, 1, 2, 2)
+        val paragraphTopY = listOf(50f, 80f, 300f, 400f)
+        val index = ImagePlacement.afterParagraphIndexForRegion(
+            paragraphPages,
+            paragraphTopY,
+            page = 2,
+            regionTopY = 50f, // 比这一页第一段（300）还靠上，说明表格在页面最顶部。
+        )
+        assertEquals(1, index)
+    }
+
+    @Test
+    fun `同一页两个表格（分别在正文前后）应该分别插在各自对应的位置`() {
+        val paragraphPages = listOf(1, 1, 1)
+        val paragraphTopY = listOf(50f, 200f, 400f)
+        val firstTable = ImagePlacement.afterParagraphIndexForRegion(
+            paragraphPages,
+            paragraphTopY,
+            page = 1,
+            regionTopY = 100f,
+        )
+        val secondTable = ImagePlacement.afterParagraphIndexForRegion(
+            paragraphPages,
+            paragraphTopY,
+            page = 1,
+            regionTopY = 300f,
+        )
+        assertEquals(0, firstTable)
+        assertEquals(1, secondTable)
+    }
+
+    @Test
+    fun `没有任何文字段落时，表格图片一律插在最前面`() {
+        val index = ImagePlacement.afterParagraphIndexForRegion(
+            emptyList(),
+            emptyList(),
+            page = 1,
+            regionTopY = 50f,
+        )
+        assertEquals(-1, index)
+    }
 }

@@ -47,4 +47,32 @@ object ImagePlacement {
         }
         return result
     }
+
+    /**
+     * [afterParagraphIndex] 的页内精确版——2026-08-19 增量，配合 [PdfTextExtractor]
+     * "表格区域裁剪"这个功能：一页里表格只占一部分，表格前后都可能有正文段落，图片
+     * （表格渲染出来的那张）该插在"表格开始位置之前最后一个段落"之后，不是简单地插
+     * 在"这一页最后一个段落"之后（那样会把表格后面的正文也排到表格图片前面去）。
+     *
+     * @param paragraphPages 每个文字段落所在的页码，按段落顺序排列。
+     * @param paragraphTopY 每个段落第一行距页面顶部的距离（pt），跟 [paragraphPages]
+     *   下标一一对应，跟 [regionTopY] 同一套坐标系（都是"距页顶多少 pt"）。
+     * @param page 表格所在的页码。
+     * @param regionTopY 表格区域顶部距页面顶部的距离（pt）。
+     * @return 应该插入在哪个段落下标之后（0-based）；`-1` 表示插在所有段落之前。
+     */
+    fun afterParagraphIndexForRegion(
+        paragraphPages: List<Int>,
+        paragraphTopY: List<Float>,
+        page: Int,
+        regionTopY: Float,
+    ): Int {
+        var result = -1
+        for (index in paragraphPages.indices) {
+            val isBeforeRegion = paragraphPages[index] < page ||
+                (paragraphPages[index] == page && paragraphTopY[index] < regionTopY)
+            if (isBeforeRegion) result = index
+        }
+        return result
+    }
 }

@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.Path
 import android.graphics.PointF
+import android.graphics.Rect
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.contentstream.PDFGraphicsStreamEngine
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -82,7 +83,7 @@ import kotlin.math.sign
  * 分隔符左右位置对调、章节号上下顺序颠倒，但截图里汉字字形本身仍是正常方向（不是
  * 每个字形本身镜像到认不出来那种）——同一份文档里另一张结构类似的图片方向正常，
  * 说明不是全局性的、每张图都错。诊断日志显示这张图"疑似表格页=0"，即没有走
- * [renderTablePageImages] 整页渲染那条路，走的是下面说的内嵌图片抽取路径。
+ * [renderTableRegionImages] 整页渲染那条路，走的是下面说的内嵌图片抽取路径。
  *
  * **根因，用构造的 fixture 实测确认，不是纯推理**：`PDImageXObject`
  * 这类图片资源本身只是原始像素数据，它在页面上究竟怎么摆（缩放/旋转/翻转/位置）
@@ -130,7 +131,7 @@ import kotlin.math.sign
  * 极罕见（本次真机反馈的现象本身也是镜像/整体倒转的模式，不是任意角度旋转）；
  * 二是任意角度旋转后的位图边缘必然引入插值，没法再用"取像素点精确比对"这种确定性
  * 方式验证正确性，复杂度和可验证性都不成比例。[表格检测那条整页渲染路径]
- * （[renderTablePageImages]，用 [PDFRenderer.renderImageWithDPI]）不受这个 bug
+ * （[renderTableRegionImages]，用 [PDFRenderer.renderImageWithDPI]）不受这个 bug
  * 影响——那是页面级别的渲染 API，由 PdfBox-Android 自己的渲染引擎负责应用页面
  * 内所有 CTM（包括图片的），不是"抽取单个图片资源、自己拼位图"这条路径，两者用的
  * 是完全不同的代码，这个判断没有另外找 fixture 验证（renderImageWithDPI 是否正确
@@ -138,7 +139,8 @@ import kotlin.math.sign
  * 一个第三方库的核心渲染路径），只是读代码路径确认它和 [scanPages] 走的不是
  * 同一段逻辑。
  *
- * ## 表格检测（2026-08-18 增量）：疑似表格的整页降级为图片
+ * ## 表格检测（2026-08-18 增量，2026-08-19 从"整页降级"改成"区域裁剪"）：疑似表格
+ * 的区域降级为图片，同页其余正文照常重排
  *
  * 提示词档案第 6 条要求"表格不重排，整体展示，支持双指缩放"——PDF 格式本身没有
  * "表格"这个结构化概念，"这块内容是不是表格"是个没有标准答案的启发式检测问题
@@ -148,29 +150,40 @@ import kotlin.math.sign
  * 1. **检测信号：矢量网格线，不是文字列对齐。** [scanPages] 对每一页跑一遍
  *    [PageContentStreamEngine]（继承 `PDFGraphicsStreamEngine`，能拿到页面 content
  *    stream 里 `re`/`m l S` 等图形操作符的线段坐标），把线段交给纯逻辑
- *    [TableGridDetector.looksLikeTable] 判断"这一页是不是有网格"。选网格线而不是
- *    "文字按列对齐"这个更简单的信号，是因为后者在多栏排版、目录页上误判率明显更高
- *    （一大段无关文字碰巧在几行里都能切出 3 列对齐点，这种巧合并不罕见）；网格线
- *    要求"多条横线和多条竖线互相交叉"，普通正文段落、多栏排版、目录页几乎不会画
- *    出这种矢量图形，误判率天然更低，符合"宁可漏检、不可错杀"的保守策略（见
- *    [TableGridDetector] 类注释的完整阈值设计理由）。用真实 fixture
- *    （`sample-with-table.pdf`）反编译验证过：Chromium 打印 `<table border>` 时，
- *    表格边框是画成"细长填充矩形"而不是描边直线，[PageContentStreamEngine] 对
+ *    [TableGridDetector.tableRegionOrNull] 判断"这一页有没有网格，网格大致占地
+ *    多大"。选网格线而不是"文字按列对齐"这个更简单的信号，是因为后者在多栏排版、
+ *    目录页上误判率明显更高（一大段无关文字碰巧在几行里都能切出 3 列对齐点，这种
+ *    巧合并不罕见）；网格线要求"多条横线和多条竖线互相交叉"，普通正文段落、多栏
+ *    排版、目录页几乎不会画出这种矢量图形，误判率天然更低，符合"宁可漏检、不可
+ *    错杀"的保守策略（见 [TableGridDetector] 类注释的完整阈值设计理由）。用真实
+ *    fixture（`sample-with-table.pdf`）反编译验证过：Chromium 打印 `<table border>`
+ *    时，表格边框是画成"细长填充矩形"而不是描边直线，[PageContentStreamEngine] 对
  *    `appendRectangle`/`strokePath`/`fillPath` 都做了处理，两种画法都能识别。
  *
- * 2. **降级策略：一旦一页疑似有表格，整页都不参与 reflow，改成渲染成一张 Bitmap。**
- *    检测"表格在页面内的精确边界"（哪几行哪几列真正属于表格、表格前后哪些文字不
- *    属于表格）本身复杂度和不确定性很高，与"够用的启发式"这个目标不成比例。所以
- *    一旦命中疑似表格信号，直接把这一整页用 [PDFRenderer.renderImageWithDPI]
- *    （PdfBox-Android 提供的整页渲染 API，和上游 Apache PDFBox 的 `PDFRenderer`
- *    同源）渲染成一张 [Bitmap]，这一页原本会抽取出的文字段落全部跳过——**代价**：
- *    如果这一页里表格和大段正文混排，正文也会跟着变成图片、丢失"重排+调字号"的
- *    能力，这是把"检测精度"换成"实现简单性和复用度"的妥协（复用现有
- *    [ExtractedImage]/`DisplayBlock.Image`/双指缩放机制，不需要发明新的展示类型）。
+ * 2. **降级策略：把表格所在的区域（不是整页）渲染成一张 Bitmap，区域之外的正文
+ *    照常抽取+reflow。** 用户反馈"一页上既有表格又有正文时，能不能像 EPUB 阅读器
+ *    那样文字是文字、表格是表格"——早期版本（2026-08-18~19 之间）检测到表格就把
+ *    整页都渲染成图片，哪怕表格只占一小块，同页大段正文也跟着丢失"重排+调字号"
+ *    的能力。改成 [renderTableRegionImages]：先用 [PDFRenderer.renderImageWithDPI]
+ *    整页渲染（`PDFRenderer` 没有提供"只渲染页面某个区域"的公开 API），再裁剪到
+ *    [TableGridDetector.tableRegionOrNull] 算出的包围盒（[tableCropRect]，加一圈
+ *    内边距避免裁掉表格边缘文字）；文字抽取那一侧用 [isWithinTableBand] 排除掉
+ *    落在这个区域纵向范围内的行——两处用的是同一套坐标换算和同一个内边距常量
+ *    （[TABLE_REGION_PADDING_PT]），保证"图片裁到哪、文字排除到哪"是一致的，不会
+ *    出现表格边缘文字既被裁进图片、又重复留在正文段落里。
+ *
+ *    **已知局限（有意的降级范围，不是遗漏）**：只按纵向范围排除文字，不判断横向
+ *    位置——假设表格占满页面宽度的一个横向条带，遇到"表格和正文左右并排"这种排版
+ *    会连正文一起误判成表格范围内、被裁掉；一页有多个互相分离的表格时，
+ *    [TableGridDetector.tableRegionOrNull] 只算出一个涵盖全部疑似表格线段的包围盒，
+ *    会把两个表格之间的正文也划进"表格区域"。两种情况都比"这次修复之前"（整页
+ *    降级）要好（至少表格前后的正文能保住），但没有做到完全精确，真实文档这两种
+ *    排版都相对少见，跟本类"保守但简单"的一贯原则一致。
+ *
  *    渲染失败（内存不足、极端复杂页面等）时不强行让整份文档抽取失败，而是让这一页
- *    退回正常的文字抽取路径——见 [renderTablePageImages] 里的 `runCatching`，这样
- *    "表格检测/渲染出问题"最坏情况下只是退化成"这页表格没能整页降级、还是按普通
- *    文字重排"，不会让用户连文字都看不到。
+ *    退回正常的文字抽取路径——见 [renderTableRegionImages] 里的 `runCatching`，这样
+ *    "表格检测/渲染出问题"最坏情况下只是退化成"这页表格没能降级、还是按普通文字
+ *    重排"，不会让用户连文字都看不到。
  *
  * ## 大纲/目录抽取（2026-08-18 增量）：有官方结构就直接读，没有就如实留空
  *
@@ -379,15 +392,40 @@ object PdfTextExtractor {
             // 内嵌图片"两步耗时的大头，合并后省掉重复解析 content stream 的开销。
             val pageScans = scanPages(document)
             val t1 = System.currentTimeMillis()
-            val candidatePages = pageScans.filterValues { TableGridDetector.looksLikeTable(it.segments) }.keys
-            val tablePageImages = renderTablePageImages(document, candidatePages)
-            val renderedTablePages = tablePageImages.keys
+            // 见类注释"表格区域裁剪"一节：不再是"这一页像不像表格"的布尔值，而是
+            // "表格在这一页的大致包围盒"——只裁剪渲染表格本身，不连累同页正文。
+            //
+            // 真机踩坑：先按页面可见范围过滤一遍线段（onPageSegments），再交给
+            // TableGridDetector——见 [isSegmentOnPage] KDoc，有的 PDF（真机反馈一份
+            // 网页转 PDF 的长文）content stream 里混着大量完全在页面可见范围之外的
+            // 装饰性矢量图形（诊断日志实测过：Y 坐标跨度能到 -4284~5076，MediaBox
+            // 却是正常的 0~792，说明不是坐标系原点偏移，是内容流本身画了一堆不可见
+            // 的东西），不过滤的话这些"看不见的线"也会被数进表格检测，算出离谱的
+            // 包围盒（曾经真机复现过：一个章节的目录列表+好几段正文被整块误判成
+            // 表格区域裁掉）。
+            val tableRegions = pageScans.mapNotNull { (pageNo, scan) ->
+                val page = document.getPage(pageNo - 1)
+                val onPageSegments = scan.segments.filter {
+                    isSegmentOnPage(it, page.mediaBox.width, page.mediaBox.height)
+                }
+                TableGridDetector.tableRegionOrNull(onPageSegments)?.let { pageNo to it }
+            }.toMap()
+            val tableRegionImages = renderTableRegionImages(document, tableRegions)
+            // 只有真的渲染成功的页码才继续参与后面的"排除文字/排除内嵌图片"计算——
+            // 渲染失败的页退回正常文字抽取，见 renderTableRegionImages KDoc。
+            val renderedTableRegions = tableRegions.filterKeys { it in tableRegionImages.keys }
+            val tableRegionPageHeights = renderedTableRegions.keys.associateWith {
+                document.getPage(it - 1).mediaBox.height
+            }
             val t2 = System.currentTimeMillis()
 
             val stripper = LineCollectingStripper()
             stripper.getText(document)
             val t3 = System.currentTimeMillis()
-            val nonTableLines = stripper.lines.filterNot { it.page in renderedTablePages }
+            val nonTableLines = stripper.lines.filterNot { line ->
+                val region = renderedTableRegions[line.page]
+                region != null && isWithinTableBand(line.y, region, tableRegionPageHeights.getValue(line.page))
+            }
             val rawParagraphs = linesToParagraphs(nonTableLines)
             // 见 RunningFooterFilter 类注释：过滤掉"浏览器打印 PDF 自带的页眉页脚水印"
             // （纯网址/纯日期时间一行，以及跟它们同页出现的纯页码计数一行），不是书本身
@@ -401,12 +439,19 @@ object PdfTextExtractor {
             val paragraphPages = paragraphs.map { it.page }
             val paragraphTopYs = paragraphs.map { it.topY }
 
-            val inlineImages = buildInlineImages(pageScans, paragraphPages, excludePages = renderedTablePages)
+            val inlineImages = buildInlineImages(pageScans, paragraphPages, excludePages = renderedTableRegions.keys)
             val t4 = System.currentTimeMillis()
-            val tableImages = renderedTablePages.map { pageNo ->
+            val tableImages = renderedTableRegions.map { (pageNo, region) ->
+                val pageHeight = tableRegionPageHeights.getValue(pageNo)
+                val regionTopYDirAdj = pageHeight - region.maxY
                 ExtractedImage(
-                    bitmap = tablePageImages.getValue(pageNo),
-                    afterParagraphIndex = ImagePlacement.afterParagraphIndex(paragraphPages, pageNo),
+                    bitmap = tableRegionImages.getValue(pageNo),
+                    afterParagraphIndex = ImagePlacement.afterParagraphIndexForRegion(
+                        paragraphPages,
+                        paragraphTopYs,
+                        pageNo,
+                        regionTopYDirAdj,
+                    ),
                 )
             }
             // 大纲抽取失败（文档没有大纲、大纲结构异常等）不能让整份文档的抽取失败，
@@ -415,8 +460,8 @@ object PdfTextExtractor {
             val outline = runCatching { extractOutline(document) }.getOrDefault(emptyList())
             android.util.Log.d(
                 "PdfReaderDebug",
-                "页数=${document.numberOfPages} 疑似表格页=${candidatePages.size} " +
-                    "扫描页面(表格检测+图片抽取)=${t1 - t0}ms 渲染表格页=${t2 - t1}ms " +
+                "页数=${document.numberOfPages} 疑似表格页=${tableRegions.size} " +
+                    "扫描页面(表格检测+图片抽取)=${t1 - t0}ms 渲染表格区域=${t2 - t1}ms " +
                     "抽取文字=${t3 - t2}ms 组装图片=${t4 - t3}ms 总计=${t4 - t0}ms",
             )
             return PdfContent(
@@ -536,22 +581,112 @@ object PdfTextExtractor {
     }
 
     /**
-     * 把 [candidatePages] 里每一页整页渲染成 [Bitmap]（[TABLE_PAGE_RENDER_DPI]）。
-     * 只有渲染成功的页码才会出现在返回值里——渲染失败的页码不进返回值，调用方
+     * 把 [tableRegions] 里每一页整页渲染成 [Bitmap]（[TABLE_PAGE_RENDER_DPI]），再裁剪
+     * 到表格本身的包围盒（加 [TABLE_REGION_PADDING_PT] 内边距，见 [tableCropRect]）——
+     * 只有渲染+裁剪都成功的页码才会出现在返回值里，失败的页码不进返回值，调用方
      * ([extractContent]) 就不会把那一页的文字行排除掉，等价于"这一页没有被判定为
      * 表格"，见类注释"表格检测"一节的降级说明。
+     *
+     * 用"整页渲染再裁剪"而不是"只渲染表格那一小块区域"：`PDFRenderer` 没有提供
+     * 直接渲染页面局部区域的公开 API（`renderImageWithDPI` 只能整页渲染），裁剪
+     * 一张已经渲染好的 `Bitmap` 是安卓平台最基础的操作，比自己拼一套局部渲染逻辑
+     * 简单可靠得多——多渲染的部分（表格区域之外的整页内容）会在裁剪后直接丢弃，
+     * 多花的渲染成本相对"表格检测→裁剪"这条路径的其它开销可以接受。
      */
-    private fun renderTablePageImages(document: PDDocument, candidatePages: Set<Int>): Map<Int, Bitmap> {
-        if (candidatePages.isEmpty()) return emptyMap()
+    private fun renderTableRegionImages(document: PDDocument, tableRegions: Map<Int, TableRegion>): Map<Int, Bitmap> {
+        if (tableRegions.isEmpty()) return emptyMap()
         val renderer = PDFRenderer(document)
         val result = mutableMapOf<Int, Bitmap>()
-        for (pageNo in candidatePages) {
+        for ((pageNo, region) in tableRegions) {
             val bitmap = runCatching {
-                renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
+                val pageHeight = document.getPage(pageNo - 1).mediaBox.height
+                val fullPage = renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
+                val crop = tableCropRect(region, pageHeight, TABLE_PAGE_RENDER_DPI, fullPage.width, fullPage.height)
+                Bitmap.createBitmap(fullPage, crop.left, crop.top, crop.width(), crop.height())
             }.getOrNull() ?: continue
             result[pageNo] = bitmap
         }
         return result
+    }
+
+    /** 表格包围盒四周留的内边距（PDF 坐标系 pt）——见 [tableCropRect] KDoc。 */
+    private const val TABLE_REGION_PADDING_PT = 6f
+
+    /**
+     * 纯几何计算：把 [region]（PDF 页面坐标系，y 轴向上）换算成整页渲染出来的
+     * [bitmapWidth]x[bitmapHeight] 像素图里该裁剪的矩形（像素坐标系，y 轴向下、
+     * 原点左上），四周留 [TABLE_REGION_PADDING_PT] 的内边距——表格边框线本身往往
+     * 比单元格文字的可见范围更紧，不留一点余量容易把边界上的文字裁掉一点点。
+     *
+     * 换算公式：`scale = dpi / 72`（PDF 的 1pt = 1/72 英寸，`renderImageWithDPI`
+     * 就是按这个换算出实际像素）；`pixelY = (pageHeightPt - pdfY) * scale`——PDF
+     * 坐标系原点在左下、y 轴向上，像素坐标系原点在左上、y 轴向下，两者唯一的转换
+     * 就是"用页高减一下"，这也是本项目其它地方（[targetTopYOrNull]、[isWithinTableBand]）
+     * 处理这两套坐标系转换时反复用到的同一个公式，不是这里现推的。
+     *
+     * 用 [Rect] 的坐标全部 `coerceIn` 卡在 `[0, bitmapWidth/bitmapHeight]` 范围内
+     * ——内边距、四舍五入误差都可能让算出来的坐标略微超出图片实际范围，
+     * `Bitmap.createBitmap` 对越界坐标会直接抛异常，裁剪一张已经渲染好的大图不该
+     * 因为几个像素的误差整个失败。
+     */
+    internal fun tableCropRect(
+        region: TableRegion,
+        pageHeightPt: Float,
+        dpi: Float,
+        bitmapWidth: Int,
+        bitmapHeight: Int,
+    ): Rect {
+        val scale = dpi / 72f
+        val left = ((region.minX - TABLE_REGION_PADDING_PT) * scale).toInt().coerceIn(0, bitmapWidth - 1)
+        val top = ((pageHeightPt - region.maxY - TABLE_REGION_PADDING_PT) * scale).toInt()
+            .coerceIn(0, bitmapHeight - 1)
+        val right = ((region.maxX + TABLE_REGION_PADDING_PT) * scale).toInt().coerceIn(left + 1, bitmapWidth)
+        val bottom = ((pageHeightPt - region.minY + TABLE_REGION_PADDING_PT) * scale).toInt()
+            .coerceIn(top + 1, bitmapHeight)
+        return Rect(left, top, right, bottom)
+    }
+
+    /**
+     * 纯逻辑：[lineYDirAdj]（[Line.y]，距页面顶部多少 pt）是不是落在表格区域的纵向
+     * 范围内（同样加 [TABLE_REGION_PADDING_PT] 内边距，跟 [tableCropRect] 裁剪的
+     * 范围保持一致——不能裁剪的时候留了内边距、排除文字的时候却没留，那样表格边缘
+     * 的文字会被裁进图片里、又同时留在文字段落里，重复显示）。只判断纵向范围，
+     * 不判断横向——见 [TableGridDetector] 类注释"已知局限"一节，这次的实现假设
+     * 表格占满页面宽度的一个横向条带，不处理"表格和正文左右并排"这种布局。
+     */
+    internal fun isWithinTableBand(lineYDirAdj: Float, region: TableRegion, pageHeightPt: Float): Boolean {
+        val topYDirAdj = pageHeightPt - region.maxY - TABLE_REGION_PADDING_PT
+        val bottomYDirAdj = pageHeightPt - region.minY + TABLE_REGION_PADDING_PT
+        return lineYDirAdj in topYDirAdj..bottomYDirAdj
+    }
+
+    /** [isSegmentOnPage] 允许线段端点超出页面边界一点点的容差（pt）。 */
+    private const val PAGE_BOUNDS_TOLERANCE_PT = 1f
+
+    /**
+     * 判断一条 [LineSegment] 是不是落在页面可见范围（`[0, pageWidth] x [0, pageHeight]`，
+     * 留一点点 [PAGE_BOUNDS_TOLERANCE_PT] 容差）内——真机踩坑，见类注释"表格区域
+     * 裁剪"一节：真机反馈一份网页转 PDF 的长文，某一页目录列表+好几段正文被整块
+     * 误判成表格区域裁掉，诊断日志实测确认这一页 content stream 里混着大量矢量线段
+     * 的坐标跨度极大（Y 从 -4284 到 5076），而这份文档的 `MediaBox` 是完全正常的
+     * `0~792`——排除了"页面坐标系原点偏移"这个猜测，说明这些线段本身就画在页面可见
+     * 范围之外（大概率是生成这份 PDF 的工具把整个长网页当一块连续画布，每一"页"
+     * 的 content stream 里其实包含了对整块画布的绘制指令，只是通过页面自身的
+     * `MediaBox`/裁剪范围只显示其中一段——具体是哪个工具、哪种机制没有继续深挖，
+     * 不影响这里的修法）。这些"看不见的线"不应该参与表格检测：用户读到的、以为
+     * 是表格的东西，只能是页面可见范围内画出来的内容。
+     *
+     * 两个端点都要在范围内才算"在页面上"——只有一个端点在范围内的线段（比如一条
+     * 从页面内延伸到页面外的线）保守地当作"不在页面上"丢弃，不去猜它在页面内的
+     * 那一截该在哪，这类线段本来就不是真表格线该有的样子。
+     */
+    internal fun isSegmentOnPage(segment: LineSegment, pageWidth: Float, pageHeight: Float): Boolean {
+        val minX = -PAGE_BOUNDS_TOLERANCE_PT
+        val minY = -PAGE_BOUNDS_TOLERANCE_PT
+        val maxX = pageWidth + PAGE_BOUNDS_TOLERANCE_PT
+        val maxY = pageHeight + PAGE_BOUNDS_TOLERANCE_PT
+        fun inBounds(x: Float, y: Float) = x in minX..maxX && y in minY..maxY
+        return inBounds(segment.x1, segment.y1) && inBounds(segment.x2, segment.y2)
     }
 
     /**
@@ -596,8 +731,13 @@ object PdfTextExtractor {
      * 段落之后——纯粹的列表组装，不再需要重新解析 content stream（那部分开销已经在
      * [scanPages] 里付过了），所以这一步很快。
      *
-     * [excludePages] 是已经整页渲染成图片的表格页（见类注释"表格检测"一节）——这些
-     * 页面的内嵌图片已经包含在整页渲染结果里了，不需要再单独展示一遍。
+     * [excludePages] 是检测到表格区域、已经裁剪渲染出表格图片的页（见类注释"表格
+     * 检测"一节）——这一整页的内嵌图片都跳过，不细分"是不是真的落在表格区域内"：
+     * 表格区域内的内嵌图片确实已经包含在裁剪结果里，需要跳过；表格区域外的内嵌
+     * 图片理论上可以继续单独展示，但 [PageContentStreamEngine] 目前不记录每张
+     * 内嵌图片在页面上的坐标（只记录朝向修正用的 CTM），没法判断"这张图在不在表格
+     * 区域内"，索性整页跳过——比"表格区域裁剪"改动之前（那时候是整页文字+整页
+     * 图片都跳过）范围已经小了一圈，是有意的简化，不是遗漏。
      */
     private fun buildInlineImages(
         pageScans: Map<Int, PageScan>,
