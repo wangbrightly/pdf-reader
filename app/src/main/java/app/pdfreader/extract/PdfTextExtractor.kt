@@ -904,6 +904,19 @@ object PdfTextExtractor {
     private class LineCollectingStripper : PDFTextStripper() {
         val lines = mutableListOf<Line>()
 
+        init {
+            // 2026-08-19 真机修复：PDFTextStripper 默认按 content stream 里的绘制顺序
+            // 输出文字，不是按视觉上的从上到下、从左到右顺序——这对单栏正文通常没区别
+            // （大部分 PDF 生成器本来就是按视觉顺序画的），但"表单/表格模板"这类常见
+            // 生成方式（先整体画一批标签、再单独一批填值，或者分栏绘制）会导致行内
+            // 乃至跨行的文字顺序错乱。真机复现：一份体检报告 PDF 里"年龄: 43岁"被拆成
+            // "43 岁年龄:"，一份技术规格表里同一行的好几个数值被打乱顺序拼在一起——
+            // 两份文档开这个开关后都恢复了正常的"标签在前、值在后"顺序，验证有效。
+            // 见 NOTES.md 相关条目：一开始以为要专门造一套"无边框表格检测"的复杂逻辑，
+            // 结果真正的根因只是这一行没打开，比想象的简单得多。
+            sortByPosition = true
+        }
+
         override fun writeString(text: String, textPositions: MutableList<TextPosition>) {
             if (text.isBlank()) return
             val y = textPositions.firstOrNull()?.yDirAdj ?: return
