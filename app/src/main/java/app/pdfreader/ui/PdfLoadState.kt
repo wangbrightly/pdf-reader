@@ -27,15 +27,27 @@ sealed interface PdfLoadState {
 }
 
 /**
- * 一屏内容里排在一起展示的最小单位：要么是一段已经按当前行宽重排好、可以直接塞进一个
- * TextView 的文字（[Text]），要么是一张已经解码好、可以直接塞进一个 ImageView 的图片
- * （[Image]）。谁在前谁在后由 [app.pdfreader.MainActivity] 里的组装逻辑决定，依据是
- * [app.pdfreader.extract.ExtractedImage.afterParagraphIndex]（图片该插在哪个段落之后，
- * 见 [app.pdfreader.extract.ImagePlacement]）。
+ * 一屏内容里排在一起展示的最小单位：一段已经按当前行宽重排好、可以直接塞进一个
+ * TextView 的文字（[Text]），一张已经解码好、可以直接塞进一个 ImageView 的图片
+ * （[Image]），或者一个还在后台加载中的图片/表格区域的占位符（[Placeholder]，
+ * 2026-08-19"按需加载"增量新增，见 [app.pdfreader.extract.PdfTextExtractor.Session]
+ * 类注释）。谁在前谁在后由 [app.pdfreader.MainActivity] 里的组装逻辑决定，依据是
+ * [app.pdfreader.extract.PdfTextExtractor.Session.pendingMediaPageByAfterIndex] 的
+ * key（图片/占位符该插在哪个段落之后）。
  */
 sealed interface DisplayBlock {
     data class Text(val text: String) : DisplayBlock
     data class Image(val bitmap: Bitmap) : DisplayBlock
+
+    /**
+     * [page] 是这块占位符对应的 PDF 页码（不是展示块下标）——2026-08-19 由
+     * `afterParagraphIndex` 改成按页码标识，见 [app.pdfreader.MainActivity
+     * .loadPendingMediaInBackground] 类注释"为什么按页而不是按插入位置分组"一节：
+     * 同一个插入位置（afterParagraphIndex）可能对应好几页（比如这几页之间完全没有
+     * 文字段落），按页码才能让每一页各自独立加载完就立刻替换，不用等同一批里最慢
+     * 的那一页也做完。页码在一份文档内天然唯一，可以直接当 key 用。
+     */
+    data class Placeholder(val page: Int) : DisplayBlock
 }
 
 /**

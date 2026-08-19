@@ -1073,11 +1073,15 @@ object PdfTextExtractor {
      * 更差一点的边界情况处理，真机没有实际测到过这个边界情况被触发。
      */
     class Session private constructor(private val document: PDDocument) : java.io.Closeable {
+        private val tConstructStart = System.currentTimeMillis()
+
         val pageCount: Int = document.numberOfPages
 
         val outline: List<OutlineEntry> = runCatching { extractOutline(document) }.getOrDefault(emptyList())
 
         private val pageScans: Map<Int, PageScan> = scanPages(document, decodeImages = false)
+
+        private val tAfterScan = System.currentTimeMillis()
 
         /** 表格区域按页缓存——[loadPageMedia] 复用同一份，不用重新跑一遍检测。 */
         private val tableRegions: Map<Int, TableRegion> = pageScans.mapNotNull { (pageNo, scan) ->
@@ -1087,6 +1091,8 @@ object PdfTextExtractor {
             }
             TableGridDetector.tableRegionOrNull(onPageSegments)?.let { pageNo to it }
         }.toMap()
+
+        private val tAfterTableRegions = System.currentTimeMillis()
 
         private val tablePageHeights: Map<Int, Float> = tableRegions.keys.associateWith {
             document.getPage(it - 1).mediaBox.height
@@ -1108,6 +1114,7 @@ object PdfTextExtractor {
         init {
             val stripper = LineCollectingStripper()
             stripper.getText(document)
+            val t1 = System.currentTimeMillis()
             val nonTableLines = stripper.lines.filterNot { line ->
                 val region = tableRegions[line.page]
                 region != null && isWithinTableBand(line.y, region, tablePageHeights.getValue(line.page))
@@ -1140,6 +1147,16 @@ object PdfTextExtractor {
                 pending.getOrPut(afterIndex) { mutableListOf() }.add(pageNo)
             }
             pendingMediaPageByAfterIndex = pending
+            val t2 = System.currentTimeMillis()
+            android.util.Log.d(
+                "PdfReaderDebug",
+                "Session.init 页数=$pageCount 疑似表格页=${tableRegions.size} " +
+                    "扫描页面(不解码图片)=${tAfterScan - tConstructStart}ms " +
+                    "表格区域检测=${tAfterTableRegions - tAfterScan}ms " +
+                    "抽取文字(PDFTextStripper)=${t1 - tAfterTableRegions}ms " +
+                    "段落切分+页脚过滤+占位符定位=${t2 - t1}ms " +
+                    "总计=${t2 - tConstructStart}ms 待加载位置数=${pending.size}",
+            )
         }
 
         /**
