@@ -1034,6 +1034,151 @@ object PdfTextExtractor {
         override fun clip(windingRule: Path.FillType) = Unit
         override fun shadingFill(shadingName: com.tom_roush.pdfbox.cos.COSName) = Unit
     }
+
+    /**
+     * 按需加载版本的抽取入口——2026-08-19 增量。用户反馈打开速度明显慢于 WPS，真机
+     * 日志确认耗时大头集中在图片解码/表格区域渲染，文字抽取本身一直很快（见
+     * [extractContent] 历次改动记录的耗时日志）。
+     *
+     * 跟 [extractContent] 的区别：[extractContent] 一次性做完所有耗时工作（文字+
+     * 表格检测+全部图片解码）才返回一份完整的 [PdfContent]；[Session] 打开后立刻
+     * 可以读到文字（[paragraphs]/[paragraphPages]/[paragraphTopY]，跟 [PdfContent]
+     * 同名字段语义一致）和"哪些展示位置需要加载图片/表格区域"
+     * （[pendingMediaPageByAfterIndex]），但图片/表格区域本身的 [Bitmap] 解码推迟到
+     * 调用方主动调 [loadPageMedia] 才做——调用方（UI 层）可以先把文字全部显示出来，
+     * 图片/表格区域先放占位符，再按页（比如从当前可见页开始）后台调
+     * [loadPageMedia]，加载完再把占位符换成真实内容。
+     *
+     * ## 重新扫描而不是缓存解码句柄
+     *
+     * [loadPageMedia] 被调用时会重新跑一遍那一页的 [PageContentStreamEngine]（这次
+     * `decodeImages=true`），而不是复用构造时 [pageScans]（那次 `decodeImages=false`，
+     * 图片部分没有真的解码，没有句柄可复用）。重新扫一遍一页的 content stream（不含
+     * 图片解码本身）开销只有几毫秒量级（真机日志佐证：258 页文档在图片全部解码失败
+     * 快速跳过的极端情况下，"扫描页面"总耗时不到 2 秒，摊到每页只有几毫秒）——比起
+     * "让图片解码句柄跨页面处理保持有效"这种要求对 PdfBox-Android 内部实现做更强
+     * 假设、没有把握是否支持的设计，重新扫一遍更简单可靠，多付的这点开销可以接受。
+     *
+     * ## 已知局限：表格区域的文字排除不等真的渲染成功就先做了
+     *
+     * [extractContent] 排除表格区域内的文字行之前，会先真的把该区域渲染出来，只有
+     * 渲染成功才排除对应文字，渲染失败就退回正常文字抽取（见 [extractContent] 里
+     * `renderedTableRegions` 那一步）——这是因为 [extractContent] 反正要把所有页都
+     * 渲染一遍，"先渲染再决定要不要排除文字"不多花代价。[Session] 做不到这一点：
+     * 即时可用阶段的核心意义就是不去渲染任何图片/表格区域，所以只能仅凭表格区域的
+     * 几何范围（不实际渲染）就决定排除哪些文字。真机测试中没有观察到表格区域渲染
+     * 失败的案例（这台设备上失败率是 0），如果确实发生（内存不足等极端情况），
+     * [loadPageMedia] 对应位置会解码失败、占位符停在"加载中"状态，而不是像
+     * [extractContent] 那样退回显示原文字——这是一个刻意接受的、比 [extractContent]
+     * 更差一点的边界情况处理，真机没有实际测到过这个边界情况被触发。
+     */
+    class Session private constructor(private val document: PDDocument) : java.io.Closeable {
+        val pageCount: Int = document.numberOfPages
+
+        val outline: List<OutlineEntry> = runCatching { extractOutline(document) }.getOrDefault(emptyList())
+
+        private val pageScans: Map<Int, PageScan> = scanPages(document, decodeImages = false)
+
+        /** 表格区域按页缓存——[loadPageMedia] 复用同一份，不用重新跑一遍检测。 */
+        private val tableRegions: Map<Int, TableRegion> = pageScans.mapNotNull { (pageNo, scan) ->
+            val page = document.getPage(pageNo - 1)
+            val onPageSegments = scan.segments.filter {
+                isSegmentOnPage(it, page.mediaBox.width, page.mediaBox.height)
+            }
+            TableGridDetector.tableRegionOrNull(onPageSegments)?.let { pageNo to it }
+        }.toMap()
+
+        private val tablePageHeights: Map<Int, Float> = tableRegions.keys.associateWith {
+            document.getPage(it - 1).mediaBox.height
+        }
+
+        val paragraphs: List<String>
+        val paragraphPages: List<Int>
+        val paragraphTopY: List<Float>
+
+        /**
+         * 哪个展示块下标之后需要插入媒体占位符，值是需要在那个位置加载的页码列表
+         * （通常只有一个，见类注释"已知局限"一节旁的边界情况）——表格区域优先于
+         * 内嵌图片（一页两者只会算进一个，跟 [extractContent] 里"检测到表格区域的
+         * 页不再单独抽取内嵌图片"是同一个降级精神）。UI 层遍历这个表，在对应展示块
+         * 下标插入占位符，之后调 [loadPageMedia] 换成真内容。
+         */
+        val pendingMediaPageByAfterIndex: Map<Int, List<Int>>
+
+        init {
+            val stripper = LineCollectingStripper()
+            stripper.getText(document)
+            val nonTableLines = stripper.lines.filterNot { line ->
+                val region = tableRegions[line.page]
+                region != null && isWithinTableBand(line.y, region, tablePageHeights.getValue(line.page))
+            }
+            val rawParagraphs = linesToParagraphs(nonTableLines)
+            val footerNoiseIndices = RunningFooterFilter.noiseIndices(
+                rawParagraphs.map { PageTextLine(it.text, it.page) },
+            )
+            val filtered = rawParagraphs.filterIndexed { index, _ -> index !in footerNoiseIndices }
+            paragraphs = filtered.map { it.text }
+            paragraphPages = filtered.map { it.page }
+            paragraphTopY = filtered.map { it.topY }
+
+            val pending = mutableMapOf<Int, MutableList<Int>>()
+            for ((pageNo, scan) in pageScans) {
+                val region = tableRegions[pageNo]
+                val hasMedia = region != null || scan.hasImages
+                if (!hasMedia) continue
+                val afterIndex = if (region != null) {
+                    val regionTopYDirAdj = tablePageHeights.getValue(pageNo) - region.maxY
+                    ImagePlacement.afterParagraphIndexForRegion(
+                        paragraphPages,
+                        paragraphTopY,
+                        pageNo,
+                        regionTopYDirAdj,
+                    )
+                } else {
+                    ImagePlacement.afterParagraphIndex(paragraphPages, pageNo)
+                }
+                pending.getOrPut(afterIndex) { mutableListOf() }.add(pageNo)
+            }
+            pendingMediaPageByAfterIndex = pending
+        }
+
+        /**
+         * 真正做耗时工作的地方：解码出这一页表格区域（如果有）或内嵌图片的真实
+         * [Bitmap]——一页要么算进表格区域要么算内嵌图片，不会两者都有（见
+         * [pendingMediaPageByAfterIndex] 类注释）。每一页只应该被加载一次，调用方
+         * 负责这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
+         */
+        fun loadPageMedia(pageNo: Int): List<Bitmap> {
+            val region = tableRegions[pageNo]
+            if (region != null) {
+                val cropped = runCatching {
+                    val pageHeight = tablePageHeights.getValue(pageNo)
+                    val renderer = PDFRenderer(document)
+                    val fullPage = renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
+                    val crop = tableCropRect(region, pageHeight, TABLE_PAGE_RENDER_DPI, fullPage.width, fullPage.height)
+                    Bitmap.createBitmap(fullPage, crop.left, crop.top, crop.width(), crop.height())
+                }.getOrNull()
+                return listOfNotNull(cropped)
+            }
+            val page = document.getPage(pageNo - 1)
+            return runCatching {
+                val engine = PageContentStreamEngine(page, decodeImages = true)
+                engine.processPage(page)
+                engine.images
+            }.getOrDefault(emptyList())
+        }
+
+        override fun close() {
+            document.close()
+        }
+
+        companion object {
+            fun open(context: Context, file: File): Session {
+                PDFBoxResourceLoader.init(context.applicationContext ?: context)
+                return Session(PDDocument.load(file))
+            }
+        }
+    }
 }
 
 /**
