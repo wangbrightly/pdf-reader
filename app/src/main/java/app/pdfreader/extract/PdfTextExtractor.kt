@@ -247,6 +247,9 @@ object PdfTextExtractor {
      */
     private const val MAX_IMAGE_DIMENSION_PX = 2000
 
+    /** 见 [PageContentStreamEngine] 里 `segmentCollectionCapped` 的 KDoc。 */
+    private const val MAX_SEGMENTS_PER_PAGE = 20_000
+
     /**
      * 内嵌图片长边（`max(width, height)`）超过 [MAX_IMAGE_DIMENSION_PX] 判定为"过大"，
      * 每次减半算出理论上该降到多少——纯数学，见 [decodeJpegWithNativeSubsampling]
@@ -1000,19 +1003,42 @@ object PdfTextExtractor {
         var hasImages = false
             private set
         private val pendingSegments = mutableListOf<LineSegment>()
+
+        /**
+         * 2026-08-20 真机反馈修复：一份矢量图形极端密集的文档（地图/图表类扫描件）
+         * 真机测出能把 App 拖进持续 GC、最终 OutOfMemoryError 的地步——[segments]
+         * 是无上限增长的 `MutableList`，content stream 里每一条 `m`/`l`/`re` 都会
+         * 往里加，正常表格的网格线是几十条量级，但复杂矢量美术/地图内容单页能画出
+         * 几十万条路径，全部收集下来内存直接爆掉。真表格的网格线数量远低于这个
+         * 上限，加这条安全阀不会影响任何真实表格的检测结果，只会让"这页明显不是
+         * 表格、是复杂图形"的页提前放弃收集（那一页仍然正常抽取文字/图片，只是不
+         * 参与表格检测——跟本类一贯的"宁可漏检、不可拖垮 App"降级精神一致）。
+         */
+        private var segmentCollectionCapped = false
         private var currentX = 0f
         private var currentY = 0f
         private var subpathStartX = 0f
         private var subpathStartY = 0f
 
+        /** 见 [segmentCollectionCapped] KDoc——所有往 [pendingSegments] 加线段的地方都走这里。 */
+        private fun addPendingSegment(segment: LineSegment) {
+            if (segmentCollectionCapped) return
+            if (segments.size + pendingSegments.size >= MAX_SEGMENTS_PER_PAGE) {
+                segmentCollectionCapped = true
+                pendingSegments.clear()
+                return
+            }
+            pendingSegments.add(segment)
+        }
+
         override fun appendRectangle(p0: PointF, p1: PointF, p2: PointF, p3: PointF) {
             // `re` 操作符：矩形四条边直接进 pendingSegments，等对应的 stroke/fill
             // 操作符提交（表格边框在 Chromium 输出里常见的画法就是细长填充矩形，
             // 见 TableGridDetector 类注释）。
-            pendingSegments.add(LineSegment(p0.x, p0.y, p1.x, p1.y))
-            pendingSegments.add(LineSegment(p1.x, p1.y, p2.x, p2.y))
-            pendingSegments.add(LineSegment(p2.x, p2.y, p3.x, p3.y))
-            pendingSegments.add(LineSegment(p3.x, p3.y, p0.x, p0.y))
+            addPendingSegment(LineSegment(p0.x, p0.y, p1.x, p1.y))
+            addPendingSegment(LineSegment(p1.x, p1.y, p2.x, p2.y))
+            addPendingSegment(LineSegment(p2.x, p2.y, p3.x, p3.y))
+            addPendingSegment(LineSegment(p3.x, p3.y, p0.x, p0.y))
             currentX = p0.x
             currentY = p0.y
             subpathStartX = p0.x
@@ -1027,7 +1053,7 @@ object PdfTextExtractor {
         }
 
         override fun lineTo(x: Float, y: Float) {
-            pendingSegments.add(LineSegment(currentX, currentY, x, y))
+            addPendingSegment(LineSegment(currentX, currentY, x, y))
             currentX = x
             currentY = y
         }
@@ -1039,7 +1065,7 @@ object PdfTextExtractor {
         }
 
         override fun closePath() {
-            pendingSegments.add(LineSegment(currentX, currentY, subpathStartX, subpathStartY))
+            addPendingSegment(LineSegment(currentX, currentY, subpathStartX, subpathStartY))
             currentX = subpathStartX
             currentY = subpathStartY
         }
@@ -1125,6 +1151,14 @@ object PdfTextExtractor {
         private val tConstructStart = System.currentTimeMillis()
 
         val pageCount: Int = document.numberOfPages
+
+        init {
+            // 2026-08-20 真机诊断确认过一份 4232 页文档会在后面的阶段 OOM（NOTES.md
+            // #21）——这一步本身几乎不耗时，但打出页数很关键：只有这行出现、后面
+            // 没有任何阶段日志时，说明卡在了 PDDocument.load 本身（文件拷贝/PDF
+            // 结构解析），不是 Session 内部的哪个具体阶段，帮排查省一轮猜测。
+            android.util.Log.d("PdfReaderDebug", "Session 开始构造 页数=$pageCount")
+        }
 
         val outline: List<OutlineEntry> = runCatching { extractOutline(document) }.getOrDefault(emptyList())
 
