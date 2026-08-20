@@ -31,7 +31,12 @@ class ReaderSettingsPreferencesTest {
     @Test
     fun `保存后读出的设置和保存前一致（round trip）`() {
         val context = RuntimeEnvironment.getApplication()
-        val settings = ReaderSettings(fontSizeSp = 24, lineSpacingMultiplier = 1.5f, paddingDp = 20)
+        val settings = ReaderSettings(
+            fontSizeSp = 24,
+            lineSpacingMultiplier = 1.5f,
+            paddingDp = 20,
+            blockSpacingDp = 24,
+        )
 
         ReaderSettingsPreferences.save(context, settings)
         val loaded = ReaderSettingsPreferences.load(context)

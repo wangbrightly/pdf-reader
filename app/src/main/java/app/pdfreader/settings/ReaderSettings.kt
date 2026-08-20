@@ -1,16 +1,21 @@
 package app.pdfreader.settings
 
 /**
- * 阅读设置：字号（sp）、行距倍数、内边距（dp）。三者都通过 SeekBar 连续调节，
- * 改动即时生效（见 MainActivity），并经 [ReaderSettingsPreferences] 持久化。
+ * 阅读设置：字号（sp）、行距倍数、内边距（dp）、段距（dp）。四者都通过 SeekBar
+ * 连续调节，改动即时生效（见 MainActivity），并经 [ReaderSettingsPreferences] 持久化。
  *
- * 字号范围 12sp–32sp 是需求写死的（提示词原文）；行距倍数 1.0–2.0、边距 8dp–32dp
- * 是本增量按"够用、不离谱"给的合理区间，不是需求强制的数字。
+ * 字号范围 12sp–32sp 是需求写死的（提示词原文）；行距倍数 1.0–2.0、边距 8dp–32dp、
+ * 段距 0dp–32dp 是本增量按"够用、不离谱"给的合理区间，不是需求强制的数字。
+ *
+ * 2026-08-20：新增 [blockSpacingDp]——段落/图片之间、以及翻页时页与页之间的纵向
+ * 留白，原本是 [app.pdfreader.ui.PdfPageAdapter] 里写死的常量（12dp），真机反馈
+ * "段与段之间看不出间隙"后改成可调（用户明确要求"设置菜单里加一个段距拉杆"）。
  */
 data class ReaderSettings(
     val fontSizeSp: Int = DEFAULT_FONT_SIZE_SP,
     val lineSpacingMultiplier: Float = DEFAULT_LINE_SPACING_MULTIPLIER,
     val paddingDp: Int = DEFAULT_PADDING_DP,
+    val blockSpacingDp: Int = DEFAULT_BLOCK_SPACING_DP,
 ) {
     /**
      * 把可能越界的值收拢回合法区间。用于两个场景：
@@ -21,6 +26,7 @@ data class ReaderSettings(
         fontSizeSp = fontSizeSp.coerceIn(MIN_FONT_SIZE_SP, MAX_FONT_SIZE_SP),
         lineSpacingMultiplier = lineSpacingMultiplier.coerceIn(MIN_LINE_SPACING_MULTIPLIER, MAX_LINE_SPACING_MULTIPLIER),
         paddingDp = paddingDp.coerceIn(MIN_PADDING_DP, MAX_PADDING_DP),
+        blockSpacingDp = blockSpacingDp.coerceIn(MIN_BLOCK_SPACING_DP, MAX_BLOCK_SPACING_DP),
     )
 
     companion object {
@@ -35,5 +41,9 @@ data class ReaderSettings(
         const val MIN_PADDING_DP = 8
         const val MAX_PADDING_DP = 32
         const val DEFAULT_PADDING_DP = 16
+
+        const val MIN_BLOCK_SPACING_DP = 0
+        const val MAX_BLOCK_SPACING_DP = 32
+        const val DEFAULT_BLOCK_SPACING_DP = 12
     }
 }

@@ -94,4 +94,91 @@ class PdfTextExtractorTest {
 
         assertFalse("提取结果里出现了 U+FFFD 替换字符，说明命中了 CJK ToUnicode CMap 缺失的已知问题", fullText.contains('�'))
     }
+
+    /**
+     * 2026-08-20 真机 bug 回归测试——见 [PdfTextExtractor.mergeSameLineRuns] KDoc
+     * 完整背景：一页里如果有很多"同一条视觉行被 PDFBox 拆成多个零 gap 片段"（中英
+     * 文混排常见），[PdfTextExtractor.linesToParagraphs] 算出的中位数 gap 会被这些
+     * 零 gap 拖成 0，导致真实的段内换行全部被误判成"另起一段"。
+     *
+     * 构造的数据形状照抄真机日志：39 行里有一大堆同 y 值的零 gap 片段（模拟中英文
+     * 混排导致的字体切换），中间夹着几处真实的段内换行（gap≈31-43）——不合并同行
+     * 片段的话，中位数会落在 0，这几处真实换行会被错误地切成独立段落。
+     */
+    @Test
+    fun `同一视觉行被拆成多个零gap片段时不会把真实段内换行误判成分段`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("我来翻译一下，20", 452.83f, 1),
+            PdfTextExtractor.Line("年前贝索斯的亚马逊，年用", 452.83f, 1),
+            PdfTextExtractor.Line("150", 452.83f, 1),
+            PdfTextExtractor.Line("万，一个微信小程", 452.83f, 1),
+            PdfTextExtractor.Line("序可能都比它的用户数多。", 484.03f, 1),
+            PdfTextExtractor.Line("10", 484.03f, 1),
+            PdfTextExtractor.Line("亿人民币，搁在今天，就是", 484.03f, 1),
+            // 这里是真实的段内换行（gap≈31.2），不该被切开：
+            PdfTextExtractor.Line("但是那一年，贝索斯写道：", 589.66f, 1),
+            PdfTextExtractor.Line("为，一切都将围绕长期价值", 620.86f, 1),
+            PdfTextExtractor.Line("战略愿景不一样，战略耐心", 652.06f, 1),
+        )
+
+        val paragraphs = PdfTextExtractor.linesToParagraphs(lines)
+
+        assertTrue(
+            "真实的段内换行不该被拆开——期望\"贝索斯写道：\"和\"为，一切都……\"在同一段里",
+            paragraphs.any { it.text.contains("贝索斯写道：") && it.text.contains("为，一切都将围绕长期价值") },
+        )
+    }
+
+    /**
+     * [PdfTextExtractor.classifyHeadings] 的单元测试——用户明确选择的策略："字号
+     * 明显偏大 或 字体本身加粗，两个信号满足一个就算标题"（见该函数 KDoc）。
+     */
+    @Test
+    fun `字号明显大于本页中位数时判定为标题`() {
+        val paragraphs = listOf(
+            PdfTextExtractor.Paragraph("标题", page = 1, topY = 0f, fontSize = 24f, isBold = false),
+            PdfTextExtractor.Paragraph("正文一", page = 1, topY = 30f, fontSize = 12f, isBold = false),
+            PdfTextExtractor.Paragraph("正文二", page = 1, topY = 60f, fontSize = 12f, isBold = false),
+        )
+
+        val result = PdfTextExtractor.classifyHeadings(paragraphs)
+
+        assertEquals(listOf(true, false, false), result)
+    }
+
+    @Test
+    fun `字号跟正文差不多但标了加粗时也判定为标题`() {
+        val paragraphs = listOf(
+            PdfTextExtractor.Paragraph("加粗小标题", page = 1, topY = 0f, fontSize = 12f, isBold = true),
+            PdfTextExtractor.Paragraph("正文一", page = 1, topY = 30f, fontSize = 12f, isBold = false),
+            PdfTextExtractor.Paragraph("正文二", page = 1, topY = 60f, fontSize = 12f, isBold = false),
+        )
+
+        val result = PdfTextExtractor.classifyHeadings(paragraphs)
+
+        assertEquals(listOf(true, false, false), result)
+    }
+
+    @Test
+    fun `字号只是略大不到阈值倍数时不判定为标题`() {
+        val paragraphs = listOf(
+            // 12 * 1.15 = 13.8，13 没超过，不该判定为标题。
+            PdfTextExtractor.Paragraph("略大一点", page = 1, topY = 0f, fontSize = 13f, isBold = false),
+            PdfTextExtractor.Paragraph("正文一", page = 1, topY = 30f, fontSize = 12f, isBold = false),
+            PdfTextExtractor.Paragraph("正文二", page = 1, topY = 60f, fontSize = 12f, isBold = false),
+        )
+
+        val result = PdfTextExtractor.classifyHeadings(paragraphs)
+
+        assertEquals(listOf(false, false, false), result)
+    }
+
+    @Test
+    fun `只有一个段落时没有对比基准，只能靠加粗信号`() {
+        val bold = listOf(PdfTextExtractor.Paragraph("独占一页的加粗文字", page = 1, topY = 0f, fontSize = 12f, isBold = true))
+        val notBold = listOf(PdfTextExtractor.Paragraph("独占一页的普通文字", page = 1, topY = 0f, fontSize = 12f, isBold = false))
+
+        assertEquals(listOf(true), PdfTextExtractor.classifyHeadings(bold))
+        assertEquals(listOf(false), PdfTextExtractor.classifyHeadings(notBold))
+    }
 }

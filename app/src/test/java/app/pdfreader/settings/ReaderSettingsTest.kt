@@ -47,4 +47,10 @@ class ReaderSettingsTest {
         assertEquals(8, ReaderSettings(paddingDp = -10).coerced().paddingDp)
         assertEquals(32, ReaderSettings(paddingDp = 500).coerced().paddingDp)
     }
+
+    @Test
+    fun `段距越界时收拢到 0dp 到 32dp 之间`() {
+        assertEquals(0, ReaderSettings(blockSpacingDp = -10).coerced().blockSpacingDp)
+        assertEquals(32, ReaderSettings(blockSpacingDp = 500).coerced().blockSpacingDp)
+    }
 }

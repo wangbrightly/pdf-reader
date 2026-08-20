@@ -7,6 +7,7 @@
     <string name="font_size_label">字号：%1$dsp</string>
     <string name="line_spacing_label">行距：%1$.1f 倍</string>
     <string name="padding_label">边距：%1$ddp</string>
+    <string name="block_spacing_label">段距：%1$ddp</string>
     <!-- 2026-08-19 用户反馈"设置按钮只保留'设置'二字"——展开/收起两种状态原来分别是
          "收起设置"/"展开设置"，改成都只显示"设置"，不再用文案区分状态（按钮本身的
          点击行为不变，还是展开/收起 settingsPanel，只是不再靠文字提示当前状态）。 -->

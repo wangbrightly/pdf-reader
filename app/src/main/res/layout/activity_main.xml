@@ -142,6 +142,21 @@
             android:progress="16"
             android:thumb="@drawable/seekbar_thumb_large" />
 
+        <TextView
+            android:id="@+id/blockSpacingLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp" />
+
+        <SeekBar
+            android:id="@+id/blockSpacingSeekBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:min="0"
+            android:max="32"
+            android:progress="12"
+            android:thumb="@drawable/seekbar_thumb_large" />
+
     </LinearLayout>
 
     <ProgressBar
@@ -154,30 +169,25 @@
         android:visibility="gone" />
 
     <!--
-        contentContainer 取代了原来单个 TextView 的位置：图片浮动展示这个增量要求
-        "图片穿插在大致对应的文字段落之间"，单个 TextView 塞一整段纯文字做不到——
-        改成一个纵向 LinearLayout，按顺序动态塞"文字段落 TextView"和"图片 ImageView"
-        两种子 View（见 MainActivity.renderBlocks）。padding 从原来 contentText 上
-        移到这里，保持"内容离屏幕边缘有一圈留白"的视觉效果不变。
-        注意：MainActivity 的阅读进度滚动比例计算（computeScrollRatio /
-        restoreScrollRatioIfNeeded）依赖 contentScrollView.getChildAt(0) 拿到"内容区
-        总高度"，这两个方法本身不关心子 View 是 TextView 还是 LinearLayout，改动前后
-        行为兼容，不需要跟着改。
+        2026-08-20：contentScrollView（ScrollView 包 contentContainer LinearLayout）
+        换成 RecyclerView——文字/图片真正按需加载（RecyclerView 窗口式重构，见
+        /Users/mac/.claude/plans/fizzy-snuggling-cloud.md），条目粒度=页，只有屏幕
+        附近的页会真的创建 View/抽取内容，翻远的自动回收，这是根治超大文档
+        （NOTES.md #21，4232 页会 OutOfMemoryError）必需的基础设施，普通 ScrollView+
+        LinearLayout 做不到"翻远的内容自动释放"这件事。
+        LayoutManager（LinearLayoutManager，纵向）在 MainActivity.onCreate 里设置，
+        不在 XML 里写死——阅读进度（当前第几页）、目录跳转都要拿到这个 LayoutManager
+        的引用，放在代码里更方便复用同一个实例。
+        padding 从原来 contentContainer 移到这里，"边距"设置项现在直接改
+        recyclerView 自己的 padding。
     -->
-    <ScrollView
-        android:id="@+id/contentScrollView"
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recyclerView"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_marginTop="8dp"
-        android:layout_weight="1">
-
-        <LinearLayout
-            android:id="@+id/contentContainer"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:padding="16dp" />
-
-    </ScrollView>
+        android:layout_weight="1"
+        android:clipToPadding="false"
+        android:padding="16dp" />
 
 </LinearLayout>

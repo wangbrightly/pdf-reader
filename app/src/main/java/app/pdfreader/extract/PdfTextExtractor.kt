@@ -254,6 +254,9 @@ object PdfTextExtractor {
     /** 见 [Session.footerLearnedTitles] KDoc——页脚水印"标题类重复"检测的样本页数上限。 */
     private const val FOOTER_SAMPLE_PAGE_COUNT = 150
 
+    /** 见 [classifyHeadings] KDoc——字号超过本页中位数的这个倍数才算"明显偏大"。 */
+    private const val HEADING_FONT_SIZE_RATIO = 1.15f
+
     /**
      * 内嵌图片长边（`max(width, height)`）超过 [MAX_IMAGE_DIMENSION_PX] 判定为"过大"，
      * 每次减半算出理论上该降到多少——纯数学，见 [decodeJpegWithNativeSubsampling]
@@ -739,11 +742,75 @@ object PdfTextExtractor {
      * 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。
      * [topY] 是这个段落第一行的 [Line.y]（距页面顶部多少 pt），供目录页内精确定位用。
      */
-    private data class Paragraph(val text: String, val page: Int, val topY: Float)
+    /**
+     * 可见性 `internal` 不是 `private`：只为了让 [PdfTextExtractorTest] 能直接构造/
+     * 校验，不是对外公开 API。[fontSize]/[isBold]（2026-08-20 新增，给"标题加粗"用）
+     * 是这个段落里各行 [Line.fontSize]/[Line.isBold] 的汇总——[fontSize] 取段内最大
+     * 字号，[isBold] 只要段内有一行加粗就算（见 [linesToParagraphs] 汇总逻辑），跟
+     * "任一信号命中就算标题"是同一个宽松精神。
+     */
+    internal data class Paragraph(
+        val text: String,
+        val page: Int,
+        val topY: Float,
+        val fontSize: Float = 0f,
+        val isBold: Boolean = false,
+    )
 
-    private fun linesToParagraphs(lines: List<Line>): List<Paragraph> {
+    /**
+     * 把同一条视觉行内、因为字体/样式切换（中英文混排、数字用了不同字体等）被
+     * PDFBox 拆成多次 `writeString` 回调的 [Line] 合并成一条——这些 [Line] 共享
+     * （几乎）相同的 y 坐标，本来就是同一条视觉行的不同片段，不该被当成"另起一行"
+     * 参与后面 [linesToParagraphs] 的段落切分统计（"gap"）。
+     *
+     * 2026-08-20 真机 bug：一份中英文混排的文档，"贝索斯写道："这行后面紧跟一段
+     * 英文引用，PDFBox 把这整条视觉行拆成好几个 [Line]（中文片段/英文片段/中文
+     * 片段），相邻片段 y 坐标完全相同、gap=0。按需加载改造后 [linesToParagraphs]
+     * 变成按单页调用（以前是整份文档一次性调用），单页里这类"零 gap"片段一多，
+     * 中位数（`typicalGap`）很容易直接算出 0，导致切分阈值也是 0，最终整页里但凡
+     * 有一丁点 gap 的相邻行全部被误判成"另起一段"——真实文本"可以翻译"|"为，一切
+     * 都……"被拆成两个不相关的段落，就是这个原因（真机诊断日志实测确认过某页
+     * `typicalGap=0.0 threshold=0.0`，日志已经在定位完之后删掉，不是永久诊断）。
+     * 这个问题在改造前的"整份文档一次性调用"版本里几乎不会触发——那时候一份文档
+     * 里真实的行间 gap 数量级远超零 gap 片段的数量级，中位数落到 0 的概率很低；
+     * 按页调用后单页行数骤减，这个前提不再成立。
+     *
+     * 合并用跟 [appendLine] 一样的"CJK 边界不加空格、其余情况加空格"规则——语义上
+     * 这些片段本来就该拼成一段连续的视觉行文字，用同一套拼接规则合情合理。
+     */
+    internal fun mergeSameLineRuns(lines: List<Line>): List<Line> {
+        if (lines.size <= 1) return lines
+        val merged = mutableListOf<Line>()
+        var currentText = StringBuilder(lines[0].text)
+        var currentY = lines[0].y
+        var currentPage = lines[0].page
+        var currentFontSize = lines[0].fontSize
+        var currentBold = lines[0].isBold
+        for (i in 1 until lines.size) {
+            val sameLine = lines[i].page == currentPage && abs(lines[i].y - currentY) < 0.01f
+            if (sameLine) {
+                appendLine(currentText, lines[i].text)
+                currentFontSize = maxOf(currentFontSize, lines[i].fontSize)
+                currentBold = currentBold || lines[i].isBold
+            } else {
+                merged.add(Line(currentText.toString(), currentY, currentPage, currentFontSize, currentBold))
+                currentText = StringBuilder(lines[i].text)
+                currentY = lines[i].y
+                currentPage = lines[i].page
+                currentFontSize = lines[i].fontSize
+                currentBold = lines[i].isBold
+            }
+        }
+        merged.add(Line(currentText.toString(), currentY, currentPage, currentFontSize, currentBold))
+        return merged
+    }
+
+    internal fun linesToParagraphs(rawLines: List<Line>): List<Paragraph> {
+        val lines = mergeSameLineRuns(rawLines)
         if (lines.isEmpty()) return emptyList()
-        if (lines.size == 1) return listOf(Paragraph(lines[0].text, lines[0].page, lines[0].y))
+        if (lines.size == 1) {
+            return listOf(Paragraph(lines[0].text, lines[0].page, lines[0].y, lines[0].fontSize, lines[0].isBold))
+        }
 
         val gaps = (1 until lines.size).map { lines[it].y - lines[it - 1].y }
         val typicalGap = gaps.sorted()[gaps.size / 2]
@@ -752,9 +819,13 @@ object PdfTextExtractor {
         val texts = mutableListOf<StringBuilder>()
         val pages = mutableListOf<Int>()
         val topYs = mutableListOf<Float>()
+        val fontSizes = mutableListOf<Float>()
+        val bolds = mutableListOf<Boolean>()
         texts.add(StringBuilder(lines[0].text))
         pages.add(lines[0].page)
         topYs.add(lines[0].y)
+        fontSizes.add(lines[0].fontSize)
+        bolds.add(lines[0].isBold)
 
         for (i in 1 until lines.size) {
             val gap = lines[i].y - lines[i - 1].y
@@ -765,11 +836,37 @@ object PdfTextExtractor {
                 texts.add(StringBuilder(lines[i].text))
                 pages.add(lines[i].page)
                 topYs.add(lines[i].y)
+                fontSizes.add(lines[i].fontSize)
+                bolds.add(lines[i].isBold)
             } else {
                 appendLine(texts.last(), lines[i].text)
+                fontSizes[fontSizes.lastIndex] = maxOf(fontSizes.last(), lines[i].fontSize)
+                bolds[bolds.lastIndex] = bolds.last() || lines[i].isBold
             }
         }
-        return texts.indices.map { Paragraph(normalizeCjkSpacing(texts[it].toString()), pages[it], topYs[it]) }
+        return texts.indices.map {
+            Paragraph(normalizeCjkSpacing(texts[it].toString()), pages[it], topYs[it], fontSizes[it], bolds[it])
+        }
+    }
+
+    /**
+     * 判断本页每个段落是不是标题——用户明确选择的策略："字号明显比本页正文字号大"
+     * 或者"字体本身标了加粗"，两个信号满足一个就算标题（不是要求同时满足）。
+     *
+     * 字号基准用本页所有段落字号的中位数（不是平均数——极端值不会像平均数那样把
+     * 基准拖偏，比如一页里偶尔有一段特别大的标题，不该让"正文该多大"这个基准跟着
+     * 被拉高）；[HEADING_FONT_SIZE_RATIO] 定"明显偏大"的门槛。只有一个段落时没有
+     * 别的段落可比，基准就是它自己，字号信号必然不触发（`ratio` 恒为 1），这种情况
+     * 下只能靠加粗信号判断——是"没有对比基准"这个前提下的合理退化，不是遗漏。
+     */
+    internal fun classifyHeadings(paragraphs: List<Paragraph>): List<Boolean> {
+        if (paragraphs.isEmpty()) return emptyList()
+        val sortedSizes = paragraphs.map { it.fontSize }.filter { it > 0f }.sorted()
+        val baseline = if (sortedSizes.isNotEmpty()) sortedSizes[sortedSizes.size / 2] else 0f
+        return paragraphs.map { paragraph ->
+            val sizeSignal = baseline > 0f && paragraph.fontSize > baseline * HEADING_FONT_SIZE_RATIO
+            sizeSignal || paragraph.isBold
+        }
     }
 
     /**
@@ -941,8 +1038,25 @@ object PdfTextExtractor {
             code in 0xFF00..0xFFEF
     }
 
-    /** 内部用：一行文字 + 纵坐标 + 所在页码（页码从 1 起，来自 `getCurrentPageNo()`）。 */
-    private data class Line(val text: String, val y: Float, val page: Int)
+    /**
+     * 内部用：一行文字 + 纵坐标 + 所在页码（页码从 1 起，来自 `getCurrentPageNo()`）。
+     * 可见性 `internal` 不是 `private`：只为了让 [PdfTextExtractorTest] 能直接构造/
+     * 校验 [mergeSameLineRuns]/[linesToParagraphs]，不是对外公开 API。
+     *
+     * [fontSize]/[isBold]（2026-08-20 新增）：给"标题加粗"用——原文档里这行文字的
+     * 字号（取这一行内所有 `TextPosition` 的最大字号，见 [LineCollectingStripper
+     * .writeString]）和是否加粗（这一行内超过一半的 `TextPosition` 判定为加粗才算，
+     * 见 [isBoldTextPosition]，避免行内偶尔一两个字符加粗就把整行误判）。默认值 0f/
+     * false 只是给旧测试调用点（没传这两个参数）一个安全默认，不代表"没有字号信息"
+     * 有特殊含义。
+     */
+    internal data class Line(
+        val text: String,
+        val y: Float,
+        val page: Int,
+        val fontSize: Float = 0f,
+        val isBold: Boolean = false,
+    )
 
     private class LineCollectingStripper : PDFTextStripper() {
         val lines = mutableListOf<Line>()
@@ -963,8 +1077,27 @@ object PdfTextExtractor {
         override fun writeString(text: String, textPositions: MutableList<TextPosition>) {
             if (text.isBlank()) return
             val y = textPositions.firstOrNull()?.yDirAdj ?: return
-            lines.add(Line(fixRadicalVariants(text), y, currentPageNo))
+            val fontSize = textPositions.maxOfOrNull { it.fontSizeInPt } ?: 0f
+            val boldCount = textPositions.count { isBoldTextPosition(it) }
+            val isBold = textPositions.isNotEmpty() && boldCount * 2 > textPositions.size
+            lines.add(Line(fixRadicalVariants(text), y, currentPageNo, fontSize, isBold))
         }
+    }
+
+    /**
+     * 单个字符是否判定为加粗——两个来源都查，见字节码反编译确认过的 PDFBox-Android
+     * API（`PDFontDescriptor.isForceBold()`/`getFontName()`）：
+     * 1. 字体描述符里的 `ForceBold` 标志——语义上最准确，但很多字体压根没设置这个
+     *    标志位（哪怕视觉上明显是粗体），不能只靠它。
+     * 2. 字体名包含"Bold"（不分大小写）——常见字体命名惯例（`Arial-BoldMT`、
+     *    `SimHei-Bold` 之类），作为标志位缺失时的兜底信号。
+     * 两者任一为真就判定这个字符是加粗——跟"标题判断"整体的"任一信号命中就算"是
+     * 同一个宽松精神（用户在标题判断这一层明确选过这个策略）。
+     */
+    private fun isBoldTextPosition(textPosition: TextPosition): Boolean {
+        val descriptor = textPosition.font?.fontDescriptor ?: return false
+        if (descriptor.isForceBold) return true
+        return descriptor.fontName?.contains("Bold", ignoreCase = true) == true
     }
 
     /**
@@ -1115,70 +1248,45 @@ object PdfTextExtractor {
     }
 
     /**
-     * 一页的展示内容——[Session.loadPage] 的返回值，见该方法 KDoc"文字/图片真正按需
-     * 加载"一节完整背景。[blocks] 只会是 [DisplayBlock.Text]/[DisplayBlock.Image]
-     * 这两种（不会是 [DisplayBlock.Placeholder]——"这一页还没加载出来"这件事由调用方
-     * 自己决定要不要显示占位符，不是 [loadPage] 的返回值该表达的状态），按页内顺序
-     * 排列（段落/图片穿插，复用 [ImagePlacement] 定位逻辑，跟 [extractContent] 里
-     * 同一套摆放规则）。
+     * 一页的展示内容——[Session.loadPage] 的返回值，见该方法 KDoc 完整背景。
+     * [blocks] 按页内顺序排列（段落/图片穿插，复用 [ImagePlacement] 定位逻辑，跟
+     * [extractContent] 里同一套摆放规则）。
      */
     data class PageContent(val blocks: List<DisplayBlock>)
 
     /**
-     * 按需加载版本的抽取入口——2026-08-19 增量。用户反馈打开速度明显慢于 WPS，真机
-     * 日志确认耗时大头集中在图片解码/表格区域渲染，文字抽取本身一直很快（见
-     * [extractContent] 历次改动记录的耗时日志）。
+     * 文字/图片真正按需加载的抽取入口——2026-08-20 架构性重写（前身是 2026-08-19
+     * 那版"文字一次性抽完、图片按需加载"的 `Session`，见 commit 历史）。
      *
-     * 跟 [extractContent] 的区别：[extractContent] 一次性做完所有耗时工作（文字+
-     * 表格检测+全部图片解码）才返回一份完整的 [PdfContent]；[Session] 打开后立刻
-     * 可以读到文字（[paragraphs]/[paragraphPages]/[paragraphTopY]，跟 [PdfContent]
-     * 同名字段语义一致）和"哪些展示位置需要加载图片/表格区域"
-     * （[pendingMediaPageByAfterIndex]），但图片/表格区域本身的 [Bitmap] 解码推迟到
-     * 调用方主动调 [loadPageMedia] 才做——调用方（UI 层）可以先把文字全部显示出来，
-     * 图片/表格区域先放占位符，再按页（比如从当前可见页开始）后台调
-     * [loadPageMedia]，加载完再把占位符换成真实内容。
+     * ## 背景：为什么"文字也要按需加载"
      *
-     * ## 重新扫描而不是缓存解码句柄
+     * 真机反馈一份 4232 页的文档打开会 `OutOfMemoryError`（NOTES.md #21）——上一版
+     * `Session` 虽然图片已经是按需加载，但文字仍然是打开时一次性全部抽完（当时的
+     * 理由是"文字抽取本身很快"，对几百页的文档确实成立，但对几千页的文档，累加
+     * 起来的时间和内存都撑不住）。完整方案见
+     * `/Users/mac/.claude/plans/fizzy-snuggling-cloud.md`（RecyclerView 窗口式
+     * 重构，条目粒度 = PDF 页，只有屏幕附近的页会真的调 [loadPage]，见
+     * [app.pdfreader.ui.PdfPageAdapter]）。
      *
-     * [loadPageMedia] 被调用时会重新跑一遍那一页的 [PageContentStreamEngine]（这次
-     * `decodeImages=true`），而不是复用构造时 [pageScans]（那次 `decodeImages=false`，
-     * 图片部分没有真的解码，没有句柄可复用）。重新扫一遍一页的 content stream（不含
-     * 图片解码本身）开销只有几毫秒量级（真机日志佐证：258 页文档在图片全部解码失败
-     * 快速跳过的极端情况下，"扫描页面"总耗时不到 2 秒，摊到每页只有几毫秒）——比起
-     * "让图片解码句柄跨页面处理保持有效"这种要求对 PdfBox-Android 内部实现做更强
-     * 假设、没有把握是否支持的设计，重新扫一遍更简单可靠，多付的这点开销可以接受。
+     * 跟 [extractContent] 的区别：[extractContent] 一次性做完全文档的文字+表格
+     * 检测+图片解码；`Session` 打开只做两件便宜的事——读 [pageCount]（几乎不耗时）
+     * 和 [outline]（遍历一次大纲树，通常很小），[footerLearnedTitles] 顶多扫描
+     * 前 [FOOTER_SAMPLE_PAGE_COUNT] 页（有上限，不随文档总页数增长）。具体每一页
+     * 的文字/表格检测/图片解码全部推迟到调用方主动调 [loadPage] 才做。
      *
      * ## 已知局限：表格区域的文字排除不等真的渲染成功就先做了
      *
      * [extractContent] 排除表格区域内的文字行之前，会先真的把该区域渲染出来，只有
-     * 渲染成功才排除对应文字，渲染失败就退回正常文字抽取（见 [extractContent] 里
-     * `renderedTableRegions` 那一步）——这是因为 [extractContent] 反正要把所有页都
-     * 渲染一遍，"先渲染再决定要不要排除文字"不多花代价。[Session] 做不到这一点：
-     * 即时可用阶段的核心意义就是不去渲染任何图片/表格区域，所以只能仅凭表格区域的
-     * 几何范围（不实际渲染）就决定排除哪些文字。真机测试中没有观察到表格区域渲染
-     * 失败的案例（这台设备上失败率是 0），如果确实发生（内存不足等极端情况），
-     * [loadPageMedia] 对应位置会解码失败、占位符停在"加载中"状态，而不是像
-     * [extractContent] 那样退回显示原文字——这是一个刻意接受的、比 [extractContent]
-     * 更差一点的边界情况处理，真机没有实际测到过这个边界情况被触发。
+     * 渲染成功才排除对应文字，渲染失败就退回正常文字抽取——这是因为 [extractContent]
+     * 反正要把所有页都渲染一遍，"先渲染再决定要不要排除文字"不多花代价。[loadPage]
+     * 做不到这一点：只处理一页，仅凭这一页表格区域的几何范围（不实际渲染）就决定
+     * 排除哪些文字。真机测试中没有观察到表格区域渲染失败的案例（这台设备上失败率
+     * 是 0），如果确实发生（内存不足等极端情况），这一页的表格图片会解码失败（见
+     * [loadPage] 内部 `cropped` 那个 `runCatching`），而不是像 [extractContent]
+     * 那样退回显示原文字——这是一个刻意接受的、比 [extractContent] 更差一点的边界
+     * 情况处理，真机没有实际测到过这个边界情况被触发。
      *
-     * ## 2026-08-20 增量：文字/图片真正按需加载——[loadPage] 是新的核心入口
-     *
-     * 真机反馈一份 4232 页的文档打开会 `OutOfMemoryError`（NOTES.md #21）——根因不是
-     * 单页内容复杂，是"一次性抽完全部页面的文字"（[paragraphs]/[paragraphPages]/
-     * [paragraphTopY] 这套字段，[init] 块里一次性算好）这个模式，遇到几千页量级的
-     * 文档时内存和时间都撑不住。完整方案见 `/Users/mac/.claude/plans/fizzy-snuggling-cloud.md`
-     * （RecyclerView 窗口式重构，条目粒度 = 页，[MainActivity] 只在真正翻到某一页时
-     * 才调 [loadPage]）。
-     *
-     * [loadPage] 是分步实施的第 2 步：新增的按页加载入口，跟旧的
-     * [paragraphs]/[pendingMediaPageByAfterIndex]/[loadPageMedia] 这套"一次性抽完
-     * 全部"的字段暂时并存——[MainActivity] 还没有切换到 `RecyclerView`（第 3 步）
-     * 之前继续依赖旧字段，所以这一步不删除、不修改它们，只新增。等第 3 步
-     * `MainActivity` 改造完、不再依赖旧字段后，[init] 块里"一次性扫描全部页面"这部分
-     * 才能真正删除——**这一步本身还不能修好 4232 页 OOM 的问题**，`Session` 构造时
-     * 仍然会做全文档扫描，[loadPage] 只是新加的、还没被真正用起来的能力。
-     *
-     * ### 页脚水印检测的改造：全文档已知 -> 样本学习
+     * ## 页脚水印检测：全文档已知 -> 样本学习
      *
      * 旧的 [RunningFooterFilter.noiseIndices] 判断"标题类重复"水印需要看到跨页的
      * 重复率，按需加载后不再有"全文档所有行"可用。[footerLearnedTitles]
@@ -1188,125 +1296,9 @@ object PdfTextExtractor {
      * [RunningFooterFilter] 类注释"样本学习 + 按页应用"一节的完整设计理由和已知局限。
      */
     class Session private constructor(private val document: PDDocument) : java.io.Closeable {
-        private val tConstructStart = System.currentTimeMillis()
-
         val pageCount: Int = document.numberOfPages
 
-        init {
-            // 2026-08-20 真机诊断确认过一份 4232 页文档会在后面的阶段 OOM（NOTES.md
-            // #21）——这一步本身几乎不耗时，但打出页数很关键：只有这行出现、后面
-            // 没有任何阶段日志时，说明卡在了 PDDocument.load 本身（文件拷贝/PDF
-            // 结构解析），不是 Session 内部的哪个具体阶段，帮排查省一轮猜测。
-            android.util.Log.d("PdfReaderDebug", "Session 开始构造 页数=$pageCount")
-        }
-
         val outline: List<OutlineEntry> = runCatching { extractOutline(document) }.getOrDefault(emptyList())
-
-        private val pageScans: Map<Int, PageScan> = scanPages(document, decodeImages = false)
-
-        private val tAfterScan = System.currentTimeMillis()
-
-        /** 表格区域按页缓存——[loadPageMedia] 复用同一份，不用重新跑一遍检测。 */
-        private val tableRegions: Map<Int, TableRegion> = pageScans.mapNotNull { (pageNo, scan) ->
-            val page = document.getPage(pageNo - 1)
-            val onPageSegments = scan.segments.filter {
-                isSegmentOnPage(it, page.mediaBox.width, page.mediaBox.height)
-            }
-            TableGridDetector.tableRegionOrNull(onPageSegments)?.let { pageNo to it }
-        }.toMap()
-
-        private val tAfterTableRegions = System.currentTimeMillis()
-
-        private val tablePageHeights: Map<Int, Float> = tableRegions.keys.associateWith {
-            document.getPage(it - 1).mediaBox.height
-        }
-
-        val paragraphs: List<String>
-        val paragraphPages: List<Int>
-        val paragraphTopY: List<Float>
-
-        /**
-         * 哪个展示块下标之后需要插入媒体占位符，值是需要在那个位置加载的页码列表
-         * （通常只有一个，见类注释"已知局限"一节旁的边界情况）——表格区域优先于
-         * 内嵌图片（一页两者只会算进一个，跟 [extractContent] 里"检测到表格区域的
-         * 页不再单独抽取内嵌图片"是同一个降级精神）。UI 层遍历这个表，在对应展示块
-         * 下标插入占位符，之后调 [loadPageMedia] 换成真内容。
-         */
-        val pendingMediaPageByAfterIndex: Map<Int, List<Int>>
-
-        init {
-            val stripper = LineCollectingStripper()
-            stripper.getText(document)
-            val t1 = System.currentTimeMillis()
-            val nonTableLines = stripper.lines.filterNot { line ->
-                val region = tableRegions[line.page]
-                region != null && isWithinTableBand(line.y, region, tablePageHeights.getValue(line.page))
-            }
-            val rawParagraphs = linesToParagraphs(nonTableLines)
-            val footerNoiseIndices = RunningFooterFilter.noiseIndices(
-                rawParagraphs.map { PageTextLine(it.text, it.page) },
-            )
-            val filtered = rawParagraphs.filterIndexed { index, _ -> index !in footerNoiseIndices }
-            paragraphs = filtered.map { it.text }
-            paragraphPages = filtered.map { it.page }
-            paragraphTopY = filtered.map { it.topY }
-
-            val pending = mutableMapOf<Int, MutableList<Int>>()
-            for ((pageNo, scan) in pageScans) {
-                val region = tableRegions[pageNo]
-                val hasMedia = region != null || scan.hasImages
-                if (!hasMedia) continue
-                val afterIndex = if (region != null) {
-                    val regionTopYDirAdj = tablePageHeights.getValue(pageNo) - region.maxY
-                    ImagePlacement.afterParagraphIndexForRegion(
-                        paragraphPages,
-                        paragraphTopY,
-                        pageNo,
-                        regionTopYDirAdj,
-                    )
-                } else {
-                    ImagePlacement.afterParagraphIndex(paragraphPages, pageNo)
-                }
-                pending.getOrPut(afterIndex) { mutableListOf() }.add(pageNo)
-            }
-            pendingMediaPageByAfterIndex = pending
-            val t2 = System.currentTimeMillis()
-            android.util.Log.d(
-                "PdfReaderDebug",
-                "Session.init 页数=$pageCount 疑似表格页=${tableRegions.size} " +
-                    "扫描页面(不解码图片)=${tAfterScan - tConstructStart}ms " +
-                    "表格区域检测=${tAfterTableRegions - tAfterScan}ms " +
-                    "抽取文字(PDFTextStripper)=${t1 - tAfterTableRegions}ms " +
-                    "段落切分+页脚过滤+占位符定位=${t2 - t1}ms " +
-                    "总计=${t2 - tConstructStart}ms 待加载位置数=${pending.size}",
-            )
-        }
-
-        /**
-         * 真正做耗时工作的地方：解码出这一页表格区域（如果有）或内嵌图片的真实
-         * [Bitmap]——一页要么算进表格区域要么算内嵌图片，不会两者都有（见
-         * [pendingMediaPageByAfterIndex] 类注释）。每一页只应该被加载一次，调用方
-         * 负责这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
-         */
-        fun loadPageMedia(pageNo: Int): List<Bitmap> {
-            val region = tableRegions[pageNo]
-            if (region != null) {
-                val cropped = runCatching {
-                    val pageHeight = tablePageHeights.getValue(pageNo)
-                    val renderer = PDFRenderer(document)
-                    val fullPage = renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
-                    val crop = tableCropRect(region, pageHeight, TABLE_PAGE_RENDER_DPI, fullPage.width, fullPage.height)
-                    Bitmap.createBitmap(fullPage, crop.left, crop.top, crop.width(), crop.height())
-                }.getOrNull()
-                return listOfNotNull(cropped)
-            }
-            val page = document.getPage(pageNo - 1)
-            return runCatching {
-                val engine = PageContentStreamEngine(page, decodeImages = true)
-                engine.processPage(page)
-                ImageStripStitcher.stitchIfTiled(engine.images)
-            }.getOrDefault(emptyList())
-        }
 
         /**
          * 见类注释"页脚水印检测的改造"一节：只在样本范围内（前 [FOOTER_SAMPLE_PAGE_COUNT]
@@ -1331,15 +1323,18 @@ object PdfTextExtractor {
          * [pageNo] 这一页：抽这一页的文字、测这一页有没有表格区域、按需解码这一页的
          * 图片，返回值已经是可以直接渲染的 [PageContent]（不需要调用方再拼装）。
          *
-         * 跟 [loadPageMedia] 一样"重新扫描而不是缓存解码句柄"（见该方法 KDoc 完整
-         * 理由）——[loadPage] 内部按需再调一次 [PageContentStreamEngine]（先
-         * `decodeImages=false` 判断有没有表格/内嵌图片，是内嵌图片的话再
-         * `decodeImages=true` 重新扫一遍拿真正的 [Bitmap]），这一页的开销跟
-         * [loadPageMedia] 是同一个量级（几十毫秒），不会因为"按页调用"就变慢。
+         * "重新扫描而不是缓存解码句柄"——每次调用都重新对这一页跑一遍
+         * [PageContentStreamEngine]（先 `decodeImages=false` 判断有没有表格/内嵌
+         * 图片，是内嵌图片的话再 `decodeImages=true` 重新扫一遍拿真正的
+         * [Bitmap]），不缓存解码句柄跨调用复用——单页 content stream 的解析开销是
+         * 几十毫秒量级，重新扫一遍比"让解码句柄跨页面处理保持有效"这种要求对
+         * PdfBox-Android 内部实现做更强假设、没有把握是否支持的设计更简单可靠。
          *
-         * 表格区域优先于内嵌图片（跟 [pendingMediaPageByAfterIndex] 类注释、
-         * [extractContent] 是同一个降级精神）：检测到表格区域就不再抽取这一页的
-         * 内嵌图片（假设都已经包含在裁剪出来的表格图片里）。
+         * 表格区域优先于内嵌图片：检测到表格区域就不再抽取这一页的内嵌图片（假设
+         * 都已经包含在裁剪出来的表格图片里），跟 [extractContent] 是同一个降级精神。
+         *
+         * 每一页只应该被调用一次，调用方（[app.pdfreader.ui.PdfPageAdapter]）负责
+         * 这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
          */
         fun loadPage(pageNo: Int): PageContent {
             val page = document.getPage(pageNo - 1)
@@ -1368,7 +1363,12 @@ object PdfTextExtractor {
                 rawParagraphs.map { PageTextLine(it.text, it.page) },
                 footerLearnedTitles,
             )
+            // 标题判断要在噪音过滤之前、按整页段落算基准（见 classifyHeadings KDoc
+            // "字号基准"一节）——过滤掉页脚噪音之后段落数变少，基准会不稳定；用
+            // filterIndexed 配同一组下标保证两边（文字/是否标题）一一对应。
+            val headingFlags = classifyHeadings(rawParagraphs)
             val filtered = rawParagraphs.filterIndexed { index, _ -> index !in noiseIndices }
+            val filteredHeadingFlags = headingFlags.filterIndexed { index, _ -> index !in noiseIndices }
 
             val blocks = mutableListOf<DisplayBlock>()
             if (tableRegion != null) {
@@ -1387,11 +1387,13 @@ object PdfTextExtractor {
                 )
                 if (afterIndex == -1) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
                 filtered.forEachIndexed { index, paragraph ->
-                    blocks.add(DisplayBlock.Text(paragraph.text))
+                    blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
                     if (index == afterIndex) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
                 }
             } else {
-                filtered.forEach { blocks.add(DisplayBlock.Text(it.text)) }
+                filtered.forEachIndexed { index, paragraph ->
+                    blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
+                }
                 if (hasImages) {
                     // 图片插在这一页最后一个段落之后——跟 extractContent/旧 Session 的
                     // "同页图片统一插在该页最后一个段落之后（按页归类）"是同一条约定，

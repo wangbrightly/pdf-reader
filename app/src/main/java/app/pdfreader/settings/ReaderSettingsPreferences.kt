@@ -16,6 +16,7 @@ object ReaderSettingsPreferences {
     private const val KEY_FONT_SIZE_SP = "font_size_sp"
     private const val KEY_LINE_SPACING_MULTIPLIER = "line_spacing_multiplier"
     private const val KEY_PADDING_DP = "padding_dp"
+    private const val KEY_BLOCK_SPACING_DP = "block_spacing_dp"
 
     fun load(context: Context): ReaderSettings {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -26,6 +27,7 @@ object ReaderSettingsPreferences {
                 ReaderSettings.DEFAULT_LINE_SPACING_MULTIPLIER,
             ),
             paddingDp = prefs.getInt(KEY_PADDING_DP, ReaderSettings.DEFAULT_PADDING_DP),
+            blockSpacingDp = prefs.getInt(KEY_BLOCK_SPACING_DP, ReaderSettings.DEFAULT_BLOCK_SPACING_DP),
         ).coerced()
     }
 
@@ -36,6 +38,7 @@ object ReaderSettingsPreferences {
             .putInt(KEY_FONT_SIZE_SP, coerced.fontSizeSp)
             .putFloat(KEY_LINE_SPACING_MULTIPLIER, coerced.lineSpacingMultiplier)
             .putInt(KEY_PADDING_DP, coerced.paddingDp)
+            .putInt(KEY_BLOCK_SPACING_DP, coerced.blockSpacingDp)
             .apply()
     }
 }

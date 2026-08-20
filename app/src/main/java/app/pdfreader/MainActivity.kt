@@ -2,6 +2,7 @@ package app.pdfreader
 
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.util.TypedValue
@@ -12,7 +13,6 @@ import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -22,25 +22,26 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.os.BundleCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import app.pdfreader.extract.OutlineEntry
 import app.pdfreader.extract.PdfTextExtractor
 import app.pdfreader.progress.ReadingProgressKey
 import app.pdfreader.progress.ReadingProgressStore
 import app.pdfreader.settings.ReaderSettings
 import app.pdfreader.settings.ReaderSettingsPreferences
-import app.pdfreader.ui.DisplayBlock
 import app.pdfreader.ui.IntentUriResolver
-import app.pdfreader.ui.OutlineNavigation
 import app.pdfreader.ui.PdfLoadReducer
 import app.pdfreader.ui.PdfLoadState
+import app.pdfreader.ui.PdfPageAdapter
 import java.io.File
 import java.io.FileNotFoundException
 import kotlin.concurrent.thread
 
 /**
  * 唯一的界面：一个"打开 PDF"按钮 + 字号/行距/边距三个 SeekBar + 进度条 + 可滚动内容区，
- * 串起"选文件 → 抽取（[PdfTextExtractor]）→ 显示"这条链路，并支持阅读设置连续调节、
- * 即时生效、重启后保持，图片穿插在文字段落之间浮动展示。
+ * 串起"选文件 → 打开（[PdfTextExtractor.Session]）→ 按页展示"这条链路，并支持阅读
+ * 设置连续调节、即时生效、重启后保持，图片穿插在文字段落之间浮动展示。
  *
  * 两个入口都会走到同一个 [loadPdf]：
  * 1. 点按钮 → [openDocumentLauncher]（Storage Access Framework 文件选择器）。
@@ -48,144 +49,114 @@ import kotlin.concurrent.thread
  *    ACTION_VIEW intent-filter 启动本 Activity，[IntentUriResolver] 从 onCreate 收到的
  *    Intent 里解析出 Uri。
  *
- * 抽取在后台线程跑（可能要几秒），结果统一通过 [PdfLoadReducer] 转成 [PdfLoadState]
- * 再回主线程渲染——任何异常（文件不是有效 PDF、密码保护等）都会被 [PdfLoadReducer]
- * 兜成 [PdfLoadState.Error]，只弹 Toast，不会让 App 崩溃闪退。
+ * 打开在后台线程跑，结果统一通过 [PdfLoadReducer] 转成 [PdfLoadState] 再回主线程
+ * 渲染——任何异常（文件不是有效 PDF、密码保护等）都会被 [PdfLoadReducer] 兜成
+ * [PdfLoadState.Error]，只弹 Toast，不会让 App 崩溃闪退。
+ *
+ * ## 2026-08-20：文字/图片真正按需加载（RecyclerView 窗口式重构）
+ *
+ * 真机反馈一份 4232 页的文档打开会 `OutOfMemoryError`（NOTES.md #21）——根因是
+ * 旧架构"一次性抽完全部页面的文字、渲染成全部 TextView 塞进一个普通
+ * `LinearLayout`"，遇到几千页量级的文档内存和时间都撑不住。完整方案见
+ * `/Users/mac/.claude/plans/fizzy-snuggling-cloud.md`：条目粒度 = PDF 页，
+ * `recyclerView`（[R.id.recyclerView]，`LinearLayoutManager` 纵向）配合
+ * [PdfPageAdapter]，只有屏幕附近的页会真的调 [PdfTextExtractor.Session.loadPage]
+ * 抽取内容、创建 View，翻远的自动回收（[PdfPageAdapter] 有自己的有界缓存）。
+ *
+ * [loadPdf] 打开 [PdfTextExtractor.Session] 后立刻知道 [PdfTextExtractor.Session
+ * .pageCount]（不需要等任何抽取步骤），`render` 据此设置 `recyclerView.adapter`，
+ * 具体每一页的内容由 [PdfPageAdapter] 按需加载。[currentSession] 在整个阅读期间
+ * 保持打开，换文件/Activity 销毁时才关闭（[onDestroy]）。
  *
  * ## 换行交给 TextView 原生排版，不再自己算（2026-08-18 架构性修正）
  *
- * 这个项目从最早的 TDD 增量起，"重排"一直是自己写的 `app.pdfreader.reflow.reflow`
- * 算法：拿屏幕宽度、字体宽度估算出"每行能放几个字符"，手动插 `\n`。一路修了好几轮
- * 真机反馈的显示问题（等宽字体空格视觉偏宽、英文按中文宽度算预算腰斩、单字符测量
- * 样本不代表性、空格该用更窄的权重……），每一轮都是在把"自己的估算"往真实值上硬
- * 凑，直到真机反馈"右侧仍有空隙、还出现单个字母独占一行"，才想清楚：这些问题的
- * 共同根源是"估算"这件事本身——TextView 自带的排版引擎（StaticLayout）本来就会用
- * 真实字体在真实像素宽度上精确断行，不需要我们猜。[PdfTextExtractor.linesToParagraphs]
- * 早就把原始 PDF 里的断行拼接成了连续文字，"重排"真正要做的事到抽取这一步已经做完，
- * 剩下"按屏幕宽度换行"这一步完全可以交给 TextView 自己——不管中文（Android 对 CJK
- * 的断行规则本来就支持逐字断行，比我们自己的 tokenizer 更懂"标点不能开头"这类规则）
- * 还是英文（按单词边界断行是 TextView 的默认行为），都不需要我们插手。
- *
+ * "重排"曾经是自己写的字符宽度估算算法，几轮真机反馈的显示问题（等宽字体空格视觉
+ * 偏宽、单字符测量样本不代表性……）逼着想清楚：这些问题的共同根源是"估算"这件事
+ * 本身——TextView 自带的排版引擎（StaticLayout）本来就会用真实字体在真实像素宽度
+ * 上精确断行，不需要猜。[PdfTextExtractor.linesToParagraphs] 早就把原始 PDF 里的
+ * 断行拼接成了连续文字，"按屏幕宽度换行"这一步完全可以交给 TextView 自己。
  * `reflow`/`LineWidthEstimator` 本身的算法没有错（各自的单元测试还在，继续保留作为
- * "给定固定宽度的纯逻辑断行"这个能力，以后如果有需要精确控制断行位置的场景还用得
- * 上），只是不再是"决定屏幕上文字怎么换行"这件事的负责人，[buildDisplayBlocks] 现在
- * 直接把抽取出的段落原文交给 TextView。
+ * "给定固定宽度的纯逻辑断行"这个能力），只是不再是"决定屏幕上文字怎么换行"这件事
+ * 的负责人，[createParagraphTextView] 直接把段落原文交给 TextView。
  *
- * ## 图片浮动展示（2026-08-18 增量）：展示层从单个 TextView 换成 LinearLayout 容器
+ * ## 字号/边距调节：改 View 属性即可，不需要重新抽取，也不需要"重排/重建"
  *
- * SELECTION.md 第 4 节兜底方案要求"图片降级为独立浮动展示……按大致所处的段落位置，
- * 插入到对应段落之间"。单个 TextView 塞一整段纯文字做不到"文字里穿插图片"，所以
- * [contentContainer]（`activity_main.xml` 里的纵向 LinearLayout）取代了原来的单个
- * `contentText` TextView：[renderBlocks] 按 [PdfLoadState.Success.blocks] 顺序，
- * 给每个 [DisplayBlock.Text] 建一个 TextView、每个 [DisplayBlock.Image] 建一个支持
- * 双指缩放的 ImageView（[enablePinchZoom]），依次 addView 进容器。
- *
- * [buildDisplayBlocks] 是"文字段落 + 图片"合并成有序展示块列表的地方：图片该插在哪个
- * 段落之后，由 [ExtractedImage.afterParagraphIndex] 决定（计算逻辑在
- * [app.pdfreader.extract.ImagePlacement]，纯逻辑、有独立单元测试）。
- *
- * ## 按需加载（2026-08-19 增量）：文字立即显示，图片/表格区域后台按页补上
- *
- * 用户反馈打开速度明显慢于 WPS，真机日志确认耗时大头集中在图片解码/表格区域渲染，
- * 文字抽取本身一直很快——完整背景和取舍见 [PdfTextExtractor.Session] 类 KDoc。
- * [loadPdf] 打开 [PdfTextExtractor.Session] 后立刻能拿到全部文字，[render] 把文字
- * 整个显示出来，图片/表格区域先摆占位符（[DisplayBlock.Placeholder]），显示完之后
- * 调 [loadPendingMediaInBackground] 顺序把每一页的图片/表格区域加载出来，加载完
- * 一个就把对应占位符换成真图片（[replaceMediaPlaceholder]）。[currentSession] 在
- * 整个阅读期间保持打开（跟 [PdfTextExtractor.extractContent] 那版"一次性读完就关闭
- * 文件"不同），换文件/Activity 销毁时才关闭（[onDestroy]）。
- *
- * ## 字号/边距调节：改 View 属性即可，不需要重新抽取，也不用手动重排
- *
- * 字号/边距变化不需要重新抽取：[loadPdf] 成功后把 [PdfTextExtractor.Session] 缓存在
- * [currentSession] 里，字号变化只是改 TextView 的 `setTextSize`、边距变化只是改
- * [contentContainer] 的 padding——两者都会让 Android 自动重新排版（见上一节），不需要
- * 我们手动重建。[reflowCurrentParagraphs] 目前仍保留用于边距变化时重建 [DisplayBlock]
- * 列表 + 按比例还原滚动位置这条已测试过的路径，但它本身已经不再依赖任何宽度估算。
+ * 字号/边距变化不需要重新抽取，也不再需要整体重建（RecyclerView 化之前
+ * `reflowCurrentParagraphs` 会重建整个展示块列表，现在不需要了）：
+ * [forEachVisibleParagraphTextView] 遍历当前贴在屏幕上的 `ViewHolder`，直接改
+ * `setTextSize`/`setLineSpacing` 做即时预览；边距变化直接改 `recyclerView` 自己的
+ * padding。两者都会让 Android 自动重新排版（同上一节），不需要我们手动重建。还没
+ * 绑定/已经被回收的条目不用管——[PdfPageAdapter.onBindViewHolder] 每次绑定都会用
+ * [currentSettings] 当前的值创建新 View（见 [createParagraphTextView]/
+ * [createImageView] 读取 [currentSettings] 的方式），下次滚动到时自然是新设置。
  *
  * ## 拖动防抖：拖动中只改外观预览
  *
- * [SeekBar.OnSeekBarChangeListener.onProgressChanged] 在拖动过程中会高频触发（每移动
- * 一点像素就回调一次）。拖动过程中只做轻量的外观预览：遍历 [contentContainer] 里
- * 现有的 TextView 子 View 直接调 `setTextSize`/`setLineSpacing`（[forEachParagraphTextView]），
- * 或者直接改 [contentContainer] 的 padding——这些都是 View 系统内部的度量+重绘，本身
- * 有节流，不会卡，且 Android 会自动据此重新排版，拖动过程本身就是实时正确的预览，
- * 不是"假装改了、松手才是真的"。
+ * [SeekBar.OnSeekBarChangeListener.onProgressChanged] 在拖动过程中会高频触发。拖动
+ * 过程中只做轻量的外观预览：遍历当前可见的 TextView 直接调
+ * `setTextSize`/`setLineSpacing`，或者直接改 `recyclerView` 的 padding——这些都是
+ * View 系统内部的度量+重绘，本身有节流，不会卡，且 Android 会自动据此重新排版，
+ * 拖动过程本身就是实时正确的预览。
  *
- * ## 阅读进度：记比例、存取抽成独立类、onPause 存 / 内容渲染完后恢复
+ * ## 阅读进度：记页码，存取抽成独立类，onPause 存 / 内容渲染完后恢复
  *
  * "记住每个文件的阅读进度"拆成三件事，纯存取逻辑（[ReadingProgressKey] 算文件标识、
- * [ReadingProgressStore] 存取滚动比例）都不依赖 Activity，可以脱离 UI 单测；这里只是
+ * [ReadingProgressStore] 存取页码）都不依赖 Activity，可以脱离 UI 单测；这里只是
  * 接线：
  *
- * 1. **存的时机**：[onPause]（不是 [onStop]——`onPause` 保证在 Activity 可能被系统
- *    回收前调用，是 Android 官方推荐的"落盘不可丢数据"的时机点，`onStop` 在极端场景
- *    下可能被跳过）。另外 [loadPdf] 打开新文件前也会先存一次——"打开另一份 PDF"
- *    对上一份文件来说也是"离开"，不等到整个 Activity 暂停才存。
- * 2. **恢复的时机**：[render] 处理 [PdfLoadState.Success] 时，内容已经渲染进
- *    [contentContainer]，但布局（测量出容器的实际高度）是异步的，滚动目标要
- *    等布局完成才算得出来，所以用 `contentScrollView.post { ... }` 把恢复动作排到
- *    下一次布局之后执行，而不是设完内容立刻滚动（那时候高度还是上一次的旧值）。
- * 3. **边距变化重建后的位置还原**：[reflowCurrentParagraphs] 触发重建前，先把
- *    "当前显示位置对应的滚动比例"存进 [pendingScrollRatio]，重建完成后按同一个比例
- *    恢复——不是精确到像素/行的还原，是"大致还在全文的同一个位置"这个粒度，足够用
- *    且实现简单。
- *
- * [computeScrollRatio]/[restoreScrollRatioIfNeeded] 两个方法都是通过
- * `contentScrollView.getChildAt(0)` 泛泛地拿"内容区总高度"，不关心这个子 View 具体是
- * TextView 还是 LinearLayout。
+ * 1. **存的时机**：[onPause]（不是 `onStop`——`onPause` 保证在 Activity 可能被系统
+ *    回收前调用）。另外 [loadPdf] 打开新文件前也会先存一次——"打开另一份 PDF"对
+ *    上一份文件来说也是"离开"，不用等到 onPause 才存。
+ * 2. **记的是什么**：2026-08-20 从"滚动比例"改成"页码"（`LinearLayoutManager
+ *    .findFirstVisibleItemPosition() + 1`）——RecyclerView 化之后"内容总高度"这个
+ *    概念不存在了（内容不再一次性全部渲染），页码是天然可用、且比"0-1 浮点比例"
+ *    更符合直觉的进度单位，见 [ReadingProgressStore] 类 KDoc。
+ * 3. **恢复的时机**：[render] 处理 [PdfLoadState.Success] 时调
+ *    `recyclerView.scrollToPosition`——`RecyclerView` 天然支持"滚动到还没绑定过的
+ *    位置"（绑定会在滚动到位后自动触发），不需要像旧模型那样"先把中间内容全部
+ *    加载一遍"才能跳转。
  *
  * ## 目录（2026-08-18 增量）：读 PDF 自带的大纲结构，没有就禁用按钮，不瞎猜
  *
  * PDF 格式本身有标准的大纲（Outline/书签）结构，抽取逻辑在
  * [app.pdfreader.extract.PdfTextExtractor]（该类 KDoc"大纲/目录抽取"一节有 API 细节）
- * ——这里只是接线：[currentSession] 打开时已经带上了 [PdfTextExtractor.Session.outline]，
- * 不需要重新抽取。
+ * ——这里只是接线：[currentSession] 打开时已经带上了 [PdfTextExtractor.Session.outline]。
  *
- * **没有大纲时禁用 [tocButton]，而不是隐藏或点击后弹提示**：
- * 1. 禁用（变灰但位置不变）比隐藏更好——按钮始终在同一个位置，不会因为换了一份
- *    文档就让旁边的"打开 PDF"/"收起设置"跟着跳动位置，布局更稳定，用户也不用去
- *    猜"这个功能是不是消失了"。
- * 2. 禁用比"点击后弹 Toast 提示"更好——按钮本身的禁用态（变灰、点不动）已经是
- *    Android 的标准视觉语言，能提前说明"这份文档没有目录"，不需要用户先点一下、
- *    再看到提示才知道，少一次无意义的交互。
+ * **没有大纲时禁用 [tocButton]，而不是隐藏或点击后弹提示**：禁用（变灰但位置不变）
+ * 比隐藏更好——按钮始终在同一个位置，不会因为换了一份文档就让旁边的按钮跟着跳动
+ * 位置；禁用态本身就是标准视觉语言，不需要用户先点一下才知道"没有目录"。
  *
- * 每次 [render] 处理 [PdfLoadState.Success]/[PdfLoadState.Loading]/[PdfLoadState.Error]
- * 都会同步一次 [tocButton] 的启用状态（[syncTocButtonEnabled]），依据是
- * [currentSession]?.[PdfTextExtractor.Session.outline] 是否非空——这样字号/边距变化
- * 触发的 [reflowCurrentParagraphs] 重建（[currentSession] 不变，大纲当然也不变）不会
- * 误把按钮状态改错。
+ * **点击目录项怎么定位**：2026-08-20 简化——目录项给的是"第几页"，直接
+ * `recyclerView.scrollToPosition(targetPage - 1)`，不再像旧版
+ * （`OutlineNavigation`）那样换算"页内精确 Y 坐标对应第几个展示块"。**已知的取舍
+ * （如实记录）**：这样跳转的精度从"页内某个具体段落"退化成"页顶"，一页内容多、
+ * 目录项指向页面中间靠后的位置时，跳转落点会比旧版更靠上一些——RecyclerView 模型
+ * 下要恢复页内精确定位需要在条目绑定完成后再做一次二次滚动微调，这次先用更简单的
+ * 页级跳转，微调留给以后有需要再做。
  *
- * **点击目录项怎么定位到滚动位置**：目录项给的是"第几页"，需要换算成"应该滚动到
- * [contentContainer] 里第几个子 View"——这个页码→展示块下标的纯逻辑在
- * [OutlineNavigation]（该类 KDoc 有完整推导），[scrollToOutlineEntry] 算出目标下标后，
- * 用 `contentContainer.getChildAt(index)` 拿到目标 View，读它的 [View.getTop] 传给
- * [ScrollView.smoothScrollTo]——选 `smoothScrollTo` 而不是瞬间跳转，是因为实现复杂度
- * 完全一样（都是"算出目标 Y 坐标再滚动"，唯一区别是 `smoothScrollTo` 内部自带动画），
- * 但平滑滚动能让用户感知到"页面往哪个方向跳了多远"，瞬间跳转容易让人一下子迷失在
- * 陌生的位置，体验明显更好，值得选。
+ * **用 `scrollToPosition`，不是 `smoothScrollToPosition`**（2026-08-20 真机踩坑后
+ * 改）：`smoothScrollToPosition` 会带动画地"滚过"起点到终点之间的每一页——从第 1
+ * 页跳到第 500 页会真的连续滚屏经过中间全部页，不止观感上不是"跳转"更像"翻书"，
+ * 滚过的每一页还会触发 [PdfPageAdapter] 的按需加载和缓存淘汰，短时间内密集触发，
+ * 真机上复现过一次因此引发的崩溃（见 `PdfPageAdapter.cache` 字段注释）。
+ * `scrollToPosition` 是无动画的直接跳转，只绑定目标位置附近真正可见的条目，不会
+ * 经过中间页，这才是"点目录立刻跳到那一页"该有的行为。
  *
  * ## 配置变化（转屏等）重建后恢复文档（2026-08-19 增量，code review 发现的缺口）
  *
- * `MainActivity` 没有 `android:configChanges`，配置变化（转屏、系统字体大小变化等）
- * 会触发完整的 Activity 销毁重建——如果什么都不做，[currentSession] 这些实例字段
- * 全部清零，用户正在读的书直接消失，回到"还没打开任何文档"的初始画面。
- *
- * 不选择"整份文档内容塞进 [onSaveInstanceState] 的 `Bundle`"这个方案——`Bundle`
- * 走的是进程内 Binder 传输，有大小限制（典型上限约 1MB），一本书的文字+图片很容易
- * 超标，而且图片的 `Bitmap` 本来就不适合塞进 `Bundle`（[currentSession] 内部持有的
- * `PDDocument` 就更不用说了，压根不是可序列化的东西）。改成只存一样东西：
- * [currentUri]（当前文档的来源 `Uri`，`Uri` 本身是 `Parcelable`，几乎
- * 不占空间）。重建后的 `onCreate` 读到这个 `Uri` 就直接调 [loadPdf] 重新走一遍抽取
- * ——效果上等价于"自动帮用户重新打开刚才那份文件"，会比真正的状态保留慢（要重新
- * 解析 PDF），但实现简单、不依赖 `Bundle` 大小限制，而且滚动位置不需要另外处理：
- * [onPause] 在 Activity 销毁前已经把阅读进度存过一次（见类注释"阅读进度"一节），
- * 重新 [loadPdf] 走的是和"手动重新打开这份文件"完全相同的路径，会自动读回那次存的
- * 进度，不需要专门为"配置变化重建"这条路径写一遍恢复逻辑。
+ * `MainActivity` 没有 `android:configChanges`，配置变化会触发完整的 Activity 销毁
+ * 重建——不选择"整份文档内容塞进 `onSaveInstanceState` 的 `Bundle`"这个方案
+ * （`Bundle` 走进程内 Binder 传输，有大小限制，图片的 `Bitmap`/[PdfTextExtractor
+ * .Session] 内部持有的 `PDDocument` 也都不适合塞进 `Bundle`）。改成只存
+ * [currentUri]（`Uri` 本身是 `Parcelable`，几乎不占空间），重建后的 `onCreate`
+ * 读到就直接调 [loadPdf] 重新走一遍——效果上等价于"自动帮用户重新打开刚才那份
+ * 文件"，滚动位置不需要另外处理（[onPause] 已经存过一次阅读进度，重新 [loadPdf]
+ * 会自动读回）。
  *
  * 用 `savedInstanceState != null` 判断"这是重建，不是真正冷启动"，只在重建时才用
- * 恢复出来的 `Uri`；真正冷启动时优先看有没有"用……打开"分享过来的 PDF（[IntentUriResolver]）
- * ——两条路径不会冲突，同一次 `onCreate` 最多只会触发一次 [loadPdf]。
+ * 恢复出来的 `Uri`；真正冷启动时优先看有没有"用……打开"分享过来的 PDF
+ * （[IntentUriResolver]）——两条路径不会冲突，同一次 `onCreate` 最多只会触发一次
+ * [loadPdf]。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -194,8 +165,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var toggleSettingsButton: Button
     private lateinit var settingsPanel: View
     private lateinit var progressBar: ProgressBar
-    private lateinit var contentContainer: LinearLayout
-    private lateinit var contentScrollView: ScrollView
+    private lateinit var recyclerView: RecyclerView
+    private lateinit var layoutManager: LinearLayoutManager
 
     private lateinit var fontSizeLabel: TextView
     private lateinit var fontSizeSeekBar: SeekBar
@@ -203,51 +174,35 @@ class MainActivity : AppCompatActivity() {
     private lateinit var lineSpacingSeekBar: SeekBar
     private lateinit var paddingLabel: TextView
     private lateinit var paddingSeekBar: SeekBar
+    private lateinit var blockSpacingLabel: TextView
+    private lateinit var blockSpacingSeekBar: SeekBar
 
     /** 当前生效的阅读设置，onCreate 时从 [ReaderSettingsPreferences] 读，改动即时写回。 */
     private var currentSettings: ReaderSettings = ReaderSettings()
 
     /**
-     * 当前打开的文档——按需加载版本，见 [PdfTextExtractor.Session] 类注释。文字
-     * 立即可读，图片/表格区域按需通过 [PdfTextExtractor.Session.loadPageMedia]
-     * 后台加载，见类注释"按需加载"一节。
+     * 当前打开的文档——[PdfTextExtractor.Session.loadPage] 按页加载，见类注释
+     * "文字/图片真正按需加载"一节。
      */
     private var currentSession: PdfTextExtractor.Session? = null
 
     /**
      * [currentSession] 对应的临时缓存文件（[copyToCacheFile] 拷贝出来的）。
-     * [PdfTextExtractor.Session] 在整个阅读期间都要能继续从这份文件读取页面内容
-     * （[PdfTextExtractor.Session.loadPageMedia] 是按需调用的，不是打开时就读完），
-     * 不能像 [PdfTextExtractor.extractContent] 那版那样一读完就删——只有在
-     * [currentSession] 关闭之后（换文件/Activity 销毁）才能安全删除。
+     * [PdfTextExtractor.Session] 在整个阅读期间都要能继续从这份文件读取页面内容，
+     * 不能一读完就删——只有在 [currentSession] 关闭之后（换文件/Activity 销毁）
+     * 才能安全删除。
      */
     private var currentCacheFile: File? = null
 
     /**
-     * 已经加载完的图片/表格区域，key 是页码（2026-08-19 从"展示块下标"改成"页码"，
-     * 见 [loadPendingMediaInBackground] 类注释），value 是这一页解码出来的全部
-     * [Bitmap]（可能是空列表，表示这一页的媒体全部解码失败）。不在这个表里的页码
-     * 表示还在加载中，[buildDisplayBlocks] 据此决定摆占位符还是真图片。这份状态跨
-     * [reflowCurrentParagraphs] 保留（字号/边距变化不应该让已经加载好的图片又变回
-     * 占位符），只在 [loadPdf] 打开新文档时清空。
-     */
-    private val resolvedMedia = mutableMapOf<Int, List<Bitmap>>()
-
-    /**
      * 每次调用 [loadPdf] 就 +1，后台加载线程用它判断"这份结果是不是还对应当前正在
-     * 显示的文档"——用户中途又换了一份文件时，上一份文档还没跑完的后台加载不应该
-     * 继续更新画面（那些占位符/[contentContainer] 早就不是当前文档的了）。
+     * 显示的文档"——用户中途又换了一份文件时，上一份文档还没打开完的后台工作不应该
+     * 继续更新画面。
      */
     private var loadGeneration = 0
 
     /**
-     * [renderBlocks] 渲染出的占位符 View，key 是它对应的页码——后台图片加载完成后
-     * 靠这个表找到该替换哪个 View，见 [replaceMediaPlaceholder]。
-     */
-    private val placeholderViewsByPage = mutableMapOf<Int, View>()
-
-    /**
-     * 当前正在显示/加载的文档来源——[loadPdf] 一开始就设置，不等抽取成功。配置变化
+     * 当前正在显示/加载的文档来源——[loadPdf] 一开始就设置，不等打开成功。配置变化
      * 重建时靠这个字段恢复文档，见类注释"配置变化重建后恢复文档"一节。
      */
     private var currentUri: Uri? = null
@@ -256,11 +211,11 @@ class MainActivity : AppCompatActivity() {
     private var currentFileKey: String? = null
 
     /**
-     * 内容渲染完成后要恢复到的滚动比例。[loadPdf] 里从 [ReadingProgressStore] 读出来，
-     * [reflowCurrentParagraphs] 里则是重排前临时记下的"当前位置"，见类注释"阅读进度"一节。
-     * 消费一次（在 [restoreScrollRatioIfNeeded] 里）就清空，避免下一次渲染误用旧值。
+     * 内容渲染完成后要滚动到的页码（1-based）。[loadPdf] 里从 [ReadingProgressStore]
+     * 读出来，见类注释"阅读进度"一节。消费一次（在 [restoreScrollPositionIfNeeded]
+     * 里）就清空，避免下一次渲染误用旧值。
      */
-    private var pendingScrollRatio: Float? = null
+    private var pendingScrollPage: Int? = null
 
     private val openDocumentLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -277,14 +232,17 @@ class MainActivity : AppCompatActivity() {
         toggleSettingsButton = findViewById(R.id.toggleSettingsButton)
         settingsPanel = findViewById(R.id.settingsPanel)
         progressBar = findViewById(R.id.progressBar)
-        contentContainer = findViewById(R.id.contentContainer)
-        contentScrollView = findViewById(R.id.contentScrollView)
+        recyclerView = findViewById(R.id.recyclerView)
+        layoutManager = LinearLayoutManager(this)
+        recyclerView.layoutManager = layoutManager
         fontSizeLabel = findViewById(R.id.fontSizeLabel)
         fontSizeSeekBar = findViewById(R.id.fontSizeSeekBar)
         lineSpacingLabel = findViewById(R.id.lineSpacingLabel)
         lineSpacingSeekBar = findViewById(R.id.lineSpacingSeekBar)
         paddingLabel = findViewById(R.id.paddingLabel)
         paddingSeekBar = findViewById(R.id.paddingSeekBar)
+        blockSpacingLabel = findViewById(R.id.blockSpacingLabel)
+        blockSpacingSeekBar = findViewById(R.id.blockSpacingSeekBar)
 
         currentSettings = ReaderSettingsPreferences.load(applicationContext)
         applySettingsToView(currentSettings)
@@ -296,18 +254,9 @@ class MainActivity : AppCompatActivity() {
         }
         tocButton.setOnClickListener { showOutlineDialog() }
         toggleSettingsButton.setOnClickListener { toggleSettingsPanel() }
-        // 用户反馈"设置菜单默认不展开"——冷启动、还没打开任何 PDF 时也应该是收起状态，
-        // 不只是"加载成功后自动收起"（那是 render() 里已有的逻辑，只覆盖"打开文档"这
-        // 个时机）。直接复用 collapseSettingsPanel，不在 XML 里另外维护一套初始状态，
-        // 避免两处"折叠态"定义不同步。
-        //
-        // 只在 savedInstanceState == null（真正的冷启动，不是横竖屏切换等配置变化
-        // 触发的 Activity 重建）时收起——2026-08-19 code review 发现的问题：这行
-        // 一开始没加判断，导致用户读到一半展开设置调字号、转一下屏幕（或任何触发
-        // 重建的配置变化），设置面板会被强制收起，跟当时正在做的事对不上。
-        // savedInstanceState 在配置变化重建时框架会自动给一个非空 Bundle（哪怕本
-        // Activity 没有覆写 onSaveInstanceState 主动存任何东西），可以用它可靠区分
-        // "真的是第一次启动"和"只是重建"。
+        // 用户反馈"设置菜单默认不展开"——冷启动、还没打开任何 PDF 时也应该是收起状态。
+        // 只在 savedInstanceState == null（真正的冷启动，不是配置变化触发的重建）时
+        // 收起，配置变化重建时不该打断用户当时正在做的事（比如正展开着调字号）。
         if (savedInstanceState == null) collapseSettingsPanel()
 
         // 配置变化重建：优先恢复重建前正在看的文档，见类注释"配置变化重建后恢复
@@ -335,11 +284,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * [currentSession] 持有一个打开的 PDDocument（[PdfTextExtractor.Session] 类注释
-     * "按需加载"一节——按需加载要求文档在整个阅读期间保持可读，不能像
-     * [PdfTextExtractor.extractContent] 那版一次性读完就关闭文件），Activity 销毁时
-     * （不管是真正退出还是配置变化重建，见类注释"配置变化重建后恢复文档"一节）都要
-     * 主动关掉，不然这个 PDDocument/临时缓存文件会一直占着不释放。
+     * [currentSession] 持有一个打开的 `PDDocument`，阅读期间要一直保持可读
+     * （[PdfTextExtractor.Session.loadPage] 是按需调用的，不是打开时就读完），
+     * Activity 销毁时（不管是真正退出还是配置变化重建）都要主动关掉，不然这个
+     * `PDDocument`/临时缓存文件会一直占着不释放。
      */
     override fun onDestroy() {
         super.onDestroy()
@@ -348,21 +296,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 2026-08-19 改成按需加载——见 [PdfTextExtractor.Session] 类注释完整背景（用户
-     * 反馈打开速度明显慢于 WPS，真机日志确认耗时大头集中在图片解码/表格区域渲染，
-     * 文字抽取本身一直很快）。跟改动前的区别：`Session` 打开阶段（这一步本身还是在
-     * 后台线程做，因为解析 PDF 结构本身也要花一点时间，但比以前"连图片一起解码完"
-     * 快很多）就能拿到全部文字，[render] 立刻把文字整个显示出来，图片/表格区域先摆
-     * 占位符（[buildDisplayBlocks] 遇到 [PdfTextExtractor.Session
-     * .pendingMediaPageByAfterIndex] 里还没加载好的位置就摆一个），显示完之后再调
-     * [loadPendingMediaInBackground] 顺序把每一页的图片/表格区域加载出来，加载完
-     * 一个就把对应占位符换成真图片，不需要用户等全部图片都处理完才能开始读。
+     * 见类注释"文字/图片真正按需加载"一节。打开 [PdfTextExtractor.Session] 只需要
+     * 知道 [PdfTextExtractor.Session.pageCount]（几乎不耗时，不需要抽取任何一页的
+     * 具体内容），[render] 据此设置 `recyclerView.adapter`，剩下的按页加载由
+     * [PdfPageAdapter] 负责。
      */
     private fun loadPdf(uri: Uri) {
         currentUri = uri
         // 打开新文件前，先把当前正在显示的文件（如果有）的阅读进度存一次——"打开
         // 另一份 PDF"对上一份文件来说也是"离开"，不用等到 onPause 才存。必须在
-        // render(Loading) 清空内容区之前算，不然滚动位置已经被重置成 0。
+        // render(Loading) 清空内容区之前算，不然当前页码已经没法读了。
         saveCurrentReadingProgress()
         render(PdfLoadState.Loading)
 
@@ -371,8 +314,8 @@ class MainActivity : AppCompatActivity() {
         val previousCacheFile = currentCacheFile
         currentSession = null
         currentCacheFile = null
-        resolvedMedia.clear()
 
+        val tStart = System.currentTimeMillis()
         thread {
             // 关掉上一份文档（如果有）——放在后台线程，close()/删除临时文件都可能有
             // I/O，不该占用主线程。
@@ -381,224 +324,43 @@ class MainActivity : AppCompatActivity() {
 
             val openResult = runCatching {
                 val file = copyToCacheFile(uri)
+                val tAfterCopy = System.currentTimeMillis()
                 val session = PdfTextExtractor.Session.open(applicationContext, file)
+                android.util.Log.d(
+                    "PdfReaderDebug",
+                    "loadPdf 拷贝文件=${tAfterCopy - tStart}ms " +
+                        "Session.open=${System.currentTimeMillis() - tAfterCopy}ms",
+                )
                 session to file
             }
 
             if (myGeneration != loadGeneration) {
                 // 加载这份文档的过程中用户又换了文件——这份结果已经过时，直接关掉
-                // 不用，不渲染（避免把已经不是当前文档的内容显示出来）。
+                // 不用，不渲染。
                 openResult.getOrNull()?.let { (session, file) -> session.close(); file.delete() }
                 return@thread
             }
 
-            val blocksResult = openResult.map { (session, file) ->
+            val pageCountResult = openResult.map { (session, file) ->
                 currentSession = session
                 currentCacheFile = file
-                // 2026-08-20 改成哈希文件字节而不是抽取出的段落——见 ReadingProgressKey
-                // 类 KDoc 完整背景（按需加载上线后"打开文档"这一步不再有"全部段落"）。
                 val fileKey = ReadingProgressKey.fromFile(file)
                 currentFileKey = fileKey
-                // 过渡写法（按需加载改造第 1 步，先只换存取的数据类型，真正按页跟踪
-                // 阅读位置要等 RecyclerView 化那一步——见 fizzy-snuggling-cloud 计划
-                // 第 3/4 步）：暂时仍按"页码/总页数≈滚动比例"这个近似换算桥接旧的
-                // 滚动比例机制，页数越多这个近似越粗略，下一步会被替换成
-                // LinearLayoutManager.findFirstVisibleItemPosition() 的精确页码。
                 val savedPage = ReadingProgressStore.loadPage(applicationContext, fileKey)
-                pendingScrollRatio = if (savedPage != null && session.pageCount > 0) {
-                    ((savedPage - 1).toFloat() / session.pageCount).coerceIn(0f, 1f)
-                } else {
-                    0f
-                }
-                buildDisplayBlocks(session)
+                pendingScrollPage = (savedPage ?: 1).coerceIn(1, session.pageCount)
+                session.pageCount
             }
-            val state = PdfLoadReducer.fromResult(blocksResult)
+            val state = PdfLoadReducer.fromResult(pageCountResult)
             runOnUiThread {
                 render(state)
-                // 只在"打开一份新文件"这条路径自动收起设置面板，给内容腾屏幕——
-                // reflowCurrentParagraphs()（用户正在调字号/边距时触发的重排）不走
-                // 这里，不然用户刚碰一下滑条面板就被收起，体验上会打架。
+                android.util.Log.d(
+                    "PdfReaderDebug",
+                    "loadPdf render(Success) 总耗时=${System.currentTimeMillis() - tStart}ms",
+                )
+                // 只在"打开一份新文件"这条路径自动收起设置面板，给内容腾屏幕。
                 if (state is PdfLoadState.Success) collapseSettingsPanel()
             }
-            if (state is PdfLoadState.Success) {
-                loadPendingMediaInBackground(myGeneration)
-            }
         }
-    }
-
-    /**
-     * 顺序（不并发——`PDDocument` 不是为并发访问设计的）把每一页待加载的图片/表格
-     * 区域加载出来，每加载完一页就在主线程把这一页对应的占位符换成真图片
-     * （[replaceMediaPlaceholder]）。已经在后台线程里跑（调用方 [loadPdf] 本身就在
-     * 后台线程里调用这个函数），不需要再开一个新线程。
-     *
-     * ## 为什么按页而不是按插入位置（afterParagraphIndex）分组处理
-     *
-     * 2026-08-19 真机诊断发现的 bug：一本 258 页、以图版为主的书（[PdfTextExtractor
-     * .Session.pendingMediaPageByAfterIndex] 打印出来只有 1 个 key，value 是全部 258
-     * 个页码——这几百页图片之间大段没有可提取的文字段落做"锚点"，全部落在同一个
-     * `afterParagraphIndex` 下）。改动前这里是按 `(afterIndex, pageNumbers)` 分组，
-     * 一组内部用 `flatMap` 把这一组全部页码的图片一次性加载完才更新一次 UI——这本书
-     * 因此变成"等 258 页图片全部解码完（真机实测 20.4 秒）才第一次更新画面"，跟"文字
-     * 秒开、图片逐步加载"这个设计目标完全对不上，用户反馈"这一版感觉上并没有提速"
-     * 正是这个 bug。
-     *
-     * 修复：直接展开成"页码"这个更细的粒度顺序处理，不管这一页的插入位置是否跟别的
-     * 页共享同一个 `afterParagraphIndex`，加载完这一页就立刻更新一次 UI。页码在一份
-     * 文档内天然唯一，[replaceMediaPlaceholder]/[resolvedMedia]/[DisplayBlock
-     * .Placeholder] 都同步改成按页码索引，不再按 `afterParagraphIndex` 索引。
-     *
-     * [generation] 是这次加载对应的 [loadGeneration] 快照——每加载完一页就检查一次
-     * 是否还等于当前的 [loadGeneration]，不等于说明用户中途换了文件，直接停止，不再
-     * 继续处理、也不再更新画面（那些占位符/[contentContainer] 早就不是当前文档的了）。
-     */
-    private fun loadPendingMediaInBackground(generation: Int) {
-        val session = currentSession ?: return
-        val overallStart = System.currentTimeMillis()
-        val allPages = session.pendingMediaPageByAfterIndex.values.flatten()
-        var loadedPages = 0
-        for (pageNo in allPages) {
-            if (generation != loadGeneration) return
-            val bitmaps = session.loadPageMedia(pageNo)
-            if (generation != loadGeneration) return
-            resolvedMedia[pageNo] = bitmaps
-            loadedPages++
-            runOnUiThread {
-                if (generation == loadGeneration) replaceMediaPlaceholder(pageNo, bitmaps)
-            }
-        }
-        android.util.Log.d(
-            "PdfReaderDebug",
-            "loadPendingMediaInBackground 完成 页数=$loadedPages " +
-                "总耗时=${System.currentTimeMillis() - overallStart}ms",
-        )
-    }
-
-    /**
-     * 把页码 [pageNo] 对应的占位符 View 换成 [bitmaps] 对应的真实图片（可能是多张，
-     * 比如同一页有好几张内嵌图片；也可能是空列表，表示这一页的媒体全部解码失败，
-     * 占位符直接消失、不留空白）。
-     *
-     * 保持跟 [renderBlocks] 一致的间距处理：占位符如果是 [contentContainer] 里的
-     * 第一个 View（前面没有任何内容），替换出来的第一张图片也不该有顶部间距；同一
-     * 位置的后续图片之间要有间距，跟其它相邻展示块之间的间距处理一致。
-     */
-    private fun replaceMediaPlaceholder(pageNo: Int, bitmaps: List<Bitmap>) {
-        val placeholder = placeholderViewsByPage.remove(pageNo) ?: return
-        val insertIndex = contentContainer.indexOfChild(placeholder)
-        if (insertIndex < 0) return
-        val isFirstOverall = insertIndex == 0
-        contentContainer.removeViewAt(insertIndex)
-        bitmaps.forEachIndexed { offset, bitmap ->
-            val imageView = createImageView(bitmap)
-            if (offset > 0 || !isFirstOverall) {
-                val params = imageView.layoutParams as LinearLayout.LayoutParams
-                params.topMargin = dpToPx(BLOCK_SPACING_DP)
-                imageView.layoutParams = params
-            }
-            contentContainer.addView(imageView, insertIndex + offset)
-        }
-    }
-
-    /**
-     * 边距变化（松手那一刻）触发：不重新抽取 PDF、不重新解码图片，用已缓存的段落重建
-     * 一遍 [buildDisplayBlocks]，见类注释"核心逻辑"一节。
-     *
-     * 2026-08-18 补：字号变化不再调用这个方法——[buildDisplayBlocks] 不再手动算换行
-     * 之后，TextView 的 `setTextSize` 本身就会触发系统重新排版（见 [buildDisplayBlocks]
-     * 类注释"架构性修正"一节），不需要我们再手动重建一遍。边距变化会改变
-     * [contentContainer] 的可用宽度，`setPadding` 同样会触发子 View 自动重新排版，
-     * 严格来说这个方法本身也不再必要——保留它只是为了兼容"重排完成后按比例还原滚动
-     * 位置"这条已经测试过的阅读体验（视图不整体重建的话，滚动位置本来就不会跑，但
-     * 保留这一层不算错，只是不再是必需品，暂不动它，等以后有明确理由再简化）。
-     */
-    private fun reflowCurrentParagraphs() {
-        val session = currentSession ?: return
-        // 重排会整块换掉 contentContainer 的内容，换之前先把"当前显示位置"换算成比例
-        // 存起来，重排完成后按同一个比例还原（不是像素级精确还原，见类注释"阅读进度"
-        // 一节）。必须在 render(Loading) 清空内容区之前算。
-        pendingScrollRatio = computeScrollRatio()
-        render(PdfLoadState.Loading)
-
-        thread {
-            // buildDisplayBlocks 会用上 resolvedMedia 里已经加载好的图片（不会因为
-            // 重排就又变回占位符），还没加载好的位置继续摆占位符——后台加载循环
-            // （loadPendingMediaInBackground）本身不受重排影响，继续按自己的节奏跑，
-            // 加载完会用 replaceMediaPlaceholder 找到这次重排出来的新占位符 View。
-            val state = PdfLoadReducer.fromResult(runCatching { buildDisplayBlocks(session) })
-            runOnUiThread { render(state) }
-        }
-    }
-
-    /**
-     * 把 [session] 已经就绪的文字段落 + 按需加载的图片/表格区域，合并成有序的
-     * [DisplayBlock] 列表——"图片插在哪个段落之后"来自
-     * [PdfTextExtractor.Session.pendingMediaPageByAfterIndex] 的 key（跟改动前
-     * [app.pdfreader.extract.ExtractedImage.afterParagraphIndex] 是同一套下标体系，
-     * 只是现在归 `Session` 管）。[resolvedMedia] 里已经加载好的位置放真实
-     * [DisplayBlock.Image]，还没加载好的位置放 [DisplayBlock.Placeholder]，见类
-     * 注释"按需加载"一节。
-     *
-     * ## 2026-08-18 架构性修正：不再用 [reflow] 手动算换行，直接交给 TextView 原生排版
-     *
-     * 这个项目从最早的 TDD 增量起，"重排"就是自己写的 [reflow] 算法：拿屏幕宽度、字体
-     * 宽度估算出"每行能放几个字符"，手动在文字里插 `\n`。一路修了好几轮真机反馈的
-     * 显示问题（等宽字体空格视觉偏宽、英文按中文宽度算预算腰斩、单字符测量样本不
-     * 代表性、空格该用更窄的权重……），每一轮都是在把"我们自己的估算"往真实值上
-     * 硬凑。这一次真机反馈"右侧仍有空隙、还出现单个字母'A'独占一行"，逼着往回想了
-     * 一层：**这些问题的共同根源是"估算"这件事本身**——TextView 自带的排版引擎
-     * （StaticLayout）本来就会用真实字体在真实像素宽度上精确断行，不需要猜。
-     * [PdfTextExtractor.linesToParagraphs] 早就把原始 PDF 里的断行拼接成了连续文字
-     * （见其 KDoc），"重排"真正要做的事到这一步已经做完了，剩下"按屏幕宽度换行"这一步
-     * 完全可以交给 TextView 自己——不管是中文（Android 对 CJK 的断行规则本来就支持
-     * 逐字断行，且比我们自己的 tokenizer 更懂标点不能开头这类规则）还是英文
-     * （按单词边界断行是 TextView 的默认行为），都不需要我们插手。
-     *
-     * [reflow]/[LineWidthEstimator] 本身的算法没有错（各自的单元测试还在，继续保留
-     * 作为"给定固定宽度的纯逻辑断行"这个能力，以后如果有需要精确控制断行位置的场景
-     * 还用得上），只是不该再是"决定屏幕上文字怎么换行"这件事的负责人。
-     */
-    private fun buildDisplayBlocks(session: PdfTextExtractor.Session): List<DisplayBlock> {
-        val blocks = mutableListOf<DisplayBlock>()
-
-        fun appendMediaAfter(index: Int) {
-            val pages = session.pendingMediaPageByAfterIndex[index] ?: return
-            for (pageNo in pages) {
-                val bitmaps = resolvedMedia[pageNo]
-                if (bitmaps != null) {
-                    bitmaps.forEach { blocks.add(DisplayBlock.Image(it)) }
-                } else {
-                    blocks.add(DisplayBlock.Placeholder(pageNo))
-                }
-            }
-        }
-
-        appendMediaAfter(-1) // 插在所有段落之前的媒体。
-        session.paragraphs.forEachIndexed { index, paragraph ->
-            blocks.add(DisplayBlock.Text(paragraph))
-            appendMediaAfter(index)
-        }
-        return blocks
-    }
-
-    /**
-     * [session] 当前"每个位置有几张图片"的完整列表——同一个插入位置
-     * （afterParagraphIndex）可能对应好几页（见 [loadPendingMediaInBackground] 类
-     * 注释），每一页各自还没加载好时按 1 个占位块算（[contentContainer] 里此刻确实
-     * 只有 1 个占位符 View），已经加载好的页按真实图片数量算。
-     * [app.pdfreader.ui.OutlineNavigation] 靠这个列表把"目录项指向第几段"换算成
-     * "展示块下标"，必须跟 [contentContainer] 的实际子 View 结构保持一致，不能用
-     * 静态的"最终会有多少张图片"这种跟当前画面对不上的数字。
-     */
-    private fun currentMediaAfterIndices(session: PdfTextExtractor.Session): List<Int> {
-        val result = mutableListOf<Int>()
-        for ((afterIndex, pages) in session.pendingMediaPageByAfterIndex) {
-            for (pageNo in pages) {
-                val count = resolvedMedia[pageNo]?.size ?: 1
-                repeat(count) { result.add(afterIndex) }
-            }
-        }
-        return result
     }
 
     /**
@@ -609,13 +371,9 @@ class MainActivity : AppCompatActivity() {
      * `fitsSystemWindows` 这个老属性覆盖不了这种情况，必须主动监听 [WindowInsetsCompat]
      * 读出系统栏高度、手动加进 padding。
      *
-     * 2026-08-19 补底部：当时只处理了顶部（状态栏），底部判断"这台设备是手势导航条，
-     * 不挡内容"——用户截图反馈底部确实被挡住了，说明这台设备当时用的是三键导航条
-     * （比手势条高得多），或者用户后来切换了导航模式；不管哪种，"读 [WindowInsetsCompat]
-     * 手动加 padding"这个机制本身跟导航模式无关，两种模式下 `navigationBars()` 这个
-     * inset 类型都会返回正确的高度（手势条模式下这个值很小，三键模式下明显更高）——
-     * 直接照顶部同样的思路把 `insets.bottom` 也加进 `paddingBottom`，不需要自己判断
-     * 当前是哪种导航模式。
+     * 2026-08-19 补底部：同样的机制也覆盖底部导航栏（三键导航条比手势条高，会挡住内容
+     * 最后一行）——直接照顶部同样的思路把 `insets.bottom` 也加进 `paddingBottom`，不需要
+     * 自己判断当前是哪种导航模式。
      */
     private fun applySystemBarInsetsAsPadding() {
         val root = findViewById<View>(R.id.rootLayout)
@@ -647,10 +405,10 @@ class MainActivity : AppCompatActivity() {
         return tempFile
     }
 
-    /** 把 [settings] 应用到 [contentContainer] 的外观（目前只有 padding；字号/行距在每个段落 TextView 创建时应用）。 */
+    /** 把 [settings] 应用到 [recyclerView] 的外观（目前只有 padding；字号/行距在每个段落 TextView 创建时应用）。 */
     private fun applySettingsToView(settings: ReaderSettings) {
         val paddingPx = dpToPx(settings.paddingDp)
-        contentContainer.setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
+        recyclerView.setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
     }
 
     /** 把 [settings] 的数值同步到三个 SeekBar 的 progress 和 Label 文字（不触发重排）。 */
@@ -663,13 +421,24 @@ class MainActivity : AppCompatActivity() {
 
         paddingSeekBar.progress = settings.paddingDp
         paddingLabel.text = getString(R.string.padding_label, settings.paddingDp)
+
+        blockSpacingSeekBar.progress = settings.blockSpacingDp
+        blockSpacingLabel.text = getString(R.string.block_spacing_label, settings.blockSpacingDp)
     }
 
-    /** 遍历 [contentContainer] 里当前已经渲染出来的文字段落 TextView（跳过图片 ImageView）。 */
-    private fun forEachParagraphTextView(action: (TextView) -> Unit) {
-        for (i in 0 until contentContainer.childCount) {
-            val child = contentContainer.getChildAt(i)
-            if (child is TextView) action(child)
+    /**
+     * 遍历 [recyclerView] 里当前贴在屏幕上的 `ViewHolder`（每个是一个纵向
+     * `LinearLayout`，见 [PdfPageAdapter]），对其中的文字段落 TextView（跳过图片
+     * ImageView）执行 [action]——见类注释"字号/边距调节"一节，为什么这样就够了
+     * （不需要整体重建）。
+     */
+    private fun forEachVisibleParagraphTextView(action: (TextView) -> Unit) {
+        for (i in 0 until recyclerView.childCount) {
+            val pageContainer = recyclerView.getChildAt(i) as? LinearLayout ?: continue
+            for (j in 0 until pageContainer.childCount) {
+                val child = pageContainer.getChildAt(j)
+                if (child is TextView) action(child)
+            }
         }
     }
 
@@ -693,7 +462,7 @@ class MainActivity : AppCompatActivity() {
         fontSizeSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
-                forEachParagraphTextView { it.setTextSize(TypedValue.COMPLEX_UNIT_SP, progress.toFloat()) }
+                forEachVisibleParagraphTextView { it.setTextSize(TypedValue.COMPLEX_UNIT_SP, progress.toFloat()) }
                 fontSizeLabel.text = getString(R.string.font_size_label, progress)
             }
 
@@ -702,7 +471,6 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(seekBar: SeekBar) {
                 currentSettings = currentSettings.copy(fontSizeSp = seekBar.progress).coerced()
                 ReaderSettingsPreferences.save(applicationContext, currentSettings)
-                reflowCurrentParagraphs()
             }
         })
 
@@ -710,14 +478,13 @@ class MainActivity : AppCompatActivity() {
             override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
                 val multiplier = progressToMultiplier(progress)
-                forEachParagraphTextView { it.setLineSpacing(0f, multiplier) }
+                forEachVisibleParagraphTextView { it.setLineSpacing(0f, multiplier) }
                 lineSpacingLabel.text = getString(R.string.line_spacing_label, multiplier)
             }
 
             override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
 
             override fun onStopTrackingTouch(seekBar: SeekBar) {
-                // 行距不影响每行能放几个字符（只影响行与行之间的垂直间距），不需要重排。
                 currentSettings = currentSettings.copy(
                     lineSpacingMultiplier = progressToMultiplier(seekBar.progress),
                 ).coerced()
@@ -729,19 +496,57 @@ class MainActivity : AppCompatActivity() {
             override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
                 val paddingPx = dpToPx(progress)
-                contentContainer.setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
+                recyclerView.setPadding(paddingPx, paddingPx, paddingPx, paddingPx)
                 paddingLabel.text = getString(R.string.padding_label, progress)
             }
 
             override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
 
             override fun onStopTrackingTouch(seekBar: SeekBar) {
-                // 边距改变了可用宽度像素，会影响每行能放几个字符，需要重排（同字号）。
                 currentSettings = currentSettings.copy(paddingDp = seekBar.progress).coerced()
                 ReaderSettingsPreferences.save(applicationContext, currentSettings)
-                reflowCurrentParagraphs()
             }
         })
+
+        blockSpacingSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                applyBlockSpacingToVisibleViews(progress)
+                blockSpacingLabel.text = getString(R.string.block_spacing_label, progress)
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
+
+            override fun onStopTrackingTouch(seekBar: SeekBar) {
+                currentSettings = currentSettings.copy(blockSpacingDp = seekBar.progress).coerced()
+                ReaderSettingsPreferences.save(applicationContext, currentSettings)
+            }
+        })
+    }
+
+    /**
+     * 段距拖动过程中的即时预览——跟 [forEachVisibleParagraphTextView] 是同一个"只改
+     * 当前贴屏幕的 ViewHolder，不用整体重建"的思路，但段距要改两层：页内每个展示块
+     * （除第一个）的 `topMargin`，以及每个页容器自己的 `topMargin`（页与页之间的
+     * 留白），两层跟 [PdfPageAdapter] 里 `onBindViewHolder`/`renderPage` 用的是同一套
+     * 规则，拖动预览和松手后重新绑定要看起来一致。
+     */
+    private fun applyBlockSpacingToVisibleViews(spacingDp: Int) {
+        val spacingPx = dpToPx(spacingDp)
+        for (i in 0 until recyclerView.childCount) {
+            val pageContainer = recyclerView.getChildAt(i) as? LinearLayout ?: continue
+            val position = recyclerView.getChildAdapterPosition(pageContainer)
+            val containerParams = pageContainer.layoutParams as? RecyclerView.LayoutParams ?: continue
+            containerParams.topMargin = if (position > 0) spacingPx else 0
+            pageContainer.layoutParams = containerParams
+
+            for (j in 1 until pageContainer.childCount) {
+                val blockView = pageContainer.getChildAt(j)
+                val params = blockView.layoutParams as? LinearLayout.LayoutParams ?: continue
+                params.topMargin = spacingPx
+                blockView.layoutParams = params
+            }
+        }
     }
 
     /** lineSpacingSeekBar 的 progress（0-10，整数）与行距倍数（1.0-2.0）的线性映射。 */
@@ -752,47 +557,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
-    /**
-     * 当前没有打开任何文件（[currentFileKey] 为 null）时什么都不做。
-     *
-     * 过渡写法（见 [loadPdf] 里对应的加载端注释）：暂时仍用滚动比例近似换算成页码，
-     * RecyclerView 化那一步会替换成 `LinearLayoutManager.findFirstVisibleItemPosition()`
-     * 的精确页码。
-     */
+    /** 当前没有打开任何文件（[currentFileKey] 为 null）时什么都不做。 */
     private fun saveCurrentReadingProgress() {
         val key = currentFileKey ?: return
         val pageCount = currentSession?.pageCount ?: return
-        val approxPage = (computeScrollRatio() * pageCount).toInt() + 1
-        ReadingProgressStore.savePage(applicationContext, key, approxPage.coerceIn(1, pageCount))
+        val position = layoutManager.findFirstVisibleItemPosition()
+        if (position == RecyclerView.NO_POSITION) return
+        val page = (position + 1).coerceIn(1, pageCount)
+        ReadingProgressStore.savePage(applicationContext, key, page)
     }
 
     /**
-     * 把 [contentScrollView] 当前的滚动位置换算成 0.0-1.0 的比例。内容还没撑满屏幕
-     * （不可滚动）或还没完成布局时，[View.getHeight] 量不出可滚动范围，此时按"在最
-     * 顶部"处理，返回 0f——这也是空文档/刚开始加载时的合理默认值。
+     * 消费一次 [pendingScrollPage]（读完就清空，避免下一次渲染误用）。
+     * `recyclerView.scrollToPosition` 可以直接跳到还没绑定过的位置，不需要像旧模型
+     * 那样等布局完成后再读高度算比例。
      */
-    private fun computeScrollRatio(): Float {
-        val child = contentScrollView.getChildAt(0) ?: return 0f
-        val scrollableRange = child.height - contentScrollView.height
-        if (scrollableRange <= 0) return 0f
-        return (contentScrollView.scrollY.toFloat() / scrollableRange).coerceIn(0f, 1f)
-    }
-
-    /**
-     * 消费一次 [pendingScrollRatio]（读完就清空，避免下一次渲染误用）。用
-     * `contentScrollView.post { ... }` 把滚动动作排到下一次布局完成之后执行——刚
-     * 渲染完 [contentContainer] 的子 View，它的高度还是上一次布局的旧值，这一刻直接
-     * 读高度算出来的滚动目标是错的。
-     */
-    private fun restoreScrollRatioIfNeeded() {
-        val ratio = pendingScrollRatio ?: return
-        pendingScrollRatio = null
-        contentScrollView.post {
-            val child = contentScrollView.getChildAt(0) ?: return@post
-            val scrollableRange = child.height - contentScrollView.height
-            val targetScrollY = if (scrollableRange > 0) (ratio * scrollableRange).toInt() else 0
-            contentScrollView.scrollTo(0, targetScrollY)
-        }
+    private fun restoreScrollPositionIfNeeded() {
+        val page = pendingScrollPage ?: return
+        pendingScrollPage = null
+        recyclerView.scrollToPosition((page - 1).coerceAtLeast(0))
     }
 
     private fun render(state: PdfLoadState) {
@@ -803,13 +586,20 @@ class MainActivity : AppCompatActivity() {
 
             PdfLoadState.Loading -> {
                 progressBar.visibility = View.VISIBLE
-                contentContainer.removeAllViews()
+                recyclerView.adapter = null
             }
 
             is PdfLoadState.Success -> {
                 progressBar.visibility = View.GONE
-                renderBlocks(state.blocks)
-                restoreScrollRatioIfNeeded()
+                val session = currentSession
+                if (session != null) {
+                    recyclerView.adapter = PdfPageAdapter(
+                        session,
+                        ::createParagraphTextView,
+                        ::createImageView,
+                    ) { currentSettings.blockSpacingDp }
+                    restoreScrollPositionIfNeeded()
+                }
             }
 
             is PdfLoadState.Error -> {
@@ -831,7 +621,7 @@ class MainActivity : AppCompatActivity() {
      * 空格视觉上更明显。点某一条就调 [scrollToOutlineEntry]。
      *
      * [tocButton] 已经在没有大纲时禁用，理论上点不到这里——这里再判空只是防御性
-     * 兜底（比如设置变化触发 [reflowCurrentParagraphs] 的极短暂窗口期），不依赖它。
+     * 兜底，不依赖它。
      */
     private fun showOutlineDialog() {
         val outline = currentSession?.outline
@@ -844,76 +634,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 把 [entry] 指向的页码换算成 [contentContainer] 里的展示块下标（[OutlineNavigation]，
-     * 纯逻辑），再平滑滚动过去，见类注释"目录"一节。任何一步算不出确切位置（没有
-     * 段落、下标越界等边界情况）都直接放弃这次滚动，不强行跳到错误位置。
+     * 见类注释"目录"一节"点击目录项怎么定位"——2026-08-20 简化成页级跳转，同日改用
+     * `scrollToPosition`（无动画直接跳转）而不是 `smoothScrollToPosition`（会带动画
+     * 滚过中间每一页，真机上密集触发按需加载/缓存淘汰引发过一次崩溃，见类注释里
+     * 完整背景）。
      */
     private fun scrollToOutlineEntry(entry: OutlineEntry) {
         val session = currentSession ?: return
-        val blockIndex = OutlineNavigation.blockIndexForDestination(
-            paragraphPages = session.paragraphPages,
-            paragraphTopY = session.paragraphTopY,
-            imageAfterParagraphIndices = currentMediaAfterIndices(session),
-            targetPage = entry.pageNumber,
-            targetY = entry.targetTopY,
-        ) ?: return
-        val target = contentContainer.getChildAt(blockIndex) ?: return
-        contentScrollView.smoothScrollTo(0, target.top)
+        val targetPosition = (entry.pageNumber - 1).coerceIn(0, (session.pageCount - 1).coerceAtLeast(0))
+        recyclerView.scrollToPosition(targetPosition)
     }
-
-    /** 把 [blocks] 依次渲染成 [contentContainer] 里的子 View：文字段落→TextView，图片→ImageView。 */
-    private fun renderBlocks(blocks: List<DisplayBlock>) {
-        contentContainer.removeAllViews()
-        placeholderViewsByPage.clear()
-        blocks.forEachIndexed { index, block ->
-            val view = when (block) {
-                is DisplayBlock.Text -> createParagraphTextView(block.text)
-                is DisplayBlock.Image -> createImageView(block.bitmap)
-                is DisplayBlock.Placeholder -> createPlaceholderView().also {
-                    placeholderViewsByPage[block.page] = it
-                }
-            }
-            if (index > 0) {
-                val params = view.layoutParams as LinearLayout.LayoutParams
-                params.topMargin = dpToPx(BLOCK_SPACING_DP)
-                view.layoutParams = params
-            }
-            contentContainer.addView(view)
-        }
-    }
-
-    /**
-     * 图片/表格区域还没加载出来时的占位符——按需加载增量，见类注释"按需加载"一节。
-     * 固定高度的一个转圈进度条，不追求精确复刻真实图片的尺寸（真实图片解码之前
-     * 拿不到最终显示尺寸，硬要算的话要么得先读一遍图片元信息，要么用页面渲染出的
-     * 近似值，复杂度和收益不成比例——占位符只是"这里有东西在加载"的信号，不是
-     * 图片的预览）。加载完成后 [replaceMediaPlaceholder] 会把这个 View 整个换掉。
-     */
-    private fun createPlaceholderView(): View =
-        ProgressBar(this).apply {
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(PLACEHOLDER_HEIGHT_DP))
-        }
-
-    /**
-     * 2026-08-18 真机实测发现：这里之前用 `Typeface.MONOSPACE` 显示，用户反馈"没有
-     * 断句的汉字之间有多个空格，看起来像换行"——排查用真实 PDF 逐字符核实过，插入的
-     * 确实只有一个 U+0020 空格（[normalizeCjkSpacing] 没有 bug），问题在等宽字体本身：
-     * 它的空格字形紧挨着全角中文字符时视觉上显得偏宽，像两个空格连在一起。改用系统
-     * 默认字体显示——CJK 字符在任何字体里本来就是全角（这是 Unicode 东亚宽度属性
-     * 决定的，不是等宽字体特有的效果），等宽字体真正影响的只是拉丁字母/数字的宽度，
-     * 对 CJK 为主的文本影响不大。
-     */
-    private fun createParagraphTextView(text: String): TextView =
-        TextView(this).apply {
-            this.text = text
-            setTextIsSelectable(true)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            )
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, currentSettings.fontSizeSp.toFloat())
-            setLineSpacing(0f, currentSettings.lineSpacingMultiplier)
-        }
 
     /**
      * 创建一个铺满可用宽度、支持双指缩放 + 缩放后拖动平移的图片 ImageView。初始按
@@ -922,20 +652,16 @@ class MainActivity : AppCompatActivity() {
      * 用 MATRIX 而不是直接改 View 本身的 `scaleX`/`scaleY`，是因为 MATRIX 缩放只在
      * ImageView 自己固定的矩形范围内放大图片内容（超出部分裁掉，效果类似放大镜看
      * 图片的一角），不会让放大后的内容视觉上盖住上下相邻的文字段落；改 View 的
-     * `scaleX`/`scaleY` 则会让整个 View 连同它的边界一起变大，在纵向滚动的
-     * LinearLayout 里会盖住邻居，观感更差。
+     * `scaleX`/`scaleY` 则会让整个 View 连同它的边界一起变大，在纵向滚动的容器里
+     * 会盖住邻居，观感更差。
      */
     private fun createImageView(bitmap: Bitmap): ImageView {
-        // 踩过的坑（2026-08-18 真机反馈"图片右侧显示不全"）：这里原来用
-        // `屏幕宽度 - 2×contentContainer 自己的 padding` 算可用宽度，漏算了外层
-        // rootLayout 自己还有一圈 16dp 的水平 padding（见 activity_main.xml）——
-        // 算出来的可用宽度比 ImageView 实际能拿到的真实宽度宽了那一截，图片被按偏大
-        // 的宽度整体放大，超出 ImageView 真实边界的部分（右侧）就被裁掉了。改成直接
-        // 读 contentContainer 自己量出来的真实宽度（它是 ImageView 的直接父容器，
-        // ImageView 是 MATCH_PARENT，contentContainer 的"宽度减自己的 padding"就是
-        // ImageView 真实能用的宽度，不需要再手动拼凑各层 padding）；contentContainer
-        // 还没走过布局（宽度是 0）这种极端情况才退回旧的估算公式兜底。
-        val measuredWidthPx = contentContainer.width - contentContainer.paddingLeft - contentContainer.paddingRight
+        // 2026-08-20：可用宽度从"contentContainer 自己量出来的真实宽度"改成
+        // "recyclerView 量出来的真实宽度"——RecyclerView 化之后每个条目内部的
+        // LinearLayout（PdfPageAdapter 创建）是 MATCH_PARENT 宽度，直接继承
+        // recyclerView 减去自己 padding 后的可用宽度，跟改动前 contentContainer
+        // 承担的"内容区域宽度"角色是同一件事，只是换了个 View 持有这份 padding。
+        val measuredWidthPx = recyclerView.width - recyclerView.paddingLeft - recyclerView.paddingRight
         val usableWidthPx = if (measuredWidthPx > 0) {
             measuredWidthPx
         } else {
@@ -964,19 +690,18 @@ class MainActivity : AppCompatActivity() {
      * 平移支持；第二轮加完平移后反馈"图片和表格完全没有缩放了"——排查是平移那版的
      * 触摸分发逻辑有一个经典坑：手指刚按下（`ACTION_DOWN`）那一刻，因为还不知道
      * 会不会变成双指捏合，旧写法在这一刻直接"放行"（`onTouch` 返回 false，让事件
-     * 继续往上传给 [contentScrollView]）——但 Android 的规则是：一个 View 如果在
-     * `ACTION_DOWN` 这一刻就放行了，后续同一串手势的事件（包括第二根手指按下的
-     * `ACTION_POINTER_DOWN`）根本不会再送到这个 View，双指捏合从源头上就检测不到，
-     * 不是"检测到了但没反应"，是"压根没收到手指事件"。
+     * 继续往上传给外层容器）——但 Android 的规则是：一个 View 如果在 `ACTION_DOWN`
+     * 这一刻就放行了，后续同一串手势的事件（包括第二根手指按下的
+     * `ACTION_POINTER_DOWN`）根本不会再送到这个 View，双指捏合从源头上就检测不到。
      *
      * 改用 Android 官方推荐处理"可缩放视图嵌在可滚动容器里"这种场景的标准写法——
      * [android.view.ViewParent.requestDisallowInterceptTouchEvent]：按下时先"拦下"
-     * 整个手势不让外层 [contentScrollView] 抢（保证后续的第二根手指、拖动都能收到），
+     * 整个手势不让外层 [recyclerView] 抢（保证后续的第二根手指、拖动都能收到），
      * 判断出"没放大、单指、不是捏合"这种该交给外层滚动的情况，再主动把拦截权限还
-     * 回去（传 false），外层 [contentScrollView] 才会接手继续走正常的上下滚动。
+     * 回去（传 false），外层 [recyclerView] 才会接手继续走正常的上下滚动。
      *
      * - **没放大（倍数=1）+ 单指拖动**：判定为"想滚动整页"，交还拦截权限给
-     *   [contentScrollView]。
+     *   [recyclerView]。
      * - **已放大（倍数>1）+ 单指拖动**：平移图片内容（[Matrix.postTranslate]），
      *   继续拦着不放。平移范围用 [clampTranslation] 限制，不让图片边缘被拖到
      *   ImageView 可视区域内侧、露出图片外的空白。
@@ -1003,25 +728,15 @@ class MainActivity : AppCompatActivity() {
 
         fun applyMatrix() {
             val scale = baseScale * zoomMultiplier
-            // 2026-08-20 真机反馈修复"放大后往左拖显示不全、往右能拖出空白"：
-            // `postScale(scale, scale)` 不带锚点参数时，缩放锚点是 (0,0)——图片
-            // 自己像素坐标系里的原点（左上角），不是 View 屏幕坐标系的原点。意味着
-            // "没有额外平移"（translateX=0）时，图片左上角死死钉在 View 左上角，
-            // 放大多出来的宽高全部朝右下方溢出——但 [clampTranslation] 算平移范围
-            // 时假设的是"没有额外平移时图片左右/上下对称溢出、整体居中"的模型
-            // （±(scaledWidth-width)/2）。两边对同一个"translateX=0"状态的理解不
-            // 一致：往右拖（正 translateX）一超出 0 就露出图片左边缘以外的空白，
-            // 往左拖（负 translateX）却在真正拖到图片右边缘之前就被 clamp 提前拦住。
-            //
-            // 第一次尝试改成 `postScale(scale, scale, width/2f, height/2f)`
-            // 用锚点参数把中心定在 View 尺寸的一半——这是错的，忘了 `postScale`
-            // 的锚点参数是在"输入坐标系"（这里是图片自己的像素坐标）里取值，不是
-            // View 的屏幕像素坐标，`width`/`height`（View 尺寸，几百 px 量级）和
-            // `bitmapWidth`/`bitmapHeight`（原图尺寸，可能几千 px 量级）完全不是
-            // 同一个数量级，锚点用错坐标系，缩放效果整个错位，真机反馈"往右/往下
-            // 完全拖不动"——退回真机验证过有效的老办法：不用锚点参数，自己算好
-            // "让缩放后的图片居中摆放"所需的基准偏移量，再叠加用户拖动的偏移量，
-            // 两步都在同一套坐标系（View 屏幕像素）里算，不留混淆空间。
+            // `postScale(scale, scale)` 不带锚点参数时，缩放锚点是 (0,0)——图片自己
+            // 像素坐标系里的原点（左上角），意味着"没有额外平移"（translateX=0）时
+            // 图片左上角死死钉在 View 左上角，放大多出来的宽高全部朝右下方溢出。
+            // [clampTranslation] 算平移范围时假设的是"没有额外平移时图片对称溢出、
+            // 整体居中"的模型（±(scaledWidth-width)/2）——两边对"没有额外平移"这个
+            // 状态的理解要一致，所以不依赖 postScale 自带的锚点参数（那个参数是在
+            // 图片自己的原始像素坐标系里取值，不是 View 屏幕像素坐标，用错过一次，
+            // 见 NOTES.md #20），自己算好"让缩放后的图片居中摆放"所需的基准偏移量，
+            // 再叠加用户实际拖动的偏移量，两步都在同一套坐标系（View 屏幕像素）里算。
             val scaledWidth = bitmapWidth * scale
             val scaledHeight = bitmapHeight * scale
             val centeringOffsetX = (width - scaledWidth) / 2f
@@ -1071,7 +786,7 @@ class MainActivity : AppCompatActivity() {
                             lastTouchY = event.y
                         } else {
                             // 没放大、单指、也不是捏合：判定为想滚动整页，把拦截权限
-                            // 还给外层 contentScrollView。
+                            // 还给外层 recyclerView。
                             view.parent?.requestDisallowInterceptTouchEvent(false)
                         }
                     }
@@ -1085,19 +800,49 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 2026-08-18 真机实测发现：这里之前用 `Typeface.MONOSPACE` 显示，用户反馈"没有
+     * 断句的汉字之间有多个空格，看起来像换行"——排查用真实 PDF 逐字符核实过，插入的
+     * 确实只有一个 U+0020 空格，问题在等宽字体本身：它的空格字形紧挨着全角中文字符
+     * 时视觉上显得偏宽，像两个空格连在一起。改用系统默认字体显示——CJK 字符在任何
+     * 字体里本来就是全角，等宽字体真正影响的只是拉丁字母/数字的宽度，对 CJK 为主
+     * 的文本影响不大。
+     *
+     * 2026-08-20 真机反馈"中文标点符号本身显得太挤"：中文标点（，。！？）的字形本身
+     * 不像英文标点那样自带前后空白（英文习惯逗号后面跟一个空格，中文没有这个书写
+     * 习惯），紧挨着相邻汉字看容易显得拥挤。加一点 [letterSpacing]（0.05em，經验值，
+     * 不是算出来的）——这个属性对 `TextView` 里的每个字符（汉字、标点、字母、数字）
+     * 一视同仁地在右侧加空隙，不是只加给标点，所以能顺带满足"标点间距跟字母/数字
+     * 间距一样"这条——用户没有要求这个值本身可调，先给固定值，如果以后觉得不够/
+     * 太多再考虑加一个字距拉杆。
+     *
+     * 2026-08-20 新增 [isHeading]：用户要求"标题要加粗"——是不是标题由抽取层判断
+     * （见 [PdfTextExtractor.classifyHeadings] KDoc，字号明显偏大或字体本身加粗，
+     * 两个信号任一命中），这里只负责按判断结果切换字重，不重复判断逻辑。只加粗，
+     * 不放大字号——用户第一次提了"粗体且大一号"，后来自己订正成只要粗体，照最后
+     * 一次的说法做。
+     */
+    private fun createParagraphTextView(text: String, isHeading: Boolean): TextView =
+        TextView(this).apply {
+            this.text = text
+            setTextIsSelectable(true)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, currentSettings.fontSizeSp.toFloat())
+            setLineSpacing(0f, currentSettings.lineSpacingMultiplier)
+            letterSpacing = PARAGRAPH_LETTER_SPACING_EM
+            setTypeface(typeface, if (isHeading) Typeface.BOLD else Typeface.NORMAL)
+        }
+
     private companion object {
-        /**
-         * 展示块（文字段落/图片）之间的纵向间距。2026-08-18 从 12dp 调到 24dp——用户
-         * 反馈"想让段与段之间的间隔更明显"，字号/行距还能再调，这个值先给个明显但不
-         * 夸张的量，以后想再调可以考虑做成第四个可调设置项。
-         */
-        const val BLOCK_SPACING_DP = 24
         const val MAX_ZOOM_MULTIPLIER = 4f
+
+        /** 见 [createParagraphTextView] 上方注释"中文标点符号本身显得太挤"一节。 */
+        const val PARAGRAPH_LETTER_SPACING_EM = 0.05f
 
         /** 见类注释"配置变化重建后恢复文档"一节。 */
         const val KEY_CURRENT_URI = "currentUri"
-
-        /** 见 [createPlaceholderView]。 */
-        const val PLACEHOLDER_HEIGHT_DP = 120
     }
 }
