@@ -180,14 +180,58 @@
         的引用，放在代码里更方便复用同一个实例。
         padding 从原来 contentContainer 移到这里，"边距"设置项现在直接改
         recyclerView 自己的 padding。
+
+        2026-08-20 同日再加：用户要求"屏幕右侧加一根可拖拽的翻页滑条"（跟很多阅读器
+        App 一样的快速翻页手柄）。外面套一层 FrameLayout，把 recyclerView 和
+        pageScrubberTrack/pageScrubberThumb/pageScrubberLabel 叠在一起——具体的拖拽
+        手势、页码换算逻辑在 MainActivity.setupPageScrubber，这里只是布局骨架。
     -->
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/recyclerView"
+    <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_marginTop="8dp"
-        android:layout_weight="1"
-        android:clipToPadding="false"
-        android:padding="16dp" />
+        android:layout_weight="1">
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recyclerView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:padding="16dp" />
+
+        <!--
+            触摸靶区：贴着屏幕最右边一条竖直窄条，比视觉上看到的滑条（thumb）宽得多——
+            手指不需要精确点在那个小圆点上，靠近右边缘任意位置按下/拖动都能触发，是
+            常见阅读器快速翻页手柄的标准做法。本身透明，不画任何东西。
+        -->
+        <View
+            android:id="@+id/pageScrubberTrack"
+            android:layout_width="40dp"
+            android:layout_height="match_parent"
+            android:layout_gravity="end" />
+
+        <!-- 视觉上真正看到的滑条手柄，纵向位置由代码算出的 translationY 决定。 -->
+        <View
+            android:id="@+id/pageScrubberThumb"
+            android:layout_width="6dp"
+            android:layout_height="36dp"
+            android:layout_gravity="end|top"
+            android:layout_marginEnd="6dp"
+            android:background="@drawable/bg_page_scrubber_thumb" />
+
+        <!-- 拖拽过程中显示"第 X 页 / 共 Y 页"，松手后隐藏，见类注释。 -->
+        <TextView
+            android:id="@+id/pageScrubberLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end|top"
+            android:layout_marginEnd="52dp"
+            android:background="@drawable/bg_settings_panel"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="6dp"
+            android:textSize="14sp"
+            android:visibility="gone" />
+
+    </FrameLayout>
 
 </LinearLayout>

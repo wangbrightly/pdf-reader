@@ -37,6 +37,7 @@ import app.pdfreader.ui.PdfPageAdapter
 import java.io.File
 import java.io.FileNotFoundException
 import kotlin.concurrent.thread
+import kotlin.math.roundToInt
 
 /**
  * 唯一的界面：一个"打开 PDF"按钮 + 字号/行距/边距三个 SeekBar + 进度条 + 可滚动内容区，
@@ -177,6 +178,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var blockSpacingLabel: TextView
     private lateinit var blockSpacingSeekBar: SeekBar
 
+    private lateinit var pageScrubberTrack: View
+    private lateinit var pageScrubberThumb: View
+    private lateinit var pageScrubberLabel: TextView
+
+    /** 见 [setupPageScrubber] KDoc"避免拖拽和自动同步互相打架"一节。 */
+    private var isDraggingPageScrubber = false
+
     /** 当前生效的阅读设置，onCreate 时从 [ReaderSettingsPreferences] 读，改动即时写回。 */
     private var currentSettings: ReaderSettings = ReaderSettings()
 
@@ -243,11 +251,15 @@ class MainActivity : AppCompatActivity() {
         paddingSeekBar = findViewById(R.id.paddingSeekBar)
         blockSpacingLabel = findViewById(R.id.blockSpacingLabel)
         blockSpacingSeekBar = findViewById(R.id.blockSpacingSeekBar)
+        pageScrubberTrack = findViewById(R.id.pageScrubberTrack)
+        pageScrubberThumb = findViewById(R.id.pageScrubberThumb)
+        pageScrubberLabel = findViewById(R.id.pageScrubberLabel)
 
         currentSettings = ReaderSettingsPreferences.load(applicationContext)
         applySettingsToView(currentSettings)
         syncSeekBars(currentSettings)
         setupSeekBarListeners()
+        setupPageScrubber()
 
         openButton.setOnClickListener {
             openDocumentLauncher.launch(arrayOf("application/pdf"))
@@ -578,15 +590,93 @@ class MainActivity : AppCompatActivity() {
         recyclerView.scrollToPosition((page - 1).coerceAtLeast(0))
     }
 
+    /**
+     * 屏幕右侧的快速翻页手柄（用户要求，参照其它阅读器 App 常见的"拖拽滑条快速
+     * 翻页"）——[pageScrubberTrack] 是贴右边缘的透明触摸靶区（比视觉上的
+     * [pageScrubberThumb] 宽得多，手指不需要精确点在那根细条上），按下/拖动时
+     * 按手指的纵向位置换算成目标页码，直接调 `recyclerView.scrollToPosition`
+     * 跳过去（无动画直接跳转，原因跟 [scrollToOutlineEntry] 里"为什么不用
+     * `smoothScrollToPosition`"是同一条：拖拽横跨很多页时带动画滚过中间每一页，
+     * 密集触发按需加载/缓存淘汰，真机验证过这类场景会崩溃，见 `PdfPageAdapter
+     * .cache` 字段注释完整背景）。
+     *
+     * **只在目标页码真正变化时才调用 `scrollToPosition`**（[lastScrubberTargetPage]
+     * 记上一次）——`ACTION_MOVE` 触发频率很高，不加这层节流会在同一页附近来回抖动
+     * 时重复触发无意义的 `RecyclerView` 重新布局。
+     *
+     * **避免拖拽和自动同步互相打架**：[isDraggingPageScrubber] 为真时，正常滚动
+     * 触发的 [syncPageScrubberThumb]（[RecyclerView.OnScrollListener]）要跳过——
+     * 拖拽本身调用 `scrollToPosition` 也会触发滚动回调，这里如果不加区分，手柄
+     * 位置会被"拖拽引起的滚动回调"和"手指当前位置"来回覆盖，产生抖动。
+     */
+    private fun setupPageScrubber() {
+        var lastScrubberTargetPage = -1
+        pageScrubberTrack.setOnTouchListener { view, event ->
+            val pageCount = currentSession?.pageCount ?: return@setOnTouchListener false
+            if (pageCount <= 1) return@setOnTouchListener false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                    isDraggingPageScrubber = true
+                    val fraction = (event.y / view.height.toFloat()).coerceIn(0f, 1f)
+                    val targetPage = (fraction * (pageCount - 1)).roundToInt() + 1
+                    moveScrubberThumbTo(fraction)
+                    pageScrubberLabel.text = getString(R.string.page_scrubber_label, targetPage, pageCount)
+                    pageScrubberLabel.visibility = View.VISIBLE
+                    if (targetPage != lastScrubberTargetPage) {
+                        lastScrubberTargetPage = targetPage
+                        recyclerView.scrollToPosition(targetPage - 1)
+                    }
+                    true
+                }
+
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    isDraggingPageScrubber = false
+                    lastScrubberTargetPage = -1
+                    pageScrubberLabel.visibility = View.GONE
+                    saveCurrentReadingProgress()
+                    true
+                }
+
+                else -> false
+            }
+        }
+
+        recyclerView.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                if (!isDraggingPageScrubber) syncPageScrubberThumb()
+            }
+        })
+    }
+
+    /** 把 [pageScrubberThumb] 挪到轨道纵向 [fraction]（0f-1f）对应的位置。 */
+    private fun moveScrubberThumbTo(fraction: Float) {
+        val trackHeight = pageScrubberTrack.height
+        val thumbHeight = pageScrubberThumb.height
+        if (trackHeight <= 0 || thumbHeight <= 0) return
+        pageScrubberThumb.translationY = fraction.coerceIn(0f, 1f) * (trackHeight - thumbHeight)
+    }
+
+    /** 按当前第一个可见页码算出手柄该在的纵向位置——正常翻页（不是拖拽手柄）时同步用。 */
+    private fun syncPageScrubberThumb() {
+        val pageCount = currentSession?.pageCount ?: return
+        if (pageCount <= 1) return
+        val position = layoutManager.findFirstVisibleItemPosition()
+        if (position == RecyclerView.NO_POSITION) return
+        val fraction = position.toFloat() / (pageCount - 1).toFloat()
+        moveScrubberThumbTo(fraction)
+    }
+
     private fun render(state: PdfLoadState) {
         when (state) {
             PdfLoadState.Idle -> {
                 progressBar.visibility = View.GONE
+                pageScrubberThumb.visibility = View.GONE
             }
 
             PdfLoadState.Loading -> {
                 progressBar.visibility = View.VISIBLE
                 recyclerView.adapter = null
+                pageScrubberThumb.visibility = View.GONE
             }
 
             is PdfLoadState.Success -> {
@@ -599,11 +689,15 @@ class MainActivity : AppCompatActivity() {
                         ::createImageView,
                     ) { currentSettings.blockSpacingDp }
                     restoreScrollPositionIfNeeded()
+                    // 只有一页的文档拖了也没意义，见 setupPageScrubber KDoc。
+                    pageScrubberThumb.visibility = if (session.pageCount > 1) View.VISIBLE else View.GONE
+                    pageScrubberThumb.post { syncPageScrubberThumb() }
                 }
             }
 
             is PdfLoadState.Error -> {
                 progressBar.visibility = View.GONE
+                pageScrubberThumb.visibility = View.GONE
                 Toast.makeText(this, state.message, Toast.LENGTH_LONG).show()
             }
         }
