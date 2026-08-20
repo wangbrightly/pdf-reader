@@ -1521,12 +1521,15 @@ object PdfTextExtractor {
                 PDFBoxResourceLoader.init(context.applicationContext ?: context)
                 // 2026-08-21：footerLearnedTitles/outline 都改成后台异步之后，装机
                 // 诊断日志确认过 Session 构造函数本身（只剩 pageCount）已经降到几毫秒，
-                // `PDDocument.load(file)` 这一步（PdfBox-Android 解析 PDF 文件结构，
-                // 第三方库内部逻辑）是目前唯一还没能动的剩余耗时——大多数文档这一步
-                // 本来就很快，只有个别文档（真机复测过一份要 7-10 秒）明显偏慢，
-                // 见 NOTES.md 对应条目：这份文档同时也是"飞"字乱码那份，两个问题
-                // 都指向这份文件本身结构可能不太规范，PDFBox 内部要花更多功夫解析/
-                // 容错，不是这次能继续深挖的范围。
+                // `PDDocument.load(file)` 这一步（PdfBox-Android 解析 PDF 文件结构）
+                // 是剩下的主要耗时——真机复测过一份 126MB 的大文档单这一步要 6-10
+                // 秒。试过一个思路：官方源码显示默认 `load(File)` 用
+                // `MemoryUsageSetting.setupMainMemoryOnly()`（PDF 流内容全缓冲进 Java
+                // 堆），猜测换成 `setupTempFileOnly()`（缓冲到临时文件）能省掉堆分配/
+                // GC 开销——**装机实测这个思路没有用**，同一份文档改完反而从 6.6 秒
+                // 变成 7.9 秒（多了磁盘 I/O，没换来预期的收益），已经撤回，改回默认
+                // 设置。如实记录：`PDDocument.load` 本身的耗时目前没找到有效的优化
+                // 手段，留给以后有需要再查（见 NOTES.md 对应条目）。
                 val document = PDDocument.load(file)
                 val session = Session(document)
                 // 见 footerLearnedTitles/outline 字段 KDoc——两个都放后台跑，不阻塞
