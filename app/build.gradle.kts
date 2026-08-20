@@ -38,6 +38,12 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
 
+    // 文字/图片按需加载（RecyclerView 窗口式重构，见
+    // /Users/mac/.claude/plans/fizzy-snuggling-cloud.md）第 3 步用——条目粒度=页，
+    // 只创建/保留屏幕附近的 ViewHolder，翻远的自动回收，是根治 4232 页文档
+    // OutOfMemoryError（NOTES.md #21）必需的基础设施。1.3.2 是稳定版本。
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+
     // PDF 文字提取层：见 SELECTION.md 及后续调研记录。
     // 原计划用 MuPDF（mupdf-android-fitz），但调研确认它没有官方发布到
     // Maven Central / JitPack 的预编译 aar——官方仓库要求把源码（含 libmupdf
