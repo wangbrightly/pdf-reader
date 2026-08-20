@@ -2,11 +2,17 @@
 <!--
     App 图标（自适应图标）的背景层——见 res/mipmap-anydpi-v26/ic_launcher.xml。
     2026-08-21 改版：用户给了手绘草图（闪电在上/PDF 字样居中最大/扇形书页在下，
-    线条画风格），照草图配色改成浅底 + 藏青蓝线条，不再是之前那版深蓝渐变+
-    实心插画风格。图标资源仍然是用 Puppeteer 截图 HTML/CSS 设计稿生成的（跟本
-    项目其它出图流程同一套工具，见 project_puppeteer_webshot_tool 记忆）。
+    线条画风格），照草图配色改成浅底线条画，不再是最早那版深蓝渐变+实心插画
+    风格。同日再"美化"一版：浅底加了一层很淡的对角渐变增加层次感，闪电改成
+    暖色调（琥珀黄）跟蓝色的字/书页拉开视觉层次。图标资源仍然是用 Puppeteer
+    截图 HTML/CSS 设计稿生成的（跟本项目其它出图流程同一套工具，见
+    project_puppeteer_webshot_tool 记忆）。
 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">
-    <solid android:color="#EEF2FC" />
+    <gradient
+        android:type="linear"
+        android:angle="315"
+        android:startColor="#F5F8FF"
+        android:endColor="#E4E9FA" />
 </shape>
