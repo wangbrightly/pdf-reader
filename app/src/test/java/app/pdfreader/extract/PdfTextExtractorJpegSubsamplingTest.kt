@@ -107,4 +107,47 @@ class PdfTextExtractorJpegSubsamplingTest {
         assertEquals(1, content.images.size)
         assertTrue(content.images.single().bitmap.width > 0)
     }
+
+    @Test
+    fun `超过阈值的大 CMYK JPEG 不走原生降采样路径，回退到 pdImage-image 保住颜色正确`() {
+        // 2026-08-20 真机反馈修复：安卓 BitmapFactory 解码 CMYK（4 通道）JPEG 有已知
+        // 老毛病，把 4 通道数据当 3 通道 RGB 硬读，视觉上是对角线彩色噪点花屏——见
+        // decodeJpegWithNativeSubsampling KDoc"已修"一节完整背景。
+        //
+        // 注意：这里不能用 `imageXObject.colorSpace.numberOfComponents` 验证 fixture
+        // 确实是 CMYK——反编译确认过 `PDImageXObject.createFromByteArray` 内部固定
+        // 用 `PDDeviceRGB.INSTANCE`，不管字节实际是什么颜色空间都报 3（这正是第一版
+        // 修法失败的原因，也是为什么最终改成直接解析 JPEG 字节本身的 SOF 段——见
+        // JpegComponentCount 类注释）。这里改成直接断言 fixture 文件本身的字节，
+        // 跟 JpegComponentCountTest 用的是同一份 fixture、同一个判断依据。
+        //
+        // fixture `cmyk-quadrant.jpg`（3000×2000，4 通道 CMYK，Python Pillow 生成）
+        // 尺寸上会触发 subsamplingFactor 算出 2 倍降采样（跟上面"大 JPEG"那条测试
+        // 同一个阈值），但因为是 CMYK，应该被 JpegComponentCount 挡在原生解码路径
+        // 之外，回退到 pdImage.image——这条路径不做尺寸降采样，解码结果应该还是
+        // 原始的 3000x2000，而不是降采样后的 ~1500x1000（用尺寸间接验证走了哪条
+        // 路径，原因见本文件类注释"只验证解码尺寸，不验证像素颜色"一节）。
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+        val document = PDDocument()
+        val page = PDPage()
+        document.addPage(page)
+        val cmykJpegBytes = requireNotNull(
+            javaClass.classLoader?.getResourceAsStream("cmyk-quadrant.jpg")?.readBytes(),
+        ) { "找不到测试 fixture：src/test/resources/cmyk-quadrant.jpg" }
+        assertEquals("这份 fixture 应该是 4 通道 CMYK，不是的话这条测试没测到目标场景", 4, JpegComponentCount.of(cmykJpegBytes))
+        val imageXObject = PDImageXObject.createFromByteArray(document, cmykJpegBytes, "cmyk")
+        assertEquals("createFromByteArray 应该把这份 JPEG 字节识别成 jpg 后缀", "jpg", imageXObject.suffix)
+        PDPageContentStream(document, page).use { it.drawImage(imageXObject, 0f, 0f, 100f, 100f) }
+        val output = File.createTempFile("cmyk-jpeg-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+
+        val content = PdfTextExtractor.extractContent(context, output)
+        assertEquals(1, content.images.size)
+        val bitmap = content.images.single().bitmap
+        assertEquals("CMYK 图应该回退到 pdImage.image，解码结果是原始尺寸，不应该被降采样", 3000, bitmap.width)
+        assertEquals("CMYK 图应该回退到 pdImage.image，解码结果是原始尺寸，不应该被降采样", 2000, bitmap.height)
+    }
 }

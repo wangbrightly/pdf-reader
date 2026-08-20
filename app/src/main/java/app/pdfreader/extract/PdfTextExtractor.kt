@@ -322,12 +322,48 @@ object PdfTextExtractor {
      * 场景里最常见的大图来源（扫描页/照片），`BitmapFactory` 对 JPEG 的支持最成熟
      * 可靠；PNG 通常是无损压缩、体积和这里要解决的"大图"问题关联度较低，TIFF/JBIG2
      * 在不同安卓版本上的原生解码支持不稳定，没有把握，不在这次的范围内。
+     *
+     * ## 已修：CMYK JPEG 用这条路径解码会花屏（2026-08-20 真机反馈）
+     *
+     * 真机反馈一份扫描版图册，后半部分好几十页图片显示成对角线彩色噪点——诊断
+     * 确认这些页每页只有 1 张原始图片（不涉及 [ImageStripStitcher]），问题出在
+     * 解码本身。这是安卓 `BitmapFactory` 解码 CMYK 编码 JPEG 的已知老毛病：扫描/
+     * 印刷行业常用 CMYK（4 通道）色彩空间存 JPEG，`BitmapFactory` 只认 RGB/YCbCr
+     * （3 通道），把 4 通道数据硬当 3 通道读，色彩通道错位，视觉上就是这种对角线
+     * 噪点/条纹。`pdImage.image`（PdfBox-Android 自己的解码路径）内部会调
+     * `PDColorSpace.toRGBImage` 做色彩空间转换，能正确处理 CMYK，只是慢。
+     *
+     * ### 走过的弯路：一开始想用 `pdImage.colorSpace.numberOfComponents` 判断，行不通
+     *
+     * 第一版修法是解码前先查 `pdImage.colorSpace.numberOfComponents`，不是 3 就
+     * 放弃快速路径。真机装上之后问题毫无变化——反编译这个版本的 pdfbox-android
+     * 才发现根本原因：这个库压根没实现 `PDDeviceCMYK`，`PDColorSpace.create` 遇到
+     * PDF 图片字典里的 `/ColorSpace /DeviceCMYK` 时会打一条"不支持，改用 DeviceRGB"
+     * 的日志然后**直接返回 `PDDeviceRGB.INSTANCE`**——也就是说不管 JPEG 实际是几
+     * 通道，这个库里 `colorSpace.numberOfComponents` 对 CMYK 图片永远报 3，这条
+     * 判断在这个库上是个死胡同，完全测不出真实的颜色空间。
+     *
+     * ## 实际修法：不信 PDF 库的颜色空间抽象，直接读 JPEG 字节本身的 SOF 段
+     *
+     * 换成 [JpegComponentCount.of]（纯字节解析，见该类 KDoc 完整背景）：JPEG 编码
+     * 本身的 SOF 标记里就带着"颜色分量数"这个字段，不需要经过任何 PDF 库的颜色
+     * 空间抽象层，RGB/YCbCr 是 3，CMYK/YCCK 是 4——解析不出来（返回 `null`，比如
+     * 数据被截断）时按"不确定"保守处理，不用快速路径，跟本函数其它失败分支的降级
+     * 精神一致，有单元测试验证（[JpegComponentCountTest]、
+     * [PdfTextExtractorJpegSubsamplingTest] 里"大 CMYK JPEG"那条）。
+     *
+     * **如实记录**：这次真机反馈的那份图册后来加诊断日志确认，花屏的那批图片
+     * `suffix=png`，根本不是 JPEG，压根没走过这段代码——那份图册的花屏是另一个
+     * 独立的 PNG 解码 bug（见 NOTES.md #19，还没修）。这条 CMYK JPEG 修复本身是
+     * 对的、有真实场景、有单元测试验证，只是不是那次真机反馈的花屏成因，两件事
+     * 分开记录，不要混为一谈。
      */
     private fun decodeJpegWithNativeSubsampling(pdImage: PDImage): Bitmap? = runCatching {
         if (pdImage.suffix != "jpg") return null
         val subsampling = subsamplingFactor(pdImage.width, pdImage.height)
         if (subsampling <= 1) return null
         val bytes = pdImage.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
+        if (JpegComponentCount.of(bytes) != 3) return null
         val options = BitmapFactory.Options().apply { inSampleSize = subsampling }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }.getOrNull()
