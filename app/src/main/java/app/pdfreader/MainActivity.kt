@@ -337,7 +337,14 @@ class MainActivity : AppCompatActivity() {
             val openResult = runCatching {
                 val file = copyToCacheFile(uri)
                 val tAfterCopy = System.currentTimeMillis()
-                val session = PdfTextExtractor.Session.open(applicationContext, file)
+                // onOutlineReady：大纲在后台抽取，抽完之后目录按钮的可用状态可能要
+                // 跟着变（原来禁用的按钮这时候才知道其实有目录）——见 Session.outline
+                // 字段 KDoc"已知代价"一节。只在还是当前这份文档时才生效
+                // （myGeneration 判断跟别处一致），避免用户中途换了文件之后旧文档的
+                // 回调还在瞎更新按钮状态。
+                val session = PdfTextExtractor.Session.open(applicationContext, file) {
+                    if (myGeneration == loadGeneration) runOnUiThread { syncTocButtonEnabled() }
+                }
                 android.util.Log.d(
                     "PdfReaderDebug",
                     "loadPdf 拷贝文件=${tAfterCopy - tStart}ms " +

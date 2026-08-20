@@ -23,6 +23,7 @@ import com.tom_roush.pdfbox.util.Matrix as PdfMatrix
 import java.io.File
 import java.text.Normalizer
 import kotlin.math.abs
+import kotlin.concurrent.thread
 import kotlin.math.sign
 
 /**
@@ -1311,7 +1312,36 @@ object PdfTextExtractor {
     class Session private constructor(private val document: PDDocument) : java.io.Closeable {
         val pageCount: Int = document.numberOfPages
 
-        val outline: List<OutlineEntry> = runCatching { extractOutline(document) }.getOrDefault(emptyList())
+        /**
+         * 2026-08-21 改成后台异步（用户要求"一秒之内打开 PDF，后台加载数据"）：真机
+         * 诊断日志实测确认过，大纲抽取本身也能占到 Session 构造耗时的好几秒（某份
+         * 文档 `PDDocument.load`=9.7s、`Session构造(pageCount+outline)`=2.95s——
+         * `pageCount` 只是读个数字，几乎不耗时，这 2.95s 基本都在大纲抽取上）。跟
+         * [footerLearnedTitles] 是同一个理由：`outline` 只有用户点"目录"按钮时才
+         * 真正用得上，没必要让它阻塞"打开文档、显示第一页"这件事。[onOutlineReady]
+         * 是抽取完之后的回调（在后台线程上调用，调用方自己决定要不要切回主线程），
+         * 目前只有 [app.pdfreader.MainActivity] 用它来"大纲抽完之后重新算一次目录
+         * 按钮是否可点"——这是唯一的已知代价（如实记录）：文档刚打开、大纲还没抽完
+         * 这段时间里，目录按钮会先短暂显示成"禁用"（哪怕这份文档其实有目录），抽完
+         * 之后立刻恢复正常，比"等大纲抽完才能看到任何内容"这个代价小得多。
+         */
+        @Volatile
+        var outline: List<OutlineEntry> = emptyList()
+            private set
+
+        private var outlineThread: Thread? = null
+
+        private fun extractOutlineInBackground(onOutlineReady: () -> Unit) {
+            outlineThread = thread {
+                outline = runCatching { extractOutline(document) }.getOrDefault(emptyList())
+                onOutlineReady()
+            }
+        }
+
+        /** 仅供测试用：阻塞等到后台大纲抽取线程跑完，理由跟 [awaitFooterLearningForTest] 一致。 */
+        internal fun awaitOutlineForTest() {
+            outlineThread?.join()
+        }
 
         /**
          * 见类注释"页脚水印检测的改造"一节：只在样本范围内（前 [FOOTER_SAMPLE_PAGE_COUNT]
@@ -1320,16 +1350,53 @@ object PdfTextExtractor {
          * 抽取失败（极端情况，比如这几页本身有问题）不影响 `Session` 整体可用，退化
          * 成"没学到任何标题类噪音"，等价于这份文档不做标题类水印过滤——比抽取失败
          * 让整个 `Session` 都打不开更符合"宁可漏检"的一贯降级精神。
+         *
+         * 2026-08-21 改成后台异步学习（用户要求"一秒之内打开 PDF，后台加载数据"）：
+         * 真机诊断日志实测确认过，这一步是"打开文档要等很久"的真正大头——某份
+         * 文档单次耗时 81 秒（样本最多 150 页，遇到内容复杂/字体异常的文档这一步
+         * 可能比正常慢几十倍，见 loadPage KDoc 关于"某些文档单页耗时几秒"的诊断）。
+         * 原来是 `Session` 构造函数里的同步字段初始化，`open()` 必须等这一步跑完
+         * 才能返回，直接把"打开文档"这件事的耗时和这个可以延后做的优化绑死了。
+         * 改成 `@Volatile var`，默认空集合（等价于"还没学到任何标题类噪音"，见上一段
+         * "抽取失败"同样的降级语义），[open] 里另起一个后台线程跑真正的学习逻辑，
+         * 学完直接赋值——`Session` 本身可以立刻返回给 UI 层显示内容，不用等这一步。
+         * 代价（如实记录）：文档刚打开、后台学习还没跑完这段时间里，`loadPage`
+         * 读到的是空集合，标题类页脚噪音暂时不会被过滤（正则类噪音判断不受影响，
+         * 那部分本来就是按页独立算的）——等后台学完，之后翻到的页会恢复正常过滤，
+         * 已经翻过去的页不会补一次重新过滤（这本来就不常触发用户能感知的重复内容，
+         * 换"文档能立刻打开看"换这一点点瑕疵很划算）。`@Volatile` 保证单次整体赋值
+         * 的可见性足够（这里只是把一个不可变 `Set` 引用换成另一个，不需要更重的
+         * 同步手段）。
          */
-        private val footerLearnedTitles: Set<String> = runCatching {
-            val sampleEndPage = minOf(FOOTER_SAMPLE_PAGE_COUNT, pageCount)
-            if (sampleEndPage < 1) return@runCatching emptySet()
-            val stripper = LineCollectingStripper()
-            stripper.startPage = 1
-            stripper.endPage = sampleEndPage
-            stripper.getText(document)
-            RunningFooterFilter.learnTitleLikeNoiseTexts(stripper.lines.map { PageTextLine(it.text, it.page) })
-        }.getOrDefault(emptySet())
+        @Volatile
+        private var footerLearnedTitles: Set<String> = emptySet()
+
+        /** 见 [footerLearnedTitles] KDoc。持有这个线程只是为了 [awaitFooterLearningForTest]，不是常规用法。 */
+        private var footerLearningThread: Thread? = null
+
+        private fun learnFooterTitlesInBackground() {
+            footerLearningThread = thread {
+                footerLearnedTitles = runCatching {
+                    val sampleEndPage = minOf(FOOTER_SAMPLE_PAGE_COUNT, pageCount)
+                    if (sampleEndPage < 1) return@runCatching emptySet()
+                    val stripper = LineCollectingStripper()
+                    stripper.startPage = 1
+                    stripper.endPage = sampleEndPage
+                    stripper.getText(document)
+                    RunningFooterFilter.learnTitleLikeNoiseTexts(stripper.lines.map { PageTextLine(it.text, it.page) })
+                }.getOrDefault(emptySet())
+            }
+        }
+
+        /**
+         * 仅供测试用：阻塞等到后台页脚学习线程跑完，这样测试才能确定性地断言
+         * "学完之后 [loadPage] 的过滤结果"，不用靠猜时间的 `Thread.sleep`。
+         * 可见性是 `internal` 不是 `private`，理由跟本文件其它几处 `internal`
+         * 一致（见 [Line]/[Paragraph] 字段注释）。
+         */
+        internal fun awaitFooterLearningForTest() {
+            footerLearningThread?.join()
+        }
 
         /**
          * 按需加载的核心入口——见类注释"文字/图片真正按需加载"一节完整背景。只处理
@@ -1350,6 +1417,10 @@ object PdfTextExtractor {
          * 这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
          */
         fun loadPage(pageNo: Int): PageContent {
+            // 2026-08-20 临时诊断日志：追查真机反馈"这本书打开后翻某些页要好几秒"——
+            // 拆开量每一步耗时，看是矢量扫描/表格检测慢，还是文字抽取本身慢，定位完
+            // 会删掉。阈值 300ms 只是不想让正常页也刷屏。
+            val tPageStart = System.currentTimeMillis()
             val page = document.getPage(pageNo - 1)
             val pageHeight = page.mediaBox.height
 
@@ -1358,14 +1429,25 @@ object PdfTextExtractor {
                 engine.processPage(page)
                 engine.segments to engine.hasImages
             }.getOrDefault(emptyList<LineSegment>() to false)
+            val tAfterScan = System.currentTimeMillis()
             val onPageSegments = scanResult.first.filter { isSegmentOnPage(it, page.mediaBox.width, pageHeight) }
             val tableRegion = TableGridDetector.tableRegionOrNull(onPageSegments)
             val hasImages = scanResult.second
+            val tAfterTableDetect = System.currentTimeMillis()
 
             val stripper = LineCollectingStripper()
             stripper.startPage = pageNo
             stripper.endPage = pageNo
             runCatching { stripper.getText(document) }
+            val tAfterStripper = System.currentTimeMillis()
+            if (tAfterStripper - tPageStart > 300) {
+                android.util.Log.d(
+                    "PdfReaderDebug",
+                    "loadPage(page=$pageNo) 慢页拆分 矢量扫描=${tAfterScan - tPageStart}ms " +
+                        "表格检测=${tAfterTableDetect - tAfterScan}ms 文字抽取=${tAfterStripper - tAfterTableDetect}ms " +
+                        "矢量段数=${scanResult.first.size} 原始行数=${stripper.lines.size}",
+                )
+            }
             val nonTableLines = if (tableRegion != null) {
                 stripper.lines.filterNot { isWithinTableBand(it.y, tableRegion, pageHeight) }
             } else {
@@ -1428,9 +1510,31 @@ object PdfTextExtractor {
         }
 
         companion object {
-            fun open(context: Context, file: File): Session {
+            /**
+             * [onOutlineReady] 见 [Session.outline] KDoc——大纲抽取放后台跑，抽完之后
+             * 在后台线程上调这个回调，调用方（[app.pdfreader.MainActivity]）自己决定
+             * 要不要切回主线程。默认空实现，不是所有调用方都关心"大纲什么时候抽完"
+             * （比如单元测试直接调 [Session.awaitFooterLearningForTest] 之类的方法
+             * 等结果，不需要回调）。
+             */
+            fun open(context: Context, file: File, onOutlineReady: () -> Unit = {}): Session {
                 PDFBoxResourceLoader.init(context.applicationContext ?: context)
-                return Session(PDDocument.load(file))
+                // 2026-08-21：footerLearnedTitles/outline 都改成后台异步之后，装机
+                // 诊断日志确认过 Session 构造函数本身（只剩 pageCount）已经降到几毫秒，
+                // `PDDocument.load(file)` 这一步（PdfBox-Android 解析 PDF 文件结构，
+                // 第三方库内部逻辑）是目前唯一还没能动的剩余耗时——大多数文档这一步
+                // 本来就很快，只有个别文档（真机复测过一份要 7-10 秒）明显偏慢，
+                // 见 NOTES.md 对应条目：这份文档同时也是"飞"字乱码那份，两个问题
+                // 都指向这份文件本身结构可能不太规范，PDFBox 内部要花更多功夫解析/
+                // 容错，不是这次能继续深挖的范围。
+                val document = PDDocument.load(file)
+                val session = Session(document)
+                // 见 footerLearnedTitles/outline 字段 KDoc——两个都放后台跑，不阻塞
+                // Session.open() 本身返回，这样调用方（MainActivity.loadPdf）能尽快
+                // 显示内容。
+                session.learnFooterTitlesInBackground()
+                session.extractOutlineInBackground(onOutlineReady)
+                return session
             }
         }
     }
