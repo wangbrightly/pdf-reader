@@ -986,9 +986,32 @@ class MainActivity : AppCompatActivity() {
 
         fun applyMatrix() {
             val scale = baseScale * zoomMultiplier
+            // 2026-08-20 真机反馈修复"放大后往左拖显示不全、往右能拖出空白"：
+            // `postScale(scale, scale)` 不带锚点参数时，缩放锚点是 (0,0)——图片
+            // 自己像素坐标系里的原点（左上角），不是 View 屏幕坐标系的原点。意味着
+            // "没有额外平移"（translateX=0）时，图片左上角死死钉在 View 左上角，
+            // 放大多出来的宽高全部朝右下方溢出——但 [clampTranslation] 算平移范围
+            // 时假设的是"没有额外平移时图片左右/上下对称溢出、整体居中"的模型
+            // （±(scaledWidth-width)/2）。两边对同一个"translateX=0"状态的理解不
+            // 一致：往右拖（正 translateX）一超出 0 就露出图片左边缘以外的空白，
+            // 往左拖（负 translateX）却在真正拖到图片右边缘之前就被 clamp 提前拦住。
+            //
+            // 第一次尝试改成 `postScale(scale, scale, width/2f, height/2f)`
+            // 用锚点参数把中心定在 View 尺寸的一半——这是错的，忘了 `postScale`
+            // 的锚点参数是在"输入坐标系"（这里是图片自己的像素坐标）里取值，不是
+            // View 的屏幕像素坐标，`width`/`height`（View 尺寸，几百 px 量级）和
+            // `bitmapWidth`/`bitmapHeight`（原图尺寸，可能几千 px 量级）完全不是
+            // 同一个数量级，锚点用错坐标系，缩放效果整个错位，真机反馈"往右/往下
+            // 完全拖不动"——退回真机验证过有效的老办法：不用锚点参数，自己算好
+            // "让缩放后的图片居中摆放"所需的基准偏移量，再叠加用户拖动的偏移量，
+            // 两步都在同一套坐标系（View 屏幕像素）里算，不留混淆空间。
+            val scaledWidth = bitmapWidth * scale
+            val scaledHeight = bitmapHeight * scale
+            val centeringOffsetX = (width - scaledWidth) / 2f
+            val centeringOffsetY = (height - scaledHeight) / 2f
             imageMatrix = Matrix().apply {
                 postScale(scale, scale)
-                postTranslate(translateX, translateY)
+                postTranslate(centeringOffsetX + translateX, centeringOffsetY + translateY)
             }
         }
 
