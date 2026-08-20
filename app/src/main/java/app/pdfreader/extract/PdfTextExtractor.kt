@@ -1232,6 +1232,19 @@ object PdfTextExtractor {
         override fun drawImage(pdImage: PDImage) {
             hasImages = true
             if (!decodeImages) return
+            // 2026-08-20 修复 NOTES.md #19（花屏）：真机诊断日志实测确认根因——
+            // PdfBox-Android 的 SampledImageReader.getRGBImage 只有 bitsPerComponent
+            // 是 1 或 8 时有专门的解码路径，其余位深（真机复现的是 4 位）会打一行
+            // "other-bit image not supported"日志后，仍然照样调用只认"每个颜色分量
+            // 正好 1 字节"的 from8bit——4 位数据被当 8 位读，字节和像素对不上，行数/
+            // 高度全部算错（真机复现：983×1441 的图解码成 983×240，高度被砍到约
+            // 1/6，画面因此被压扁+错位，也就是用户看到的"对角线花屏"）。这是第三方
+            // 库本身的缺陷，没法直接改库代码——遇到库明确不支持的位深就跳过这张图，
+            // 不展示、不是展示错误内容，跟本类"宁可漏检，不可展示错误内容"一贯的
+            // 降级原则一致。
+            if (pdImage.bitsPerComponent != 1 && pdImage.bitsPerComponent != 8) {
+                return
+            }
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
             // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
             // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。

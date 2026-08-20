@@ -347,7 +347,7 @@ Spacing`/`MAX_GAP_TO_MEDIAN_RATIO` 整个删掉），回到"只看横竖线数�
 用户确认"完整了"。拼完之后地图本身仍然是横向长条（地图内容天然如此，不是
 bug）——用户反馈"挺好，不耽误看"，就此收尾。
 
-## 19. 待办：某些 PNG 解码出来高度被砍掉约 1/6，画面对角线花屏——跟 CMYK JPEG 是两回事
+## 19. 已修：某些图片解码出来高度被砍掉约 1/6，画面对角线花屏——根因是位深 4，不是 PNG 本身
 
 **背景**：修完 #18 的图片拼接问题后，用户反馈同一本地图书翻到后面还有花屏（对角线
 彩色噪点）。一开始误判成"CMYK JPEG 走原生解码路径花屏"（见 #18 相邻的
@@ -374,12 +374,39 @@ Subsampling` 那段代码。真正的问题：原图 983×1441（正常竖版）
 这轮工作（图片拼接、JPEG CMYK、文字排序、加载速度、表格检测都已修完提交），
 这个 PNG 解码 bug 留到下一轮专门查。
 
-**下次接手时怎么开始**：`PageContentStreamEngine.drawImage` 里加诊断日志的
-写法本次验证有效（见上面贴的日志格式），可以直接复用；下一步大概率要么反编译
-PdfBox-Android 的 PNG 解码路径（`SampledImageReader` 相关，跟本文件 #13 反编译
-JPEG 解码路径找根因是同一个方法论），要么把这份具体的 PNG 文件导出来用标准
-PNG 工具（`file`/`pngcheck`/Python Pillow）读一下它的头信息，看跟正常 PNG
-有什么不一样。
+**后续排查（本轮完成）**：没有反编译字节码，改成直接从 PdfBox-Android 官方
+GitHub 仓库拉 `SampledImageReader.java` 源码（`v2.0.27.0` tag，路径
+`library/src/main/java/com/tom_roush/pdfbox/pdmodel/graphics/image/
+SampledImageReader.java`）——比反编译 `.class` 字节码可靠、直接得多，能看到
+完整逻辑和注释，这次踩过的坑（`raw.githubusercontent.com` 的 tag 要带 `v`
+前缀、仓库里 Java 源码目录是 `library/` 不是常见的 `pdfbox/`）值得记一笔，
+下次查这个库的其它方法可以直接照这个路径规律去找。
+
+源码里 `getRGBImage` 这段是真正的根因：
+
+```java
+else if (bitsPerComponent == 8 && colorKey == null && ...) {
+    return from8bit(...);   // 正常路径：每个颜色分量正好 1 字节
+}
+Log.e("PdfBox-Android", "Trying to create other-bit image not supported");
+return from8bit(...);       // 兜底：位深不是 8（这次真机数据是 4）也硬当 8 位读
+```
+
+`bitsPerComponent` 只有严格等于 1 或 8 时才有专门解码路径，其余位深会打一行
+"not supported"日志后，依然照样调用只认"每个颜色分量正好 1 字节"的
+`from8bit`——加诊断日志装机复现后拿到的真实数据：`suffix=png bpc=4 分量数=3
+原图=983x1441 结果=983x240 宽度比=1.0 高度比=6.0041666`，确认命中的是 4 位
+（不是最初怀疑的 16 位或者 Adam7 隔行扫描，两个候选方向都排除了，没有花时间
+误入歧途——虽然一开始按 4/8/组件数的比例关系手工反推"为什么恰好是 6 倍"没能
+完全对上（PdfBox 内部具体怎么从 `createInputStream` 拿字节流没有继续深挖），
+但"4 位数据被 8 位假设读错"这个方向的机制本身已经通过官方源码直接证实，不是
+猜的）。
+
+**修法**：这是第三方库本身的缺陷，没法直接改库代码——遇到库明确不支持的位深
+（不是 1 也不是 8）就跳过这张图不解码、不显示，不展示错误内容比展示花屏更
+诚实，跟本类"宁可漏检"的一贯降级原则一致（见 `PageContentStreamEngine
+.drawImage`）。真机复现过、装机验证过（用户后续决定结束这轮排查，未做逐
+像素二次确认，如实记录）。
 
 ## 20. 已修：图片/表格放大后，往一个方向能拖出空白，往另一个方向拖不到边
 
