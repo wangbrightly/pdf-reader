@@ -395,12 +395,21 @@ class MainActivity : AppCompatActivity() {
             val blocksResult = openResult.map { (session, file) ->
                 currentSession = session
                 currentCacheFile = file
-                val fileKey = ReadingProgressKey.fromParagraphs(session.paragraphs)
+                // 2026-08-20 改成哈希文件字节而不是抽取出的段落——见 ReadingProgressKey
+                // 类 KDoc 完整背景（按需加载上线后"打开文档"这一步不再有"全部段落"）。
+                val fileKey = ReadingProgressKey.fromFile(file)
                 currentFileKey = fileKey
-                // 读过这份文件就恢复到上次的位置；没读过就是 0f（从头开始），不用
-                // 特殊分支——ReadingProgressStore.loadProgress 没记录时返回 null，
-                // 这里兜底成 0f 是唯一需要区分两种语义的地方。
-                pendingScrollRatio = ReadingProgressStore.loadProgress(applicationContext, fileKey) ?: 0f
+                // 过渡写法（按需加载改造第 1 步，先只换存取的数据类型，真正按页跟踪
+                // 阅读位置要等 RecyclerView 化那一步——见 fizzy-snuggling-cloud 计划
+                // 第 3/4 步）：暂时仍按"页码/总页数≈滚动比例"这个近似换算桥接旧的
+                // 滚动比例机制，页数越多这个近似越粗略，下一步会被替换成
+                // LinearLayoutManager.findFirstVisibleItemPosition() 的精确页码。
+                val savedPage = ReadingProgressStore.loadPage(applicationContext, fileKey)
+                pendingScrollRatio = if (savedPage != null && session.pageCount > 0) {
+                    ((savedPage - 1).toFloat() / session.pageCount).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
                 buildDisplayBlocks(session)
             }
             val state = PdfLoadReducer.fromResult(blocksResult)
@@ -743,10 +752,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
-    /** 当前没有打开任何文件（[currentFileKey] 为 null）时什么都不做。 */
+    /**
+     * 当前没有打开任何文件（[currentFileKey] 为 null）时什么都不做。
+     *
+     * 过渡写法（见 [loadPdf] 里对应的加载端注释）：暂时仍用滚动比例近似换算成页码，
+     * RecyclerView 化那一步会替换成 `LinearLayoutManager.findFirstVisibleItemPosition()`
+     * 的精确页码。
+     */
     private fun saveCurrentReadingProgress() {
         val key = currentFileKey ?: return
-        ReadingProgressStore.saveProgress(applicationContext, key, computeScrollRatio())
+        val pageCount = currentSession?.pageCount ?: return
+        val approxPage = (computeScrollRatio() * pageCount).toInt() + 1
+        ReadingProgressStore.savePage(applicationContext, key, approxPage.coerceIn(1, pageCount))
     }
 
     /**
