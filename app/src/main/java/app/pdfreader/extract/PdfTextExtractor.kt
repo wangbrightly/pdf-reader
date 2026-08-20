@@ -2,6 +2,7 @@ package app.pdfreader.extract
 
 import android.content.Context
 import android.graphics.Bitmap
+import app.pdfreader.ui.DisplayBlock
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.Path
@@ -249,6 +250,9 @@ object PdfTextExtractor {
 
     /** 见 [PageContentStreamEngine] 里 `segmentCollectionCapped` 的 KDoc。 */
     private const val MAX_SEGMENTS_PER_PAGE = 20_000
+
+    /** 见 [Session.footerLearnedTitles] KDoc——页脚水印"标题类重复"检测的样本页数上限。 */
+    private const val FOOTER_SAMPLE_PAGE_COUNT = 150
 
     /**
      * 内嵌图片长边（`max(width, height)`）超过 [MAX_IMAGE_DIMENSION_PX] 判定为"过大"，
@@ -1111,6 +1115,16 @@ object PdfTextExtractor {
     }
 
     /**
+     * 一页的展示内容——[Session.loadPage] 的返回值，见该方法 KDoc"文字/图片真正按需
+     * 加载"一节完整背景。[blocks] 只会是 [DisplayBlock.Text]/[DisplayBlock.Image]
+     * 这两种（不会是 [DisplayBlock.Placeholder]——"这一页还没加载出来"这件事由调用方
+     * 自己决定要不要显示占位符，不是 [loadPage] 的返回值该表达的状态），按页内顺序
+     * 排列（段落/图片穿插，复用 [ImagePlacement] 定位逻辑，跟 [extractContent] 里
+     * 同一套摆放规则）。
+     */
+    data class PageContent(val blocks: List<DisplayBlock>)
+
+    /**
      * 按需加载版本的抽取入口——2026-08-19 增量。用户反馈打开速度明显慢于 WPS，真机
      * 日志确认耗时大头集中在图片解码/表格区域渲染，文字抽取本身一直很快（见
      * [extractContent] 历次改动记录的耗时日志）。
@@ -1146,6 +1160,32 @@ object PdfTextExtractor {
      * [loadPageMedia] 对应位置会解码失败、占位符停在"加载中"状态，而不是像
      * [extractContent] 那样退回显示原文字——这是一个刻意接受的、比 [extractContent]
      * 更差一点的边界情况处理，真机没有实际测到过这个边界情况被触发。
+     *
+     * ## 2026-08-20 增量：文字/图片真正按需加载——[loadPage] 是新的核心入口
+     *
+     * 真机反馈一份 4232 页的文档打开会 `OutOfMemoryError`（NOTES.md #21）——根因不是
+     * 单页内容复杂，是"一次性抽完全部页面的文字"（[paragraphs]/[paragraphPages]/
+     * [paragraphTopY] 这套字段，[init] 块里一次性算好）这个模式，遇到几千页量级的
+     * 文档时内存和时间都撑不住。完整方案见 `/Users/mac/.claude/plans/fizzy-snuggling-cloud.md`
+     * （RecyclerView 窗口式重构，条目粒度 = 页，[MainActivity] 只在真正翻到某一页时
+     * 才调 [loadPage]）。
+     *
+     * [loadPage] 是分步实施的第 2 步：新增的按页加载入口，跟旧的
+     * [paragraphs]/[pendingMediaPageByAfterIndex]/[loadPageMedia] 这套"一次性抽完
+     * 全部"的字段暂时并存——[MainActivity] 还没有切换到 `RecyclerView`（第 3 步）
+     * 之前继续依赖旧字段，所以这一步不删除、不修改它们，只新增。等第 3 步
+     * `MainActivity` 改造完、不再依赖旧字段后，[init] 块里"一次性扫描全部页面"这部分
+     * 才能真正删除——**这一步本身还不能修好 4232 页 OOM 的问题**，`Session` 构造时
+     * 仍然会做全文档扫描，[loadPage] 只是新加的、还没被真正用起来的能力。
+     *
+     * ### 页脚水印检测的改造：全文档已知 -> 样本学习
+     *
+     * 旧的 [RunningFooterFilter.noiseIndices] 判断"标题类重复"水印需要看到跨页的
+     * 重复率，按需加载后不再有"全文档所有行"可用。[footerLearnedTitles]
+     * 在 `Session` 打开时用一个页数有限的样本（[FOOTER_SAMPLE_PAGE_COUNT]）跑一次
+     * [RunningFooterFilter.learnTitleLikeNoiseTexts]，学出"这些具体文字算噪音"，
+     * [loadPage] 内部调 [RunningFooterFilter.pageNoiseIndices] 直接查表——见
+     * [RunningFooterFilter] 类注释"样本学习 + 按页应用"一节的完整设计理由和已知局限。
      */
     class Session private constructor(private val document: PDDocument) : java.io.Closeable {
         private val tConstructStart = System.currentTimeMillis()
@@ -1266,6 +1306,106 @@ object PdfTextExtractor {
                 engine.processPage(page)
                 ImageStripStitcher.stitchIfTiled(engine.images)
             }.getOrDefault(emptyList())
+        }
+
+        /**
+         * 见类注释"页脚水印检测的改造"一节：只在样本范围内（前 [FOOTER_SAMPLE_PAGE_COUNT]
+         * 页，文档不够这么多页就取全部）跑一次 [RunningFooterFilter
+         * .learnTitleLikeNoiseTexts]，学出的文本集合供 [loadPage] 按页查表用。样本
+         * 抽取失败（极端情况，比如这几页本身有问题）不影响 `Session` 整体可用，退化
+         * 成"没学到任何标题类噪音"，等价于这份文档不做标题类水印过滤——比抽取失败
+         * 让整个 `Session` 都打不开更符合"宁可漏检"的一贯降级精神。
+         */
+        private val footerLearnedTitles: Set<String> = runCatching {
+            val sampleEndPage = minOf(FOOTER_SAMPLE_PAGE_COUNT, pageCount)
+            if (sampleEndPage < 1) return@runCatching emptySet()
+            val stripper = LineCollectingStripper()
+            stripper.startPage = 1
+            stripper.endPage = sampleEndPage
+            stripper.getText(document)
+            RunningFooterFilter.learnTitleLikeNoiseTexts(stripper.lines.map { PageTextLine(it.text, it.page) })
+        }.getOrDefault(emptySet())
+
+        /**
+         * 按需加载的核心入口——见类注释"文字/图片真正按需加载"一节完整背景。只处理
+         * [pageNo] 这一页：抽这一页的文字、测这一页有没有表格区域、按需解码这一页的
+         * 图片，返回值已经是可以直接渲染的 [PageContent]（不需要调用方再拼装）。
+         *
+         * 跟 [loadPageMedia] 一样"重新扫描而不是缓存解码句柄"（见该方法 KDoc 完整
+         * 理由）——[loadPage] 内部按需再调一次 [PageContentStreamEngine]（先
+         * `decodeImages=false` 判断有没有表格/内嵌图片，是内嵌图片的话再
+         * `decodeImages=true` 重新扫一遍拿真正的 [Bitmap]），这一页的开销跟
+         * [loadPageMedia] 是同一个量级（几十毫秒），不会因为"按页调用"就变慢。
+         *
+         * 表格区域优先于内嵌图片（跟 [pendingMediaPageByAfterIndex] 类注释、
+         * [extractContent] 是同一个降级精神）：检测到表格区域就不再抽取这一页的
+         * 内嵌图片（假设都已经包含在裁剪出来的表格图片里）。
+         */
+        fun loadPage(pageNo: Int): PageContent {
+            val page = document.getPage(pageNo - 1)
+            val pageHeight = page.mediaBox.height
+
+            val scanResult = runCatching {
+                val engine = PageContentStreamEngine(page, decodeImages = false)
+                engine.processPage(page)
+                engine.segments to engine.hasImages
+            }.getOrDefault(emptyList<LineSegment>() to false)
+            val onPageSegments = scanResult.first.filter { isSegmentOnPage(it, page.mediaBox.width, pageHeight) }
+            val tableRegion = TableGridDetector.tableRegionOrNull(onPageSegments)
+            val hasImages = scanResult.second
+
+            val stripper = LineCollectingStripper()
+            stripper.startPage = pageNo
+            stripper.endPage = pageNo
+            runCatching { stripper.getText(document) }
+            val nonTableLines = if (tableRegion != null) {
+                stripper.lines.filterNot { isWithinTableBand(it.y, tableRegion, pageHeight) }
+            } else {
+                stripper.lines
+            }
+            val rawParagraphs = linesToParagraphs(nonTableLines)
+            val noiseIndices = RunningFooterFilter.pageNoiseIndices(
+                rawParagraphs.map { PageTextLine(it.text, it.page) },
+                footerLearnedTitles,
+            )
+            val filtered = rawParagraphs.filterIndexed { index, _ -> index !in noiseIndices }
+
+            val blocks = mutableListOf<DisplayBlock>()
+            if (tableRegion != null) {
+                val cropped = runCatching {
+                    val renderer = PDFRenderer(document)
+                    val fullPage = renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
+                    val crop = tableCropRect(tableRegion, pageHeight, TABLE_PAGE_RENDER_DPI, fullPage.width, fullPage.height)
+                    Bitmap.createBitmap(fullPage, crop.left, crop.top, crop.width(), crop.height())
+                }.getOrNull()
+                val regionTopYDirAdj = pageHeight - tableRegion.maxY
+                val afterIndex = ImagePlacement.afterParagraphIndexForRegion(
+                    filtered.map { it.page },
+                    filtered.map { it.topY },
+                    pageNo,
+                    regionTopYDirAdj,
+                )
+                if (afterIndex == -1) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
+                filtered.forEachIndexed { index, paragraph ->
+                    blocks.add(DisplayBlock.Text(paragraph.text))
+                    if (index == afterIndex) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
+                }
+            } else {
+                filtered.forEach { blocks.add(DisplayBlock.Text(it.text)) }
+                if (hasImages) {
+                    // 图片插在这一页最后一个段落之后——跟 extractContent/旧 Session 的
+                    // "同页图片统一插在该页最后一个段落之后（按页归类）"是同一条约定，
+                    // 单页范围内 ImagePlacement.afterParagraphIndex 天然只会算出
+                    // "最后一个段落之后"这一个结果，不需要真的调用它。
+                    val images = runCatching {
+                        val engine = PageContentStreamEngine(page, decodeImages = true)
+                        engine.processPage(page)
+                        ImageStripStitcher.stitchIfTiled(engine.images)
+                    }.getOrDefault(emptyList())
+                    images.forEach { blocks.add(DisplayBlock.Image(it)) }
+                }
+            }
+            return PageContent(blocks)
         }
 
         override fun close() {

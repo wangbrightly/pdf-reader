@@ -139,4 +139,54 @@ class RunningFooterFilterTest {
         val lines = (1..5).map { PageTextLine(longText, page = it) }
         assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(lines))
     }
+
+    // ---- 样本学习 + 按页应用（2026-08-20 增量，见类 KDoc 对应小节）----
+
+    @Test
+    fun `learnTitleLikeNoiseTexts 从样本里学出重复标题的具体文本`() {
+        val sample = mutableListOf<PageTextLine>()
+        for (page in 1..6) {
+            if (page != 4) sample.add(PageTextLine("幸福生命手册（2025）", page = page))
+            sample.add(PageTextLine("第${page}页各自不同的正文内容。", page = page))
+        }
+
+        val learned = RunningFooterFilter.learnTitleLikeNoiseTexts(sample)
+
+        assertEquals(setOf("幸福生命手册（2025）"), learned)
+    }
+
+    @Test
+    fun `pageNoiseIndices 用学到的标题文本按页过滤，不需要看其它页`() {
+        val learned = setOf("幸福生命手册（2025）")
+        val pageLines = listOf(
+            PageTextLine("幸福生命手册（2025）", page = 7),
+            PageTextLine("这一页自己的正文内容。", page = 7),
+        )
+
+        assertEquals(setOf(0), RunningFooterFilter.pageNoiseIndices(pageLines, learned))
+    }
+
+    @Test
+    fun `pageNoiseIndices 里URL日期页码计数不需要学习也能按页判断`() {
+        val pageLines = listOf(
+            PageTextLine("2026/7/10 23:21", page = 3),
+            PageTextLine("https://baike.azpdl.net/#/entry/abc-123", page = 3),
+            PageTextLine("22/136", page = 3),
+            PageTextLine("这一页自己的正文内容。", page = 3),
+        )
+
+        assertEquals(setOf(0, 1, 2), RunningFooterFilter.pageNoiseIndices(pageLines, emptySet()))
+    }
+
+    @Test
+    fun `pageNoiseIndices 对没学到的文本不误伤，就算它在这一页也重复出现`() {
+        // 学习阶段没见过的文本，哪怕在当前这一页恰好写了两遍，也不该被当成标题过滤
+        // ——pageNoiseIndices 不该在单页范围内重新跑一遍"重复率"判断，只认学到的集合。
+        val pageLines = listOf(
+            PageTextLine("没学过的短句", page = 9),
+            PageTextLine("没学过的短句", page = 9),
+        )
+
+        assertEquals(emptySet<Int>(), RunningFooterFilter.pageNoiseIndices(pageLines, emptySet()))
+    }
 }

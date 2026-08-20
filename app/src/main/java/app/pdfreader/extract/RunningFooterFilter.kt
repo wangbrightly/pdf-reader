@@ -51,6 +51,33 @@ data class PageTextLine(val text: String, val page: Int)
  *
  * 两道门槛都满足才过滤，任何一道不满足就保留——宁可漏掉真水印，也不错杀正常内容，
  * 跟本类其它三种检测同一套"保守"原则。
+ *
+ * ## 2026-08-20 增量：按需加载场景下的"样本学习 + 按页应用"
+ *
+ * [noiseIndices] 是"喂全文档所有行，一次性判断"这个模型——[titleLikeNoiseIndices]
+ * 需要看到跨页重复率，天然要求"已经知道全文档有多少行"。文字按需加载（按页加载，
+ * 见 [PdfTextExtractor.Session.loadPage]）上线后，"打开文档"这一步不再有"全文档
+ * 所有行"可用，但也不能什么都不做——真机反馈过的水印场景（打印时间、来源网址、
+ * 重复书名）几乎总是从文档一开始就存在、样式贯穿全文，不需要真的看完全文档才能
+ * 学出规律。
+ *
+ * 拆成两半：
+ * 1. **URL/日期/页码计数**（[URL_ONLY]/[DATE_TIME_ONLY]/[URL_WITH_TRAILING_COUNTER]/
+ *    [PAGE_COUNTER_ONLY]）——这几条判断本来就只需要"同一页内"的上下文（页码计数
+ *    要不要算噪音，只看这一页有没有同时出现网址/日期），跟"看没看过全文档"无关，
+ *    可以直接对任意一批行调用，不用改——[regexNoiseIndices] 把这部分逻辑提取出来
+ *    单独复用，[noiseIndices]（全文档一次性判断，`extractContent` 那条旧路径继续用）
+ *    和 [pageNoiseIndices]（按页判断，`Session.loadPage` 用）内部都调它。
+ * 2. **标题类重复**——需要看到"这段文字在多少页出现过"这个跨页统计，没法只看一页。
+ *    改成"先用一个页数有限的样本（比如文档前 150 页）学出'这些具体文字应该算噪音'，
+ *    存成一个 [Set]，后续按页处理时直接查表"——[learnTitleLikeNoiseTexts] 是学习
+ *    入口（样本范围内复用现有 [titleLikeNoiseIndices] 的判断逻辑不变，只是把命中的
+ *    下标换算成命中的具体文本），[pageNoiseIndices] 拿着学到的集合按页查表。
+ *
+ *    已知局限：如果一份文档的页眉/页脚样式要到样本范围之外才第一次出现（比如前
+ *    150 页没有，第 151 页才开始有），会漏检——真实场景里页眉页脚样式几乎总是
+ *    从头到尾一致，这个假设成立的概率很高，但不是 100% 保证，跟本类一贯的"宁可
+ *    漏检"取舍一致。
  */
 object RunningFooterFilter {
     private val URL_ONLY = Regex("""^https?://\S+$""")
@@ -64,7 +91,32 @@ object RunningFooterFilter {
     private const val MIN_REPEATED_PAGE_FRACTION = 0.5
 
     /** @return [lines] 里判定为页眉/页脚水印的下标集合（0-based），调用方据此过滤掉。 */
-    fun noiseIndices(lines: List<PageTextLine>): Set<Int> {
+    fun noiseIndices(lines: List<PageTextLine>): Set<Int> =
+        regexNoiseIndices(lines) + titleLikeNoiseIndices(lines)
+
+    /**
+     * 见类注释"样本学习 + 按页应用"一节：给一批样本行（通常是文档前若干页），学出
+     * "这些具体文字应该算标题类噪音"，返回命中的文本内容集合（已经 `trim()` 过，
+     * 跟 [pageNoiseIndices] 里的比较方式一致）。
+     */
+    fun learnTitleLikeNoiseTexts(sampleLines: List<PageTextLine>): Set<String> {
+        val indices = titleLikeNoiseIndices(sampleLines).toSet()
+        return indices.mapTo(mutableSetOf()) { sampleLines[it].text.trim() }
+    }
+
+    /**
+     * 见类注释"样本学习 + 按页应用"一节：[pageLines] 应该是同一页的行（[loadPage] 的
+     * 调用场景），URL/日期/页码计数走无状态正则（对这一页单独判断也成立），标题类
+     * 直接查 [learnedTitleTexts]（[learnTitleLikeNoiseTexts] 学出来的集合），不再
+     * 需要看到其它页的内容。
+     */
+    fun pageNoiseIndices(pageLines: List<PageTextLine>, learnedTitleTexts: Set<String>): Set<Int> {
+        val titleIndices = pageLines.indices.filter { pageLines[it].text.trim() in learnedTitleTexts }
+        return regexNoiseIndices(pageLines) + titleIndices
+    }
+
+    /** [URL_ONLY]/[DATE_TIME_ONLY]/[URL_WITH_TRAILING_COUNTER]/[PAGE_COUNTER_ONLY] 这四条判断，见类注释。 */
+    private fun regexNoiseIndices(lines: List<PageTextLine>): Set<Int> {
         val urlOrDateIndices = lines.indices.filter { index ->
             val text = lines[index].text.trim()
             URL_ONLY.matches(text) || DATE_TIME_ONLY.matches(text) || URL_WITH_TRAILING_COUNTER.matches(text)
@@ -74,8 +126,7 @@ object RunningFooterFilter {
             val text = lines[index].text.trim()
             PAGE_COUNTER_ONLY.matches(text) && lines[index].page in pagesWithUrlOrDate
         }
-        val titleLikeIndices = titleLikeNoiseIndices(lines)
-        return (urlOrDateIndices + counterIndices + titleLikeIndices).toSet()
+        return (urlOrDateIndices + counterIndices).toSet()
     }
 
     /** 见类注释"标题行"一节：靠"短文字 + 高比例重复出现在不同页"识别运行标题/页眉。 */
