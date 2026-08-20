@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    自适应图标（Android 8.0/API 26+，本项目 minSdk 就是 26，所有支持机型都会用这份，
+    mipmap-*dpi 下的传统方形 PNG 只是给个别不认这份 XML 的工具/场景兜底，实际不会被
+    用户看到）。前景/背景设计见 ic_launcher_foreground.png、ic_launcher_background.xml
+    的注释。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

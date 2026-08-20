@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    App 图标（自适应图标）的背景层——见 res/mipmap-anydpi-v26/ic_launcher.xml。
+    颜色跟 ic_launcher_foreground.png 设计稿（闪电 + 摊开的书 + PDF 字样）配套的蓝色
+    渐变，图标资源是用 Puppeteer 截图 HTML/CSS 设计稿生成的（跟本项目其它出图流程
+    同一套工具，见 project_puppeteer_webshot_tool 记忆），不是手绘矢量路径。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:type="linear"
+        android:angle="315"
+        android:startColor="#3B5BDB"
+        android:endColor="#2540A6" />
+</shape>
