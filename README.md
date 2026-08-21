@@ -55,6 +55,31 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 更多真机踩坑细节（工具链版本坑、PdfBox 已知 bug、字体渲染细节……）见 [NOTES.md](NOTES.md)。
 
+## App 图标演变
+
+2026-08-21 当天集中迭代，一共改了 12 次：从深蓝实心插画风格（v1-v2）改成浅色线条画风格定调（v3），之后反复微调书本形状、书页疏密和闪电的大小/位置（v4-v11），最新一版把闪电用程序化测量精确嵌进了 PDF 的"D"字母镂空正中央（v12，当前线上版本）。每一版实际图标见下表（截自对应 git 提交，`git log --oneline | grep 图标` 可查完整改动记录）：
+
+<table>
+<tr>
+<td align="center" width="150"><img src="docs/icon-history/v01_1f57b42.png" width="100"><br><sub><b>v1</b> <code>1f57b42</code><br>初版：闪电+摊开的书+PDF</sub></td>
+<td align="center" width="150"><img src="docs/icon-history/v02_e56abb4.png" width="100"><br><sub><b>v2</b> <code>e56abb4</code><br>书页加厚度纹理，PDF 字号调大</sub></td>
+<td align="center" width="150"><img src="docs/icon-history/v03_637ad5e.png" width="100"><br><sub><b>v3</b> <code>637ad5e</code><br>改版：手绘草图线条画风格</sub></td>
+<td align="center" width="150"><img src="docs/icon-history/v04_5bd4c90.png" width="100"><br><sub><b>v4</b> <code>5bd4c90</code><br>闪电加粗，书页 5→9 条</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/icon-history/v05_8101759.png" width="100"><br><sub><b>v5</b> <code>8101759</code><br>书页角度中间稀两侧密</sub></td>
+<td align="center"><img src="docs/icon-history/v06_706a240.png" width="100"><br><sub><b>v6</b> <code>706a240</code><br>书本 45° 张角+书皮加粗</sub></td>
+<td align="center"><img src="docs/icon-history/v07_1e8b91f.png" width="100"><br><sub><b>v7</b> <code>1e8b91f</code><br>书本 60° 张角+闪电实心两头尖</sub></td>
+<td align="center"><img src="docs/icon-history/v08_151275c.png" width="100"><br><sub><b>v8</b> <code>151275c</code><br>书本改实心剪影（照参考图）</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/icon-history/v09_87cf8e5.png" width="100"><br><sub><b>v9</b> <code>87cf8e5</code><br>书本直接复用参考图</sub></td>
+<td align="center"><img src="docs/icon-history/v10_585629c.png" width="100"><br><sub><b>v10</b> <code>585629c</code><br>闪电挪到字母 D 镂空处</sub></td>
+<td align="center"><img src="docs/icon-history/v11_e7172c4.png" width="100"><br><sub><b>v11</b> <code>e7172c4</code><br>闪电缩小+微调，完整显示在 D 内</sub></td>
+<td align="center"><img src="docs/icon-history/v12_e84332d.png" width="100"><br><sub><b>v12</b> <code>e84332d</code><br>闪电程序化精确定位（当前版）</sub></td>
+</tr>
+</table>
+
 ## 开发统计（截至 2026-08-21）
 
 - **代码量**：7411 行（Kotlin 主代码 3901 行、Kotlin 测试代码 3041 行、XML 372 行、Gradle 脚本 97 行），另有 655 行 NOTES.md 踩坑记录。
