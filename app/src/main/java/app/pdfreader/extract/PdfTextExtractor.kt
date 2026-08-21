@@ -258,6 +258,9 @@ object PdfTextExtractor {
     /** 见 [classifyHeadings] KDoc——字号超过本页中位数的这个倍数才算"明显偏大"。 */
     private const val HEADING_FONT_SIZE_RATIO = 1.15f
 
+    /** 见 [decodeRawImageByBitDepth] KDoc"尺寸安全阀"一节——超过这个像素数（宽×高）直接跳过，不手动解码。 */
+    private const val MAX_MANUAL_DECODE_PIXELS = 30_000_000L
+
     /** 见 [PageContentStreamEngine.hasFullPageImage] KDoc——图片渲染宽/高都达到页面宽/高的这个比例才算"占满全页"。 */
     private const val FULL_PAGE_IMAGE_COVERAGE_RATIO = 0.7f
 
@@ -381,6 +384,90 @@ object PdfTextExtractor {
         val options = BitmapFactory.Options().apply { inSampleSize = subsampling }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }.getOrNull()
+
+    /**
+     * 见 [PageContentStreamEngine.drawImage] KDoc"2026-08-21 改成真正解码"一节——
+     * 自己按位深正确解包，不依赖 PdfBox-Android 那条只支持 1/8 位的路径。
+     *
+     * PDF 图像的原始样本流规则（PDF 规范 8.9.5.2）：每个像素占
+     * `numComponents × bitsPerComponent` 位，逐个分量按大端（高位在前）紧密排列；
+     * **每一行单独按字节对齐**（一行结束后，哪怕没用满最后一个字节也要跳到下一
+     * 字节开始，不能跨行借位）——这是最容易漏掉的一条，[bytesPerRow] 按这条算，
+     * 不是简单地"总位数除以 8"。
+     *
+     * 范围限定在灰度（[numComponents]=1）/RGB（[numComponents]=3）——调色板索引色、
+     * CMYK 这些颜色空间需要额外的调色板查表/色彩转换逻辑，这次不做，遇到直接
+     * 返回 `null`（调用方会跳过这张图不显示，不展示错误内容）。
+     *
+     * 加了一个尺寸安全阀（[MAX_MANUAL_DECODE_PIXELS]）——这条路径是纯 Kotlin 手写
+     * 的逐像素循环，没有原生解码器那种性能，遇到异常巨大的图片（真机测过 4232 页
+     * 文档那种极端场景，见 NOTES.md #21）不该硬解到把 App 拖垮，跟本类其它地方
+     * "宁可漏检、不可拖垮 App"的安全阀是同一个精神。
+     */
+    private fun decodeRawImageByBitDepth(pdImage: PDImage): Bitmap? {
+        val bitsPerComponent = pdImage.bitsPerComponent
+        if (bitsPerComponent <= 0 || bitsPerComponent > 16) return null
+        val numComponents = pdImage.colorSpace.numberOfComponents
+        if (numComponents != 1 && numComponents != 3) return null
+        val width = pdImage.width
+        val height = pdImage.height
+        if (width <= 0 || height <= 0) return null
+        if (width.toLong() * height.toLong() > MAX_MANUAL_DECODE_PIXELS) return null
+
+        val bytes = pdImage.createInputStream().use { it.readBytes() }
+        val bitsPerRow = width.toLong() * numComponents * bitsPerComponent
+        val bytesPerRow = ((bitsPerRow + 7) / 8).toInt()
+        if (bytesPerRow <= 0 || bytesPerRow.toLong() * height > bytes.size.toLong()) return null
+
+        val maxSampleValue = (1 shl bitsPerComponent) - 1
+        val pixels = IntArray(width * height)
+        var pixelIndex = 0
+        val samples = IntArray(numComponents)
+        for (y in 0 until height) {
+            val rowStart = y * bytesPerRow
+            var bitOffset = 0
+            for (x in 0 until width) {
+                for (c in 0 until numComponents) {
+                    samples[c] = readBitsMsbFirst(bytes, rowStart, bitOffset, bitsPerComponent)
+                    bitOffset += bitsPerComponent
+                }
+                val r: Int
+                val g: Int
+                val b: Int
+                if (numComponents == 1) {
+                    val gray = samples[0] * 255 / maxSampleValue
+                    r = gray
+                    g = gray
+                    b = gray
+                } else {
+                    r = samples[0] * 255 / maxSampleValue
+                    g = samples[1] * 255 / maxSampleValue
+                    b = samples[2] * 255 / maxSampleValue
+                }
+                pixels[pixelIndex] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                pixelIndex++
+            }
+        }
+        return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+    }
+
+    /**
+     * 从 [bytes] 里第 [rowStartByte] 字节开始，跳过 [bitOffset] 位，读出 [bitCount]
+     * 位，按大端（高位在前）拼成一个整数——PDF 图像样本流的标准打包方式，见
+     * [decodeRawImageByBitDepth] KDoc。越界（行数据不够）按 0 处理，不抛异常，
+     * 让调用方能继续把这一行剩下的像素解完，不因为末尾几个字节缺失就整张图作废。
+     */
+    private fun readBitsMsbFirst(bytes: ByteArray, rowStartByte: Int, bitOffset: Int, bitCount: Int): Int {
+        var result = 0
+        for (i in 0 until bitCount) {
+            val globalBit = bitOffset + i
+            val byteIndex = rowStartByte + globalBit / 8
+            val bitInByte = 7 - (globalBit % 8)
+            val bit = if (byteIndex in bytes.indices) (bytes[byteIndex].toInt() shr bitInByte) and 1 else 0
+            result = (result shl 1) or bit
+        }
+        return result
+    }
 
     /** 见上方 KDoc"已知问题"一节。键是部首补充区码位，值是对应的常用独立汉字。 */
     private val RADICALS_SUPPLEMENT_FIX = mapOf(
@@ -1272,17 +1359,28 @@ object PdfTextExtractor {
                 }
             }
             if (!decodeImages) return
-            // 2026-08-20 修复 NOTES.md #19（花屏）：真机诊断日志实测确认根因——
-            // PdfBox-Android 的 SampledImageReader.getRGBImage 只有 bitsPerComponent
-            // 是 1 或 8 时有专门的解码路径，其余位深（真机复现的是 4 位）会打一行
-            // "other-bit image not supported"日志后，仍然照样调用只认"每个颜色分量
-            // 正好 1 字节"的 from8bit——4 位数据被当 8 位读，字节和像素对不上，行数/
-            // 高度全部算错（真机复现：983×1441 的图解码成 983×240，高度被砍到约
-            // 1/6，画面因此被压扁+错位，也就是用户看到的"对角线花屏"）。这是第三方
-            // 库本身的缺陷，没法直接改库代码——遇到库明确不支持的位深就跳过这张图，
-            // 不展示、不是展示错误内容，跟本类"宁可漏检，不可展示错误内容"一贯的
-            // 降级原则一致。
+            // 2026-08-20 修复 NOTES.md #19（花屏），2026-08-21 改成真正解码而不是
+            // 跳过：PdfBox-Android 的 SampledImageReader.getRGBImage 只有
+            // bitsPerComponent 是 1 或 8 时有专门的解码路径，其余位深（真机复现的
+            // 是 4 位）会打一行"other-bit image not supported"日志后，仍然照样调用
+            // 只认"每个颜色分量正好 1 字节"的 from8bit——4 位数据被当 8 位读，字节
+            // 和像素对不上，行数/高度全部算错，画面因此被压扁+错位（对角线花屏）。
+            // 这是第三方库本身的缺陷，库内部没有第二条路径能绕开。最初的修法是遇到
+            // 库不支持的位深就跳过这张图不显示——用户反馈这个思路是错的，图片应该
+            // 按需正常加载出来，不是消失。改成自己实现一个"按位深正确解包"的解码器
+            // （[decodeRawImageByBitDepth]）：直接读原始样本字节流（`createInputStream`
+            // 已经把 FlateDecode 之类的压缩过滤器处理完了，剩下的就是按 bitsPerComponent
+            // 打包的位流），按位读出每个分量的值，缩放到 0-255，自己拼出正确的
+            // `Bitmap`。范围限定在灰度/RGB（[numComponents] 是 1 或 3）——不支持
+            // 调色板索引色/CMYK 这些更复杂的颜色空间，遇到解不了的情况仍然跳过
+            // 不展示（不展示错误内容），只是把"能覆盖"的范围从"1/8 位"扩大到
+            // "任意位深的灰度/RGB"。
             if (pdImage.bitsPerComponent != 1 && pdImage.bitsPerComponent != 8) {
+                val manuallyDecoded = runCatching { decodeRawImageByBitDepth(pdImage) }.getOrNull()
+                if (manuallyDecoded != null) {
+                    val ctm = graphicsState.currentTransformationMatrix
+                    images.add(applyCtmOrientation(manuallyDecoded, ctm))
+                }
                 return
             }
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG

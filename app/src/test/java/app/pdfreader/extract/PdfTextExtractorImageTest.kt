@@ -196,4 +196,67 @@ class PdfTextExtractorImageTest {
         val pdStream = PDStream(cosStream)
         return PDImageXObject(pdStream, com.tom_roush.pdfbox.pdmodel.PDResources())
     }
+
+    /**
+     * 2026-08-21：用户反馈"之前花屏选择不加载的思路是错的，需要按需加载"——
+     * `bitsPerComponent` 不是 1/8（PdfBox-Android 没有专门解码路径的位深，见
+     * NOTES.md #19）不该直接跳过不显示，改成自己按位深正确解包（[PdfTextExtractor
+     * .decodeRawImageByBitDepth]，通过这条 [drawImage] 流程间接验证，那个函数本身
+     * 是 `private`）。这条测试手工拼一张 2×1 像素、4 位每分量的 RGB 原始图像
+     * （不走任何压缩 Filter，直接摆位打包好的字节），验证解码出的两个像素颜色
+     * 分量正确——不是"能不能显示"这种粗粒度断言，是逐分量数值核对，因为这个
+     * bug 当初就是"位深换算错了导致行/高度全乱"，只验证"图片非空"不够。
+     *
+     * 手工打包（大端、逐分量 4 位、每行按字节对齐）：
+     * 像素0 (R=15,G=0,B=8) → 二进制 1111 0000 1000 → 字节0=0xF0，字节1 高 4 位=0x8
+     * 像素1 (R=0,G=15,B=0) → 二进制 0000 1111 0000 → 字节1 低 4 位=0x0，字节2=0xF0
+     * 拼起来正好 3 字节：[0xF0, 0x80, 0xF0]（2 像素×3 分量×4 位=24 位=3 字节，
+     * 这一行天然字节对齐，不用另外补位）。
+     * 4 位满量程是 15，缩放到 0-255：15→255，0→0，8→136（8*255/15 取整）。
+     */
+    @Test
+    fun `4位每分量的RGB图片能正确解码出颜色（不再是直接跳过不显示）`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage()
+        document.addPage(page)
+
+        val cosStream = document.document.createCOSStream()
+        cosStream.createOutputStream().use { it.write(byteArrayOf(0xF0.toByte(), 0x80.toByte(), 0xF0.toByte())) }
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.TYPE, com.tom_roush.pdfbox.cos.COSName.XOBJECT)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.SUBTYPE, com.tom_roush.pdfbox.cos.COSName.IMAGE)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.WIDTH, 2)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.HEIGHT, 1)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.BITS_PER_COMPONENT, 4)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.COLORSPACE, com.tom_roush.pdfbox.cos.COSName.DEVICERGB)
+        val fourBitImage = PDImageXObject(PDStream(cosStream), com.tom_roush.pdfbox.pdmodel.PDResources())
+
+        val drawStream = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(document, page)
+        drawStream.drawImage(fourBitImage, 0f, 0f, 40f, 20f)
+        drawStream.close()
+
+        val output = File.createTempFile("four-bit-image-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+
+        val content = PdfTextExtractor.extractContent(context, output)
+
+        assertEquals(1, content.images.size)
+        val bitmap = content.images.single().bitmap
+        assertEquals(2, bitmap.width)
+        assertEquals(1, bitmap.height)
+
+        val pixel0 = bitmap.getPixel(0, 0)
+        assertEquals(255, android.graphics.Color.red(pixel0))
+        assertEquals(0, android.graphics.Color.green(pixel0))
+        assertEquals(136, android.graphics.Color.blue(pixel0))
+
+        val pixel1 = bitmap.getPixel(1, 0)
+        assertEquals(0, android.graphics.Color.red(pixel1))
+        assertEquals(255, android.graphics.Color.green(pixel1))
+        assertEquals(0, android.graphics.Color.blue(pixel1))
+    }
 }
