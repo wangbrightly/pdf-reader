@@ -384,4 +384,60 @@ class PdfTextExtractorImageTest {
         val aspectRatioDiff = kotlin.math.abs(bitmap.width.toFloat() / bitmap.height - 2000f / 3000f)
         assertTrue("占位图应该保留原图的长宽比（误差在 0.05 以内），实际长宽比=${bitmap.width.toFloat() / bitmap.height}", aspectRatioDiff < 0.05f)
     }
+
+    /**
+     * 2026-08-22 真机反馈修复：`/Rotate 180` 的页面上，JBIG2 占位图的提示文字
+     * "图片格式不支持（JBIG2）"被转成上下颠倒、左右镜像，读不出来——真机截图实测
+     * 确认（用户反馈"翻到了"之后截图看到的）。根因：占位图是我们自己现画的提示
+     * 文字，从头到尾没有"原始扫描方向"这个概念，`orientImage`（CTM 朝向修正 +
+     * 页面级 `/Rotate` 修正）这两层修正的意义都是"把原始画面转回正确方向"，套用
+     * 在占位图上纯属误伤。修法是占位图分支不再调用 `orientImage`，直接原样加入
+     * `images`。
+     *
+     * 用 `/Rotate 90`（不是 180）验证：90° 旋转会交换宽高，如果修正逻辑被错误地
+     * 应用到占位图上，这里断言的长宽比会直接失败（宽高对调），比用 180°（宽高
+     * 不变，容易被"看起来没问题"掩盖过去）更容易在测试里揪出这类回归。
+     */
+    @Test
+    fun `页面设了 Rotate 90 时，JBIG2占位图的长宽比不受页面旋转影响（占位图不应该被转向）`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage()
+        page.rotation = 90
+        document.addPage(page)
+
+        val cosStream = document.document.createCOSStream()
+        cosStream.createOutputStream().use { it.write(byteArrayOf(0x00)) }
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.TYPE, com.tom_roush.pdfbox.cos.COSName.XOBJECT)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.SUBTYPE, com.tom_roush.pdfbox.cos.COSName.IMAGE)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.FILTER, com.tom_roush.pdfbox.cos.COSName.getPDFName("JBIG2Decode"))
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.WIDTH, 2000)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.HEIGHT, 3000)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.BITS_PER_COMPONENT, 1)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.COLORSPACE, com.tom_roush.pdfbox.cos.COSName.DEVICEGRAY)
+        val jbig2Image = PDImageXObject(PDStream(cosStream), com.tom_roush.pdfbox.pdmodel.PDResources())
+
+        val drawStream = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(document, page)
+        drawStream.drawImage(jbig2Image, 0f, 0f, 200f, 300f)
+        drawStream.close()
+
+        val output = File.createTempFile("jbig2-rotated-page-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+
+        val content = PdfTextExtractor.extractContent(context, output)
+
+        assertEquals(1, content.images.size)
+        val bitmap = content.images.single().bitmap
+        // 长宽比仍然要跟原图 2000x3000（2:3）一致——如果占位图被 90° 页面旋转
+        // 误伤，宽高会对调，长宽比会变成 3:2，这条断言会失败。
+        val aspectRatioDiff = kotlin.math.abs(bitmap.width.toFloat() / bitmap.height - 2000f / 3000f)
+        assertTrue(
+            "占位图不应该受页面 /Rotate 影响，长宽比应该仍然是 2000x3000 缩放而来，实际长宽比=${bitmap.width.toFloat() / bitmap.height}",
+            aspectRatioDiff < 0.05f,
+        )
+    }
 }

@@ -1511,13 +1511,16 @@ object PdfTextExtractor {
                 // 以及绕开它直接访问库内部的 JBIG2Document，两条路最终都会撞上
                 // Android 运行时完全不存在 javax.imageio.stream 这整个子包），
                 // 改成显示一块诚实的占位图（不是静默消失）。
-                val ctm = graphicsState.currentTransformationMatrix
-                images.add(
-                    orientImage(
-                        createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"),
-                        ctm,
-                    ),
-                )
+                //
+                // **不调用 orientImage**（2026-08-22 真机反馈修复）：占位图是我们
+                // 自己现画的提示文字，不是原图片的像素内容——CTM 朝向修正/页面级
+                // `/Rotate` 这两层修正的意义都是"把扫描仪/生成工具翻转过的原始画面
+                // 转回正确方向"，占位图从头到尾没有"原始方向"这个概念，硬套这两层
+                // 修正只会把提示文字转得倒过来、镜像过去，反而更不可读——真机截图
+                // 实测过这个 bug：`/Rotate 180` 的页面上"图片格式不支持（JBIG2）"
+                // 这行字被转成上下颠倒、左右镜像，读不出来。占位图直接原样加入，
+                // 保持提示文字永远朝上可读。
+                images.add(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"))
                 return
             }
             if (pdImage.bitsPerComponent != 1 && pdImage.bitsPerComponent != 8) {
