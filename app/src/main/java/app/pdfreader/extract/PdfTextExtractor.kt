@@ -351,7 +351,13 @@ object PdfTextExtractor {
      * 印刷行业常用 CMYK（4 通道）色彩空间存 JPEG，`BitmapFactory` 只认 RGB/YCbCr
      * （3 通道），把 4 通道数据硬当 3 通道读，色彩通道错位，视觉上就是这种对角线
      * 噪点/条纹。`pdImage.image`（PdfBox-Android 自己的解码路径）内部会调
-     * `PDColorSpace.toRGBImage` 做色彩空间转换，能正确处理 CMYK，只是慢。
+     * `PDColorSpace.toRGBImage` 做色彩空间转换，理论上能正确处理 CMYK，只是慢
+     * ——**这句话 2026-08-22 被推翻了，见 [decodeCmykJpegPlaceholderOrNull] KDoc**：
+     * 另一本书的 CMYK JPEG 真机验证过，回退到 `pdImage.image` 解码结果是纯黑，
+     * 不是花屏也不是正确颜色。当时（这次注释写的时候）只验证到"挡住快速路径能
+     * 消除花屏"，没有反过来验证"回退路径解码结果真的颜色正确"，是这次判断不完整
+     * 留下的缺口，下面第 4 条"实际修法"部分描述的仍然只是"怎么正确检测到 CMYK"，
+     * 不代表"检测到之后回退的路径本身没问题"。
      *
      * ### 走过的弯路：一开始想用 `pdImage.colorSpace.numberOfComponents` 判断，行不通
      *
@@ -387,6 +393,50 @@ object PdfTextExtractor {
         val options = BitmapFactory.Options().apply { inSampleSize = subsampling }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }.getOrNull()
+
+    /**
+     * CMYK/YCCK（4 分量）JPEG——真机反馈"这本书图片显示颜色不对"→"背景变为黑色"，
+     * 加诊断日志逐张记录 suffix/JPEG 真实分量数（[JpegComponentCount.of]，读 SOF
+     * 标记，不受 [PDImage.colorSpace] 的"CMYK 永远误报成 DeviceRGB"这个已知缺陷
+     * 影响，见 [decodeJpegWithNativeSubsampling] KDoc"已修：CMYK JPEG..."一节）/
+     * 解码结果的网格采样纯黑像素占比，装机复现：这本书里的 JPEG 图片全部是
+     * 4 分量（真实 CMYK/YCCK），解码结果**网格采样纯黑占比接近或等于 100%**
+     * （比如 3675/3675、10488/10488），不是某几张个别图片的偶发问题。
+     *
+     * **两条路径都试过、真机验证过都不行，别再重复评估同一条路**：
+     * 1. `pdImage.image`（PdfBox-Android 自己的解码路径，[decodeJpegWithNative
+     *    Subsampling] 的 CMYK JPEG 修复历史记录里曾经写过"内部会调
+     *    `PDColorSpace.toRGBImage` 做色彩空间转换，能正确处理 CMYK，只是慢"——
+     *    这次真机数据证明这个说法对**这批** CMYK JPEG 不成立，解码结果纯黑）。
+     * 2. 绕开 PdfBox-Android，直接用安卓原生 `BitmapFactory.decodeByteArray`
+     *    解码同一份原始 JPEG 字节（不带任何降采样参数）——结果同样纯黑。两条
+     *    完全独立的解码路径（一个是纯 Java 的 PdfBox 实现，一个是安卓自带的
+     *    Skia/libjpeg-turbo 原生实现）给出一致的失败结果，说明这不是 PdfBox-
+     *    Android 这一个库的 bug，是这台设备的安卓系统层 JPEG 解码器本身就不认
+     *    识这批 JPEG 用的这种 CMYK/YCCK 编码变体（推测是 Adobe 反色 CMYK 之类
+     *    的非标准约定，具体是哪一种没有继续深挖字节级细节）。
+     *
+     * **真正正确解码 CMYK JPEG 需要自己实现或引入一个支持 CMYK 的 JPEG 解码器**
+     * ——跟 [createUnsupportedImagePlaceholder] KDoc"JBIG2 现状"一节记录的
+     * JBIG2 困境是同一个数量级的工作量，这次不做。改成跟 JBIG2 一样显示诚实的
+     * 占位图，不展示纯黑色块（纯黑块看起来像"图片整个坏掉了"，比一块写清楚
+     * 原因的占位图更容易让人误以为是软件本身的严重故障）。
+     *
+     * 检测本身很轻量——只读 JPEG 头部的 SOF 标记算分量数（[JpegComponentCount]
+     * 不需要解码整张图），4 分量就直接判定为"这台设备解不出来"，不用真的跑一遍
+     * 解码再看结果是不是纯黑（那样反而更慢，白白解码一遍还是要扔掉）。
+     *
+     * @return 不是 4 分量 JPEG（不需要这条特殊处理）时返回 `null`，调用方按正常
+     * 流程继续走 [decodeJpegWithNativeSubsampling]/`pdImage.image`。
+     */
+    private fun decodeCmykJpegPlaceholderOrNull(pdImage: PDImage): Bitmap? {
+        if (pdImage.suffix != "jpg") return null
+        val components = runCatching {
+            pdImage.createInputStream(listOf("DCTDecode", "DCT")).use { JpegComponentCount.of(it.readBytes()) }
+        }.getOrNull()
+        if (components != 4) return null
+        return createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（CMYK JPEG）")
+    }
 
     /**
      * "解不出来的图片"用一块诚实的占位图代替，不静默消失——真机反馈"有的图片干脆
@@ -429,6 +479,13 @@ object PdfTextExtractor {
      * 保留原图长宽比（不然版面比例会跟原文档差很多），但缩到一个很小的固定尺寸
      * （长边 [PLACEHOLDER_LONG_SIDE_PX]）——原图可能几千像素见方，占位图不需要
      * 那么大内存。
+     *
+     * ## 第二个使用场景：CMYK JPEG（2026-08-22 新增）
+     *
+     * 见 [decodeCmykJpegPlaceholderOrNull] KDoc 完整背景——4 分量 CMYK/YCCK
+     * JPEG 在这台设备上无论走 PdfBox-Android 自己的解码还是安卓原生
+     * `BitmapFactory` 都会解出纯黑图片（真机验证过，两条独立路径结果一致），
+     * 同样改成显示这块占位图，不展示看起来像"整个坏掉了"的纯黑色块。
      */
     private fun createUnsupportedImagePlaceholder(originalWidth: Int, originalHeight: Int, reason: String): Bitmap {
         val safeWidth = if (originalWidth > 0) originalWidth else 1
@@ -1548,21 +1605,24 @@ object PdfTextExtractor {
                 }
                 return
             }
+            // 见 decodeCmykJpegPlaceholderOrNull KDoc 完整背景：CMYK/YCCK JPEG 在这台
+            // 设备上无论走哪条解码路径最终都会解出纯黑图片，真机验证过后改成跟
+            // JBIG2 一样显示诚实占位图，不显示纯黑色块。检测放在 [decodeJpegWithNative
+            // Subsampling] 之前——那个函数内部虽然也会跳过非 3 分量的 JPEG（避免带
+            // 降采样参数那条路径的对角线花屏），但跳过之后仍然会走到下面的 `pdImage
+            // .image`，那条路径同样会产出纯黑图片，不提前拦截的话用户还是会看到
+            // 纯黑块。
+            val cmykPlaceholder = decodeCmykJpegPlaceholderOrNull(pdImage)
+            if (cmykPlaceholder != null) {
+                images.add(cmykPlaceholder)
+                return
+            }
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
             // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
             // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。
             val bitmap = decodeJpegWithNativeSubsampling(pdImage)
                 ?: runCatching { pdImage.image }.getOrNull()
-            if (bitmap == null) {
-                // 同上，临时诊断，诊断完会删掉。
-                android.util.Log.d(
-                    "PdfReaderDebug",
-                    "图片被跳过[标准解码失败] bpc=${pdImage.bitsPerComponent} " +
-                        "suffix=${runCatching { pdImage.suffix }.getOrNull()} " +
-                        "宽高=${pdImage.width}x${pdImage.height}",
-                )
-                return
-            }
+                ?: return
             val ctm = graphicsState.currentTransformationMatrix
             images.add(orientImage(bitmap, ctm))
         }

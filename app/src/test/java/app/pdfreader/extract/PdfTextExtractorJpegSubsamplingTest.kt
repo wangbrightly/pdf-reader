@@ -109,24 +109,29 @@ class PdfTextExtractorJpegSubsamplingTest {
     }
 
     @Test
-    fun `超过阈值的大 CMYK JPEG 不走原生降采样路径，回退到 pdImage-image 保住颜色正确`() {
-        // 2026-08-20 真机反馈修复：安卓 BitmapFactory 解码 CMYK（4 通道）JPEG 有已知
+    fun `CMYK JPEG 不走原生降采样路径，也不回退到 pdImage-image，显示占位图`() {
+        // 2026-08-20 最初的修法：安卓 BitmapFactory 解码 CMYK（4 通道）JPEG 有已知
         // 老毛病，把 4 通道数据当 3 通道 RGB 硬读，视觉上是对角线彩色噪点花屏——见
-        // decodeJpegWithNativeSubsampling KDoc"已修"一节完整背景。
+        // decodeJpegWithNativeSubsampling KDoc"已修"一节完整背景，当时的结论是
+        // "挡住快速路径、回退到 pdImage.image 就能保住颜色正确"。
+        //
+        // 2026-08-22 推翻这条结论（真机反馈修复）：用户反馈另一本书"图片显示颜色
+        // 不对"→"背景变为黑色"，装机诊断发现回退到的 pdImage.image 对**这批**
+        // CMYK JPEG 解码结果网格采样纯黑占比接近 100%——不是花屏，是纯黑。进一步
+        // 验证：绕开 PdfBox-Android、直接用安卓原生 BitmapFactory 解码同一份原始
+        // JPEG 字节（不带降采样参数）结果同样纯黑。两条独立解码路径（PdfBox 纯
+        // Java 实现 + 安卓自带 Skia/libjpeg-turbo 原生实现）给出一致的失败结果，
+        // 证明"pdImage.image 能正确处理 CMYK"这个假设是错的，至少对这类 CMYK/
+        // YCCK 编码变体不成立。改成跟 JBIG2 一样显示诚实的占位图（见
+        // decodeCmykJpegPlaceholderOrNull KDoc 完整背景），不展示纯黑块。
         //
         // 注意：这里不能用 `imageXObject.colorSpace.numberOfComponents` 验证 fixture
         // 确实是 CMYK——反编译确认过 `PDImageXObject.createFromByteArray` 内部固定
-        // 用 `PDDeviceRGB.INSTANCE`，不管字节实际是什么颜色空间都报 3（这正是第一版
-        // 修法失败的原因，也是为什么最终改成直接解析 JPEG 字节本身的 SOF 段——见
-        // JpegComponentCount 类注释）。这里改成直接断言 fixture 文件本身的字节，
-        // 跟 JpegComponentCountTest 用的是同一份 fixture、同一个判断依据。
+        // 用 `PDDeviceRGB.INSTANCE`，不管字节实际是什么颜色空间都报 3。这里改成
+        // 直接断言 fixture 文件本身的字节，跟 JpegComponentCountTest 用的是同一份
+        // fixture、同一个判断依据。
         //
-        // fixture `cmyk-quadrant.jpg`（3000×2000，4 通道 CMYK，Python Pillow 生成）
-        // 尺寸上会触发 subsamplingFactor 算出 2 倍降采样（跟上面"大 JPEG"那条测试
-        // 同一个阈值），但因为是 CMYK，应该被 JpegComponentCount 挡在原生解码路径
-        // 之外，回退到 pdImage.image——这条路径不做尺寸降采样，解码结果应该还是
-        // 原始的 3000x2000，而不是降采样后的 ~1500x1000（用尺寸间接验证走了哪条
-        // 路径，原因见本文件类注释"只验证解码尺寸，不验证像素颜色"一节）。
+        // fixture `cmyk-quadrant.jpg`（3000×2000，4 通道 CMYK，Python Pillow 生成）。
         val context = RuntimeEnvironment.getApplication()
         PDFBoxResourceLoader.init(context)
         val document = PDDocument()
@@ -147,7 +152,16 @@ class PdfTextExtractorJpegSubsamplingTest {
         val content = PdfTextExtractor.extractContent(context, output)
         assertEquals(1, content.images.size)
         val bitmap = content.images.single().bitmap
-        assertEquals("CMYK 图应该回退到 pdImage.image，解码结果是原始尺寸，不应该被降采样", 3000, bitmap.width)
-        assertEquals("CMYK 图应该回退到 pdImage.image，解码结果是原始尺寸，不应该被降采样", 2000, bitmap.height)
+        // 占位图长边缩到很小（远小于原图 3000px），且保留原图 3000x2000（3:2）
+        // 的长宽比——用这两点间接验证走的是占位图路径，不是真的解码出原图。
+        assertTrue(
+            "占位图长边应该远小于原图，不该是 pdImage.image 解码出来的原始尺寸，实际=${bitmap.width}x${bitmap.height}",
+            maxOf(bitmap.width, bitmap.height) < 1000,
+        )
+        val aspectRatioDiff = kotlin.math.abs(bitmap.width.toFloat() / bitmap.height - 3000f / 2000f)
+        assertTrue(
+            "占位图应该保留原图 3000x2000 的长宽比，实际长宽比=${bitmap.width.toFloat() / bitmap.height}",
+            aspectRatioDiff < 0.05f,
+        )
     }
 }
