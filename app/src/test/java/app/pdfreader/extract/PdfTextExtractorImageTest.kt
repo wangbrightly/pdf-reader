@@ -325,4 +325,63 @@ class PdfTextExtractorImageTest {
         assertEquals(0, android.graphics.Color.green(pixel1))
         assertEquals(0, android.graphics.Color.blue(pixel1))
     }
+
+    /**
+     * 2026-08-21：用户反馈"图片加载不全"→"有的图片干脆不出现"——真机诊断日志确认
+     * 是 JBIG2 格式（扫描书常用的黑白压缩格式），PdfBox-Android 这个 fork 完全没
+     * 实现 JBIG2，`pdImage.image` 对这种图片必定失败，原来的兜底逻辑因此把每一张
+     * 都静默跳过。试过接 Apache 官方的 jbig2-imageio 库，装机验证过走不通（真机
+     * 抛 `NoClassDefFoundError: javax/imageio/ImageReader`，Android 运行时压根没有
+     * 这个类，见 [PdfTextExtractor.createUnsupportedImagePlaceholder] KDoc 完整
+     * 背景），改成显示一块保留原图长宽比的占位图，不再是静默消失。
+     *
+     * `/Filter /JBIG2Decode` 是 PDFBox 判定 `pdImage.suffix == "jb2"` 的依据——这条
+     * 测试不需要合法的 JBIG2 编码字节（占位图路径根本不读原始图片数据，只用
+     * 宽高），随便塞几个字节能让 `COSStream` 非空即可。
+     */
+    @Test
+    fun `JBIG2图片显示占位图，不再静默消失`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage()
+        document.addPage(page)
+
+        val cosStream = document.document.createCOSStream()
+        cosStream.createOutputStream().use { it.write(byteArrayOf(0x00)) }
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.TYPE, com.tom_roush.pdfbox.cos.COSName.XOBJECT)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.SUBTYPE, com.tom_roush.pdfbox.cos.COSName.IMAGE)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.FILTER, com.tom_roush.pdfbox.cos.COSName.getPDFName("JBIG2Decode"))
+        // 2000x3000：故意用一个远超屏幕分辨率的尺寸，验证占位图会按长宽比缩小，
+        // 不会真的分配一张几千像素见方、内存爆炸的 Bitmap 只为了画几个字。
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.WIDTH, 2000)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.HEIGHT, 3000)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.BITS_PER_COMPONENT, 1)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.COLORSPACE, com.tom_roush.pdfbox.cos.COSName.DEVICEGRAY)
+        val jbig2Image = PDImageXObject(PDStream(cosStream), com.tom_roush.pdfbox.pdmodel.PDResources())
+        assertEquals("这条测试的前提假设——PDFBox 按 /Filter 把这张图判定成 jb2，占位图逻辑才会生效", "jb2", jbig2Image.suffix)
+
+        val drawStream = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(document, page)
+        drawStream.drawImage(jbig2Image, 0f, 0f, 200f, 300f)
+        drawStream.close()
+
+        val output = File.createTempFile("jbig2-image-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+
+        val content = PdfTextExtractor.extractContent(context, output)
+
+        // 占位图算作一张图片正常插入版面（不是"抽取失败/跳过"），只是内容是占位
+        // 提示，不是真解出来的画面。
+        assertEquals(1, content.images.size)
+        val bitmap = content.images.single().bitmap
+        assertTrue("占位图应该有正常的正宽高", bitmap.width > 0 && bitmap.height > 0)
+        // 原图 2000x3000（长宽比 2:3），占位图应该保持同样的长宽比，且长边远小于
+        // 原图（不该真的分配几千像素见方的 Bitmap）。
+        assertTrue("占位图长边应该远小于原图，不该真的按原始尺寸分配内存", maxOf(bitmap.width, bitmap.height) < 1000)
+        val aspectRatioDiff = kotlin.math.abs(bitmap.width.toFloat() / bitmap.height - 2000f / 3000f)
+        assertTrue("占位图应该保留原图的长宽比（误差在 0.05 以内），实际长宽比=${bitmap.width.toFloat() / bitmap.height}", aspectRatioDiff < 0.05f)
+    }
 }

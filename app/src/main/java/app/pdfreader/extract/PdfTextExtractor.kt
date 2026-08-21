@@ -264,6 +264,9 @@ object PdfTextExtractor {
     /** 见 [PageContentStreamEngine.hasFullPageImage] KDoc——图片渲染宽/高都达到页面宽/高的这个比例才算"占满全页"。 */
     private const val FULL_PAGE_IMAGE_COVERAGE_RATIO = 0.7f
 
+    /** 见 [createUnsupportedImagePlaceholder] KDoc"占位图怎么画"一节——占位图长边缩到多少像素。 */
+    private const val PLACEHOLDER_LONG_SIDE_PX = 400f
+
     /**
      * 内嵌图片长边（`max(width, height)`）超过 [MAX_IMAGE_DIMENSION_PX] 判定为"过大"，
      * 每次减半算出理论上该降到多少——纯数学，见 [decodeJpegWithNativeSubsampling]
@@ -384,6 +387,65 @@ object PdfTextExtractor {
         val options = BitmapFactory.Options().apply { inSampleSize = subsampling }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }.getOrNull()
+
+    /**
+     * "解不出来的图片"用一块诚实的占位图代替，不静默消失——真机反馈"有的图片干脆
+     * 不出现"（NOTES.md #24 后续小节）追出根因是 JBIG2（扫描书常用的黑白压缩格式），
+     * PdfBox-Android 这个 fork 完全没实现 JBIG2 解码器。
+     *
+     * ## JBIG2 现状：真正解码目前没有可行路径（已验证，别重复踩）
+     *
+     * 试过接 Apache 官方的 `jbig2-imageio`（原 levigo/jbig2-imageio 捐赠给 Apache
+     * PDFBox 项目，纯 Java、Apache 2.0 许可证、无 native 代码、Maven Central 确认
+     * 无运行时第三方依赖——供应链信任度够）——**装机验证过，走不通**：真机日志
+     * `NoClassDefFoundError: Failed resolution of: Ljavax/imageio/ImageReader;`。
+     * 这个库是标准 `javax.imageio` ImageReader 插件，依赖 `java.awt.image
+     * .BufferedImage`/`javax.imageio.*` 这些桌面 Java API——`android.jar` 编译期有
+     * 桩类能过编译，`gradle assembleDebug`/`dexBuilderDebug` 也都能成功打包，**但
+     * Android 运行时压根没有这些类的真实实现**，编译成功、装机跑真正的解码代码
+     * 才会炸。这不是"某个版本的 bug"，是 Android 平台从设计上就不包含
+     * AWT/Swing/ImageIO 这整层桌面 GUI 相关 API，没有版本能绕开。
+     *
+     * 唯一还没试过的路：JNI 包一个 C 语言的 JBIG2 解码器（比如 `jbig2dec`）——跟本
+     * 项目"无 native 库"的一贯选型原则（见 `CLAUDE.md` 拒绝 MuPDF 的理由）直接冲突，
+     * 供应链信任度/编译风险都跟当初放弃 MuPDF 是同一类考量，这次没有采用；或者
+     * 从 JBIG2 规范（ITU-T T.88）自己实现一个纯 Kotlin 解码器——工作量是"整个格式的
+     * 算术编码+通用区域解码+符号字典+文字区域"，规模上不是这个项目其它"库有 bug、
+     * 自己按规范补一段"类型的修复能比的，这次没有做，留给以后有明确需要时再评估。
+     *
+     * ## 占位图怎么画
+     *
+     * 保留原图长宽比（不然版面比例会跟原文档差很多），但缩到一个很小的固定尺寸
+     * （长边 [PLACEHOLDER_LONG_SIDE_PX]）——原图可能几千像素见方，占位图不需要
+     * 那么大内存。
+     */
+    private fun createUnsupportedImagePlaceholder(originalWidth: Int, originalHeight: Int, reason: String): Bitmap {
+        val safeWidth = if (originalWidth > 0) originalWidth else 1
+        val safeHeight = if (originalHeight > 0) originalHeight else 1
+        val longSide = maxOf(safeWidth, safeHeight).toFloat()
+        val scale = PLACEHOLDER_LONG_SIDE_PX / longSide
+        val width = (safeWidth * scale).toInt().coerceAtLeast(1)
+        val height = (safeHeight * scale).toInt().coerceAtLeast(1)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        canvas.drawColor(android.graphics.Color.parseColor("#EEEEEE"))
+        canvas.drawRect(
+            1f, 1f, width - 1f, height - 1f,
+            android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#CCCCCC")
+                style = android.graphics.Paint.Style.STROKE
+                strokeWidth = 2f
+            },
+        )
+        val paint = android.graphics.Paint().apply {
+            color = android.graphics.Color.parseColor("#888888")
+            textSize = (width / 12f).coerceIn(16f, 48f)
+            isAntiAlias = true
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        canvas.drawText(reason, width / 2f, height / 2f, paint)
+        return bitmap
+    }
 
     /**
      * 见 [PageContentStreamEngine.drawImage] KDoc"2026-08-21 改成真正解码"一节——
@@ -1393,6 +1455,24 @@ object PdfTextExtractor {
             // 调色板索引色/CMYK 这些更复杂的颜色空间，遇到解不了的情况仍然跳过
             // 不展示（不展示错误内容），只是把"能覆盖"的范围从"1/8 位"扩大到
             // "任意位深的灰度/RGB"。
+            if (pdImage.suffix == "jb2") {
+                // 见 createUnsupportedImagePlaceholder KDoc"JBIG2 现状"一节完整背景：
+                // 装机验证过接 Apache 官方 jbig2-imageio 这条路走不通（真机抛
+                // NoClassDefFoundError: javax/imageio/ImageReader——这个类不在 Android
+                // 运行时里），已经撤回那次改动。JBIG2 是扫描书常用的黑白压缩格式，
+                // PdfBox-Android 这个 fork 完全没实现，真正解出内容目前没有可行路径，
+                // 改成显示一块诚实的占位图（不是静默消失），真机反馈"有的图片干脆
+                // 不出现"至少能看出"这里本来有张图、只是格式不支持"，不是无缘无故
+                // 缺了一块。
+                val ctm = graphicsState.currentTransformationMatrix
+                images.add(
+                    applyCtmOrientation(
+                        createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"),
+                        ctm,
+                    ),
+                )
+                return
+            }
             if (pdImage.bitsPerComponent != 1 && pdImage.bitsPerComponent != 8) {
                 val manualResult = runCatching { decodeRawImageByBitDepth(pdImage) }
                 manualResult.exceptionOrNull()?.let {
@@ -1402,6 +1482,19 @@ object PdfTextExtractor {
                 if (manuallyDecoded != null) {
                     val ctm = graphicsState.currentTransformationMatrix
                     images.add(applyCtmOrientation(manuallyDecoded, ctm))
+                } else {
+                    // 临时诊断："有的图片干脆不出现"——先确认是不是命中了这条手动解码
+                    // 失败、没有任何回退的分支，顺带记下实际字节数，方便跟
+                    // decodeRawImageByBitDepth KDoc 里那次诊断一样直接反推分量数对不对
+                    // 得上。诊断完会删掉，不留在正式代码里。
+                    val actualBytes = runCatching { pdImage.createInputStream().use { it.readBytes().size } }.getOrNull()
+                    android.util.Log.d(
+                        "PdfReaderDebug",
+                        "图片被跳过[手动解码失败] bpc=${pdImage.bitsPerComponent} " +
+                            "宽高=${pdImage.width}x${pdImage.height} " +
+                            "颜色空间分量数=${runCatching { pdImage.colorSpace.numberOfComponents }.getOrNull()} " +
+                            "实际字节数=$actualBytes",
+                    )
                 }
                 return
             }
@@ -1410,7 +1503,16 @@ object PdfTextExtractor {
             // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。
             val bitmap = decodeJpegWithNativeSubsampling(pdImage)
                 ?: runCatching { pdImage.image }.getOrNull()
-                ?: return
+            if (bitmap == null) {
+                // 同上，临时诊断，诊断完会删掉。
+                android.util.Log.d(
+                    "PdfReaderDebug",
+                    "图片被跳过[标准解码失败] bpc=${pdImage.bitsPerComponent} " +
+                        "suffix=${runCatching { pdImage.suffix }.getOrNull()} " +
+                        "宽高=${pdImage.width}x${pdImage.height}",
+                )
+                return
+            }
             val ctm = graphicsState.currentTransformationMatrix
             images.add(applyCtmOrientation(bitmap, ctm))
         }

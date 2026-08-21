@@ -610,3 +610,56 @@ bug——`uiautomator dump` 看到 `RecyclerView` 里图片条目位置很奇怪
 一下，别急着信一张可能被截断的截图**——已经在 `feedback_verify_on_real_path`
 这条记忆里记过类似教训（模拟环境自测比不测更有欺骗性），这次是同一个精神的
 另一种表现形式（"看起来传完整了的文件，其实是截断的"）。
+
+## 25. 已修（部分）：JBIG2 图片"有的干脆不出现"——真正解码走不通，改成显示占位图
+
+**背景**：#24 修完之后用户追加反馈"图片加载不全"，追问确认是"有的图片干脆不
+出现"（不是显示不完整/加载慢）。加诊断日志直接在 `drawImage` 里记录每一次
+图片被跳过的原因，真机复现：
+
+```
+图片被跳过[标准解码失败] bpc=1 suffix=jb2 宽高=2112x3012
+```
+
+**根因**：`suffix=jb2` 说明是 JBIG2 编码——扫描书常用的黑白（1 位）压缩格式，
+PdfBox-Android 这个 fork 完全没实现 JBIG2 解码器，`pdImage.image` 对这种图片
+必定失败，原来的兜底逻辑因此把每一张 JBIG2 图片都静默跳过，不报错也不提示。
+
+**试过、装机验证过走不通的路**：接入 Apache 官方的 `jbig2-imageio`
+（`org.apache.pdfbox:jbig2-imageio:3.0.5`，原 levigo/jbig2-imageio 捐赠给
+Apache PDFBox 项目，纯 Java、Apache 2.0 许可证、无 native 代码、经查 Maven
+Central 确认无运行时第三方依赖——供应链信任度够，事先跟用户确认过要不要
+接这条路）。`gradle assembleDebug`/`dexBuilderDebug` 都能成功打包（编译期
+`android.jar` 有桩类能过编译），**但装机真机测试直接炸**：
+
+```
+decodeJbig2 抛异常: java.lang.NoClassDefFoundError: Failed resolution of: Ljavax/imageio/ImageReader;
+```
+
+这个库是标准 `javax.imageio` ImageReader 插件，依赖 `java.awt.image
+.BufferedImage`/`javax.imageio.*` 这些桌面 Java API——**Android 运行时从设计
+上就不包含整个 AWT/Swing/ImageIO 桌面 GUI API 体系**，编译能过、装机就抛
+`NoClassDefFoundError`，没有版本能绕开这一点。已撤回这次依赖改动
+（`build.gradle.kts`）。
+
+**已修的部分**：JBIG2 图片改成显示一块保留原图长宽比、缩到固定小尺寸
+（长边 400px，见 `PdfTextExtractor.createUnsupportedImagePlaceholder`）的
+占位图（浅灰底+边框+"图片格式不支持（JBIG2）"提示文字），不再静默消失——
+真机装机验证过占位图确实画出来了（背景色像素采样精确匹配 `#EEEEEE`）。有
+单元测试覆盖（`PdfTextExtractorImageTest`"JBIG2图片显示占位图，不再静默
+消失"）。
+
+**未修的部分（如实记录，别下次重复评估同一条路）**：真正解出 JBIG2 内容
+目前没有可行路径——唯一还没试过的是 JNI 包一个 C 语言解码器（比如
+`jbig2dec`），但跟本项目"无 native 库"的一贯选型原则直接冲突（见
+`CLAUDE.md` 拒绝 MuPDF 的理由，供应链信任度/编译风险是同一类考量）；或者
+从 JBIG2 规范（ITU-T T.88）自己实现一个纯 Kotlin 解码器——工作量是"整个
+格式的算术编码+通用区域解码+符号字典+文字区域"，规模上不是这个项目其它
+"库有 bug、自己按规范补一段"类型的修复能比的，这次没有做。
+
+**方法论**：跟 #19/#23/#24 一样，先加诊断日志拿到真实数据（`suffix=jb2`）
+再动手，选新依赖前用 WebSearch/WebFetch 核实许可证和依赖树（不是凭训练
+记忆猜），关键的"Android 运行时兼容性"这一条搜索结果给不出确定答案时，
+没有直接采信"应该没问题"，而是真的装机跑一遍拿到确定性的
+`NoClassDefFoundError`——事先跟用户说清楚"这条待验证"，出问题后如实
+汇报、撤回，不是硬撑着说"能用"。
