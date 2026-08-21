@@ -299,4 +299,66 @@ class PdfTextExtractorImageOrientationTest {
         assertTrue(bitmap.width > 0)
         assertTrue(bitmap.height > 0)
     }
+
+    /**
+     * [PdfTextExtractor.applyPageRotation] 的单元测试——见 [PdfTextExtractor]
+     * 类注释里 [PdfTextExtractor.PageContentStreamEngine.pageRotation] KDoc 完整
+     * 背景（真机反馈"这本书部分页面显示反了"，根因是页面字典的 `/Rotate` 从没
+     * 被读取过）。
+     *
+     * 只测"0 度不做任何处理"这条快速路径——`degrees != 0` 那条分支要靠
+     * `Bitmap.createBitmap(src,x,y,w,h,matrix,filter)` 真的按矩阵重采样像素，
+     * 这个重载在本机 Robolectric 环境下的影子实现不会真的重采样（见本文件顶部
+     * 注释"为什么不是...更直观的写法"一节，[PdfTextExtractor.applyCtmOrientation]
+     * 已经踩过、记录过的同一个环境限制），不是这次要重新验证的对象——真机上
+     * `Bitmap.createBitmap` 带 `Matrix` 参数是 Android 平台最基础的位图变换 API，
+     * `Matrix().postRotate(degrees)` 本身也没有翻转/旋转判断这类容易出错的推导
+     * 逻辑（不像 [PdfTextExtractor.orientationMatrixOrNull] 要处理 D4 群 8 种朝向），
+     * 出错的余地很小；"0 度提前返回、不碰重采样"这条路径本身，正是为了让绝大多数
+     * 没有 `/Rotate` 的正常页面完全不受这次改动影响，值得单独验证。
+     */
+    @Test
+    fun `页面没有旋转（0度）时占位图原样返回，不触发重采样`() {
+        val bitmap = buildQuadrantBitmap()
+        val rotated = PdfTextExtractor.applyPageRotation(bitmap, 0)
+        assertTrue("0 度旋转应该原样返回同一个 Bitmap 实例，不新建", rotated === bitmap)
+    }
+
+    /**
+     * 整页级集成测试：页面字典设 `/Rotate 90`，验证 `extractContent` 抽出的图片
+     * 数量、宽高都还是有效值（不是"0 度"那种可以精确断言输出内容的场景——
+     * `Bitmap.createBitmap` 带 `Matrix` 参数这一步在 Robolectric 下没法验证真实
+     * 像素，见上方 KDoc；这里验证的是"整条链路接上了 `page.rotation`、没有因为
+     * 多了这一步重采样而抛异常或产出退化结果"，跟本文件里"水平镜像 CTM"那条集成
+     * 测试是同一个验证层级）。
+     */
+    @Test
+    fun `页面设了 Rotate 90 时抽取流程正常跑完，不影响图片数量`() {
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage()
+        page.rotation = 90
+        document.addPage(page)
+
+        val pngBytes = requireNotNull(javaClass.classLoader?.getResourceAsStream("tiny.png")?.readBytes()) {
+            "找不到测试用的 tiny.png"
+        }
+        val imageXObject: PDImageXObject = PDImageXObject.createFromByteArray(document, pngBytes, "tiny")
+        PDPageContentStream(document, page).use { stream ->
+            stream.drawImage(imageXObject, 0f, 0f, 100f, 100f)
+        }
+
+        val output = File.createTempFile("rotated-page-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+
+        val content = PdfTextExtractor.extractContent(context, output)
+        assertEquals(1, content.images.size)
+        val bitmap = content.images.single().bitmap
+        assertTrue(bitmap.width > 0)
+        assertTrue(bitmap.height > 0)
+    }
 }

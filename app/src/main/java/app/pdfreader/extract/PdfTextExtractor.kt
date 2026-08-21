@@ -393,25 +393,36 @@ object PdfTextExtractor {
      * 不出现"（NOTES.md #24 后续小节）追出根因是 JBIG2（扫描书常用的黑白压缩格式），
      * PdfBox-Android 这个 fork 完全没实现 JBIG2 解码器。
      *
-     * ## JBIG2 现状：真正解码目前没有可行路径（已验证，别重复踩）
+     * ## JBIG2 现状：真正解码目前没有可行路径（两次真机验证过，别重复踩）
      *
-     * 试过接 Apache 官方的 `jbig2-imageio`（原 levigo/jbig2-imageio 捐赠给 Apache
-     * PDFBox 项目，纯 Java、Apache 2.0 许可证、无 native 代码、Maven Central 确认
-     * 无运行时第三方依赖——供应链信任度够）——**装机验证过，走不通**：真机日志
-     * `NoClassDefFoundError: Failed resolution of: Ljavax/imageio/ImageReader;`。
-     * 这个库是标准 `javax.imageio` ImageReader 插件，依赖 `java.awt.image
-     * .BufferedImage`/`javax.imageio.*` 这些桌面 Java API——`android.jar` 编译期有
-     * 桩类能过编译，`gradle assembleDebug`/`dexBuilderDebug` 也都能成功打包，**但
-     * Android 运行时压根没有这些类的真实实现**，编译成功、装机跑真正的解码代码
-     * 才会炸。这不是"某个版本的 bug"，是 Android 平台从设计上就不包含
-     * AWT/Swing/ImageIO 这整层桌面 GUI 相关 API，没有版本能绕开。
+     * **尝试 1**：接 Apache 官方的 `jbig2-imageio`（原 levigo/jbig2-imageio 捐赠给
+     * Apache PDFBox 项目，纯 Java、Apache 2.0 许可证、无 native 代码），走标准入口
+     * `JBIG2ImageReader.read()`（返回 `java.awt.image.BufferedImage`）——真机报
+     * `NoClassDefFoundError: Ljavax/imageio/ImageReader;`。
      *
-     * 唯一还没试过的路：JNI 包一个 C 语言的 JBIG2 解码器（比如 `jbig2dec`）——跟本
-     * 项目"无 native 库"的一贯选型原则（见 `CLAUDE.md` 拒绝 MuPDF 的理由）直接冲突，
-     * 供应链信任度/编译风险都跟当初放弃 MuPDF 是同一类考量，这次没有采用；或者
-     * 从 JBIG2 规范（ITU-T T.88）自己实现一个纯 Kotlin 解码器——工作量是"整个格式的
-     * 算术编码+通用区域解码+符号字典+文字区域"，规模上不是这个项目其它"库有 bug、
-     * 自己按规范补一段"类型的修复能比的，这次没有做，留给以后有明确需要时再评估。
+     * **尝试 2**：反过来查了这个库自己的源码结构，绕开 `JBIG2ImageReader` 那层
+     * 封装，同包直接访问库内部的 `JBIG2Document`/`JBIG2Page`/`Bitmap`（这几个类
+     * 本身很干净，`Bitmap` 完全不碰 `javax.imageio`；构造函数/`getBitmap()` 是
+     * `protected`，靠"同包可访问 protected 成员"这条语言规则拿到访问权限，不是
+     * 反射之类的取巧手段）。手写了一个不 extends 任何 `javax.imageio.stream.*`
+     * 抽象基类的 `ImageInputStream` 最小实现（`JBIG2Document` 构造函数唯一还需要
+     * 的类型），想验证"具体实现类不可用"和"接口本身不可用"是不是两件独立的事——
+     * **真机结果：连接口本身都不可用**：`NoClassDefFoundError:
+     * javax/imageio/stream/ImageInputStream;`。这就把"绕开具体类、只用接口"这条
+     * 路也彻底堵死了：`javax.imageio.stream` 整个子包（不只是某个具体类）在
+     * Android 运行时都不存在，`JBIG2Document` 构造函数签名依赖这个类型，绕不开。
+     *
+     * 两次真机验证共同证明：这个第三方库任何一层入口都会在某处触碰
+     * `javax.imageio`/`java.awt.image` 家族的类型，而 Android 平台从设计上就
+     * 不包含整个 AWT/Swing/ImageIO 桌面 GUI API 体系——`jbig2-imageio` 这条依赖
+     * 路径已经排除，不用再评估这个库的其它接入方式。
+     *
+     * **还没试过、以后有明确需要时再评估的路**：JNI 包一个 C 语言的 JBIG2 解码器
+     * （比如 `jbig2dec`）——跟本项目"无 native 库"的一贯选型原则（见 `CLAUDE.md`
+     * 拒绝 MuPDF 的理由）直接冲突，供应链信任度/编译风险都跟当初放弃 MuPDF 是同一
+     * 类考量；或者从 JBIG2 规范（ITU-T T.88）自己实现一个纯 Kotlin 解码器——
+     * 工作量是"整个格式的算术编码+通用区域解码+符号字典+文字区域"，规模上不是
+     * 这个项目其它"库有 bug、自己按规范补一段"类型的修复能比的。
      *
      * ## 占位图怎么画
      *
@@ -1125,6 +1136,28 @@ object PdfTextExtractor {
     }
 
     /**
+     * 页面级旋转（PDF 页面字典的 `/Rotate`）——真机反馈"这本书部分页面显示反了"
+     * 追出的根因：见 [PageContentStreamEngine.pageRotation] KDoc 完整背景，
+     * `PDPage.getMatrix()`（`drawImage` 拿到的 CTM 最终基于这个"初始矩阵"）固定
+     * 返回单位矩阵，完全不看 `/Rotate`，[applyCtmOrientation] 只处理 content
+     * stream 自己的 CTM，两者加起来仍然漏了页面级这一层——扫描书个别页面物理
+     * 扫描方向跟其它页不同时，靠 `/Rotate` 告诉阅读器"显示时把整页转一下"，我们
+     * 一直没读这个字段，图片因此按"未旋转"的方向显示，跟其它页对不上。
+     *
+     * `degrees` 是 [com.tom_roush.pdfbox.pdmodel.PDPage.getRotation] 返回的值——
+     * 已查官方源码确认永远是 0/90/180/270 这四个值之一（顺时针），不需要再自己
+     * 规整。0 度直接原样返回，避免给绝大多数没有这个字段的正常页面凭空多一次
+     * 位图重采样。
+     */
+    internal fun applyPageRotation(bitmap: Bitmap, degrees: Int): Bitmap {
+        if (degrees == 0) return bitmap
+        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+        return runCatching {
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        }.getOrDefault(bitmap)
+    }
+
+    /**
      * 见 [applyCtmOrientation] KDoc：只做矩阵计算，不碰任何 `Bitmap` 像素。返回
      * `null` 表示"不需要修正"——包括真正的 canonical（无翻转无旋转）、CTM 退化成
      * 零矩阵、以及非轴对齐（不在本次修复范围内）这三种情况，调用方统一处理成
@@ -1315,6 +1348,23 @@ object PdfTextExtractor {
         private val pageHeight = page.mediaBox.height
 
         /**
+         * 见 [applyPageRotation] KDoc 完整背景——真机反馈"这本书部分页面显示反了"，
+         * 根因是页面字典里的 `/Rotate`（扫描件很常见：整本书大部分页面正常拍摄，
+         * 个别页面扫描时物理方向不同，靠这个字段告诉阅读器"显示时把整页转一下"）
+         * 从头到尾没有被读取过——查官方源码确认 `PDPage.getMatrix()`（`drawImage`
+         * 一直在用的 `graphicsState.currentTransformationMatrix` 最终是从这个"初始
+         * 矩阵"累积出来的）固定返回单位矩阵，完全不看 `/Rotate`，这不是本项目代码
+         * 的 bug，是 PdfBox-Android 这一层的内容流处理管线本身就不管这件事（页面级
+         * 整页渲染的 `PDFRenderer` 是另一条独立代码路径，会正确处理，不受这个缺口
+         * 影响，见类注释"内嵌图片朝向修正"一节"已知局限"）。
+         */
+        private val pageRotation = page.rotation
+
+        /** 见 [pageRotation] KDoc——两层修正叠一起：先按 content stream 的 CTM 修正朝向，再叠加页面级 `/Rotate`。 */
+        private fun orientImage(bitmap: Bitmap, ctm: PdfMatrix): Bitmap =
+            applyPageRotation(applyCtmOrientation(bitmap, ctm), pageRotation)
+
+        /**
          * 2026-08-21 用户真机反馈+确认：某些扫描版文档的页面是"一整张图占满全页 +
          * 一行没有意义的乱码文字"——乱码来自扫描工具自动加的隐藏 OCR 文字层（为了
          * 让扫描件也能被搜索），跟图片内容毫无关系，识别质量差时就是这种反复出现
@@ -1456,17 +1506,14 @@ object PdfTextExtractor {
             // 不展示（不展示错误内容），只是把"能覆盖"的范围从"1/8 位"扩大到
             // "任意位深的灰度/RGB"。
             if (pdImage.suffix == "jb2") {
-                // 见 createUnsupportedImagePlaceholder KDoc"JBIG2 现状"一节完整背景：
-                // 装机验证过接 Apache 官方 jbig2-imageio 这条路走不通（真机抛
-                // NoClassDefFoundError: javax/imageio/ImageReader——这个类不在 Android
-                // 运行时里），已经撤回那次改动。JBIG2 是扫描书常用的黑白压缩格式，
-                // PdfBox-Android 这个 fork 完全没实现，真正解出内容目前没有可行路径，
-                // 改成显示一块诚实的占位图（不是静默消失），真机反馈"有的图片干脆
-                // 不出现"至少能看出"这里本来有张图、只是格式不支持"，不是无缘无故
-                // 缺了一块。
+                // 见 createUnsupportedImagePlaceholder KDoc"JBIG2 现状"一节完整
+                // 背景：两次装机验证过真正解码走不通（标准 JBIG2ImageReader 入口、
+                // 以及绕开它直接访问库内部的 JBIG2Document，两条路最终都会撞上
+                // Android 运行时完全不存在 javax.imageio.stream 这整个子包），
+                // 改成显示一块诚实的占位图（不是静默消失）。
                 val ctm = graphicsState.currentTransformationMatrix
                 images.add(
-                    applyCtmOrientation(
+                    orientImage(
                         createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"),
                         ctm,
                     ),
@@ -1481,7 +1528,7 @@ object PdfTextExtractor {
                 val manuallyDecoded = manualResult.getOrNull()
                 if (manuallyDecoded != null) {
                     val ctm = graphicsState.currentTransformationMatrix
-                    images.add(applyCtmOrientation(manuallyDecoded, ctm))
+                    images.add(orientImage(manuallyDecoded, ctm))
                 } else {
                     // 临时诊断："有的图片干脆不出现"——先确认是不是命中了这条手动解码
                     // 失败、没有任何回退的分支，顺带记下实际字节数，方便跟
@@ -1514,7 +1561,7 @@ object PdfTextExtractor {
                 return
             }
             val ctm = graphicsState.currentTransformationMatrix
-            images.add(applyCtmOrientation(bitmap, ctm))
+            images.add(orientImage(bitmap, ctm))
         }
 
         // 表格网格检测不关心裁剪区域、阴影填充，当无操作处理。

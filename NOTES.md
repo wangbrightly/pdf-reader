@@ -663,3 +663,96 @@ decodeJbig2 抛异常: java.lang.NoClassDefFoundError: Failed resolution of: Lja
 没有直接采信"应该没问题"，而是真的装机跑一遍拿到确定性的
 `NoClassDefFoundError`——事先跟用户说清楚"这条待验证"，出问题后如实
 汇报、撤回，不是硬撑着说"能用"。
+
+## 26. 已修：这本书部分页面显示反了——页面级 `/Rotate` 没被读取过
+
+**背景**：#25 修完之后用户反馈"这本书部分页面显示反了"。先排查了两个候选
+方向：
+
+1. 查这份文档缓存文件的原始字节，`strings | grep /Rotate` 发现全书页面
+   `/Rotate 0`，一度以为可以排除页面级旋转这个假设。
+2. 加诊断日志确认翻到的几页图片 CTM 都是最简单的"不旋转不镜像"，没有触发
+   `orientationMatrixOrNull` 的已知局限（非轴对齐 CTM 不修正）。
+
+两个方向都排除后用户反馈"现在就能看到反的"，重新加日志才在**另一份缓存
+文件**里看到 `pageRotation=180` 和 `pageRotation=0` 相邻交替出现——第 1 点
+的排查排查错了具体文件（用户当时打开的不是那份文档，缓存目录里有几十份
+`opened-*.pdf`，`ls -t` 挑的"最近修改"不一定是当前正在读的那份）。
+
+**根因**：确认后是页面字典的 `/Rotate`——扫描书很常见：大部分页面正常拍摄，
+个别页面扫描时物理方向不同，靠这个字段告诉阅读器"显示时把整页转一下"。查
+PdfBox-Android 官方源码确认 `PDPage.getMatrix()`（`drawImage` 拿到的 CTM
+最终基于这个"初始矩阵"累积）**固定返回单位矩阵，完全不看 `/Rotate`**——这
+是 PdfBox-Android 内容流处理管线本身的缺口，不是本项目代码引入的 bug；页面
+级整页渲染的 `PDFRenderer`（表格检测用）是独立代码路径，会正确处理，不受
+影响。
+
+**修法**：新增 `applyPageRotation`（`PdfTextExtractor.kt`，纯 `Matrix
+.postRotate` + `Bitmap.createBitmap` 重采样，跟 `applyCtmOrientation` 是
+同样的"矩阵计算/像素重采样"两段式）+ `PageContentStreamEngine.pageRotation`
+字段（读 `page.rotation`）+ `orientImage` 把两层修正叠一起（先 CTM 朝向、
+再页面级旋转）。真机日志确认这本书确实存在 `pageRotation=180` 的页面，修
+复后这些图片会被正确转正。单元测试见 `PdfTextExtractorImageOrientationTest`
+两条新用例（0 度快速路径 + 设了 `/Rotate 90` 的整页集成测试——跟已有的 CTM
+朝向测试一样，Robolectric 环境下 `Bitmap.createBitmap` 带 `Matrix` 参数的
+影子实现不会真的重采样，测试只能验证"链路接上了、没抛异常"，不能验证
+真实像素，真机验证才是最终判据）。
+
+**教训**：诊断时"用哪份缓存文件代表当前文档"这件事本身容易搞错——这台
+设备缓存目录常年堆着几十份 `opened-*.pdf`（每次打开都新建一份，没有清理
+机制，见 `MainActivity.copyToCacheFile`），`ls -t` 挑最近修改的不一定是
+用户当前正在看的那份（比如同一份文件被打开关闭多次，或者诊断过程中穿插
+打开过别的文件）。更可靠的确认方式：从 `LastOpenedFileStore`/日志里的
+`loadPdf` 时间戳反推，或者干脆让用户直接告诉你翻到第几页——这次是后者
+（用户反馈"现在就能看到反的"）帮着避开了这个坑，不是靠猜文件名解决的。
+
+## 27. 已确认：JBIG2 真正解码在 Android 上没有可行路径——两次装机验证过
+
+**背景**：用户明确要求"解出 JBIG2 图片内容，找找好的方案"——#25 只做了
+占位图，这次专门花一轮找真正的解码路径。
+
+**尝试 1（`org.apache.pdfbox:jbig2-imageio` 标准入口）**：走库自带的
+`JBIG2ImageReader.read()`——真机报
+`NoClassDefFoundError: Ljavax/imageio/ImageReader;`。这是 #25 已经踩过、
+记录过的坑，这次重新确认了一遍前提没变。
+
+**尝试 2（绕开 ImageReader，直接访问库内部）**：反过来查了这个库自己的
+源码结构（不是猜的，用 WebFetch 逐个文件核实）：真正的解码结果装在库自己
+的 `Bitmap` 类里——这个类整个是 `public`，完全不 import 任何
+`javax.imageio`/`java.awt.image` 相关的包，数据存成 `byte[]`
+（`getByteArray()` 能直接拿整个数组）。真正碰 AWT/ImageIO 的只有最外层的
+`JBIG2ImageReader` 封装，`JBIG2Document`/`JBIG2Page`（内部编排逻辑）本身
+很干净，只是构造函数/`getBitmap()` 是 `protected`。写了一个新文件
+（`app/src/main/java/org/apache/pdfbox/jbig2/AndroidBridge.kt`）故意声明
+成跟它们同一个包，靠 Java/Kotlin"同包可访问 protected 成员"这条语言规则
+拿到访问权限（不是反射）。
+
+第一轮真机测试：`NoClassDefFoundError: MemoryCacheImageInputStream`——
+`JBIG2Document` 构造函数还需要一个 `javax.imageio.stream.ImageInputStream`，
+库自带的这个具体实现类不可用。**关键的第二个问题**：具体实现类不可用，
+不代表接口本身也不可用——这是两件独立的事，值得单独验证。于是手写了一个
+不 extends 任何 `javax.imageio.stream.*` 抽象基类、只依赖 `ImageInputStream`
+接口本身的最小实现（`ByteArrayImageInputStream.kt`，~45 个接口方法全部
+手写，数据直接从内存里的 `ByteArray` 读）。
+
+第二轮真机测试：`NoClassDefFoundError: javax/imageio/stream/ImageInputStream;`
+——**连接口本身都不可用**。这把"绕开具体类、只用接口"这条路也彻底堵死了：
+`javax.imageio.stream` 这整个子包在 Android 运行时都不存在，不是某几个
+具体类的问题。
+
+**结论（已验证，别再重复评估同一条路）**：`jbig2-imageio` 这个库任何一层
+入口最终都会触碰 `javax.imageio`/`java.awt.image` 家族的类型，Android 平台
+从设计上就不包含整个 AWT/Swing/ImageIO 桌面 GUI API 体系，没有绕开的办法。
+两次尝试都已撤回全部代码改动（新增文件删除、`build.gradle.kts` 依赖撤回），
+仓库恢复成 #25 那版"占位图"状态。真正解出 JBIG2 内容仍然只剩两条没试过
+的路（跟 #25 记录的一样）：JNI 包 `jbig2dec` 这类 C 语言解码器（违反本项目
+"无 native 库"的选型原则）、或者从 JBIG2 规范自己写一个纯 Kotlin 解码器
+（工作量是另一个数量级）。
+
+**方法论**：核实一个库能不能在 Android 上用，不能只测"最外层的标准入口"
+就下结论——这次如果止步于尝试 1，会错误地把"这个库不能用"和"这个库的
+某一层封装不能用"混为一谈；深入到"绕开标准入口、直接用内部类"这条路之后
+才确认问题出在比 `ImageReader` 更底层的 `javax.imageio.stream` 这整个
+子包上，这才是"这个库彻底不能用"的确凿证据，不是猜测。两轮都是先读官方
+源码（WebFetch，不是凭记忆）搞清楚类结构和访问修饰符，再写代码验证，再
+装机拿到确定性的错误信息，跟 #25 的方法论一致。
