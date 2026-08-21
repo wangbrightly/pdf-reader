@@ -183,4 +183,98 @@ class PdfTextExtractorSessionTest {
             assertFalse(joined.contains("Happy Life Handbook"))
         }
     }
+
+    /**
+     * 2026-08-21：用户真机反馈+确认——某些扫描版文档一整页是一张占满全页的图片，
+     * 旁边跟着一行没有意义的乱码（扫描工具自动加的隐藏 OCR 文字层，识别质量差时
+     * 就是反复出现几个常见字的垃圾输出，跟图片内容毫无关系）。用户明确要求：图片
+     * 占满全页时不显示旁边的文字。这条测试用一张缩放铺满整个页面的图 + 一行"乱码"
+     * 验证 `loadPage` 只留图片、不留文字。
+     */
+    @Test
+    fun `图片占满全页时不显示旁边的文字`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val image = document.tinyImage()
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("garbage ocr text")
+        stream.endText()
+        // 图片铺满整个页面（起点 (0,0)，宽高就是页面宽高）——对应 loadPage 里
+        // hasFullPageImage 判断用的"渲染宽高跟页面宽高的比例"。
+        stream.drawImage(image, 0f, 0f, pageWidth, pageHeight)
+        stream.close()
+
+        val file = File.createTempFile("full-page-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue("应该保留图片", blocks.any { it is DisplayBlock.Image })
+            assertTrue(
+                "图片占满全页时不该显示旁边的乱码文字，实际 blocks=$blocks",
+                blocks.none { it is DisplayBlock.Text },
+            )
+        }
+    }
+
+    /**
+     * 反例：图片只占页面一角（不是占满全页），旁边的文字应该正常保留——防止
+     * `hasFullPageImage` 判断误伤"图文混排、图片本来就不大"这种正常场景。
+     */
+    @Test
+    fun `图片只占一小部分页面时文字正常保留`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val image = document.tinyImage()
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("real caption text")
+        stream.endText()
+        // 图片只占页面左上角一小块（40x30），远没到"占满全页"的比例阈值。
+        stream.drawImage(image, 10f, 250f, 40f, 30f)
+        stream.close()
+
+        val file = File.createTempFile("small-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val texts = session.loadPage(1).blocks.filterIsInstance<DisplayBlock.Text>().map { it.text }
+            assertEquals(listOf("real caption text"), texts)
+        }
+    }
+
+    /** 小工具：包一层 [PDDocument] + 复用 [PdfTextExtractorImageTest] 同款 tiny.png fixture 造一张真实可解码的小图片。 */
+    private class PdfDocumentForTest {
+        val pdDocument: com.tom_roush.pdfbox.pdmodel.PDDocument = com.tom_roush.pdfbox.pdmodel.PDDocument()
+
+        fun tinyImage(): com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject {
+            val pngBytes = requireNotNull(javaClass.classLoader?.getResourceAsStream("tiny.png")?.readBytes()) {
+                "找不到测试用的 tiny.png"
+            }
+            return com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject.createFromByteArray(pdDocument, pngBytes, "tiny")
+        }
+    }
 }

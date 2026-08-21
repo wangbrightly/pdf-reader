@@ -258,6 +258,9 @@ object PdfTextExtractor {
     /** 见 [classifyHeadings] KDoc——字号超过本页中位数的这个倍数才算"明显偏大"。 */
     private const val HEADING_FONT_SIZE_RATIO = 1.15f
 
+    /** 见 [PageContentStreamEngine.hasFullPageImage] KDoc——图片渲染宽/高都达到页面宽/高的这个比例才算"占满全页"。 */
+    private const val FULL_PAGE_IMAGE_COVERAGE_RATIO = 0.7f
+
     /**
      * 内嵌图片长边（`max(width, height)`）超过 [MAX_IMAGE_DIMENSION_PX] 判定为"过大"，
      * 每次减半算出理论上该降到多少——纯数学，见 [decodeJpegWithNativeSubsampling]
@@ -1141,6 +1144,27 @@ object PdfTextExtractor {
         var hasImages = false
             private set
         private val pendingSegments = mutableListOf<LineSegment>()
+        private val pageWidth = page.mediaBox.width
+        private val pageHeight = page.mediaBox.height
+
+        /**
+         * 2026-08-21 用户真机反馈+确认：某些扫描版文档的页面是"一整张图占满全页 +
+         * 一行没有意义的乱码文字"——乱码来自扫描工具自动加的隐藏 OCR 文字层（为了
+         * 让扫描件也能被搜索），跟图片内容毫无关系，识别质量差时就是这种反复出现
+         * 几个常见字的垃圾输出，不是我们抽取错了。用户选择的处理方式：图片占满
+         * 全页时直接不显示旁边的文字，见 [loadPage] 用这个字段的地方。
+         *
+         * "占满全页"用图片在页面上的**渲染尺寸**（不是原始像素尺寸——一张大图完全
+         * 可能被缩得很小再画上去）跟页面尺寸的比例判断：图片被绘制时经过的 CTM
+         * （[com.tom_roush.pdfbox.util.Matrix]）的 `scaleX`/`scaleY` 就是它在页面
+         * 坐标系（pt）下的实际宽高（图片天然画在 `[0,1]x[0,1]` 单位正方形内，CTM
+         * 把这个正方形变换到页面上的哪个位置多大），拿绝对值跟 [pageWidth]/
+         * [pageHeight] 比，双向都过 [FULL_PAGE_IMAGE_COVERAGE_RATIO] 才算"占满"，
+         * 只有一边很大（比如跨栏但不到页高的插图）不算——这类图片旁边的文字更可能
+         * 是真的说明文字，不该被一起清掉。
+         */
+        var hasFullPageImage = false
+            private set
 
         /**
          * 2026-08-20 真机反馈修复：一份矢量图形极端密集的文档（地图/图表类扫描件）
@@ -1232,6 +1256,21 @@ object PdfTextExtractor {
 
         override fun drawImage(pdImage: PDImage) {
             hasImages = true
+            // 见 hasFullPageImage KDoc——用 CTM 的 scaleX/scaleY（图片在页面坐标系
+            // 下的实际渲染宽高，不是原始像素尺寸）跟页面尺寸比，两边都够大才算
+            // "占满全页"。放在 decodeImages=false 的扫描阶段也要算（不依赖后面
+            // decodeImages=true 那趟才做的真正解码），这样表格检测那趟扫描就能拿到
+            // 结果，不用等到真正解码图片才知道。
+            if (pageWidth > 0f && pageHeight > 0f) {
+                val ctm = graphicsState.currentTransformationMatrix
+                val renderedWidth = abs(ctm.scaleX)
+                val renderedHeight = abs(ctm.scaleY)
+                if (renderedWidth / pageWidth >= FULL_PAGE_IMAGE_COVERAGE_RATIO &&
+                    renderedHeight / pageHeight >= FULL_PAGE_IMAGE_COVERAGE_RATIO
+                ) {
+                    hasFullPageImage = true
+                }
+            }
             if (!decodeImages) return
             // 2026-08-20 修复 NOTES.md #19（花屏）：真机诊断日志实测确认根因——
             // PdfBox-Android 的 SampledImageReader.getRGBImage 只有 bitsPerComponent
@@ -1424,9 +1463,11 @@ object PdfTextExtractor {
             val page = document.getPage(pageNo - 1)
             val pageHeight = page.mediaBox.height
 
+            var scanHasFullPageImage = false
             val scanResult = runCatching {
                 val engine = PageContentStreamEngine(page, decodeImages = false)
                 engine.processPage(page)
+                scanHasFullPageImage = engine.hasFullPageImage
                 engine.segments to engine.hasImages
             }.getOrDefault(emptyList<LineSegment>() to false)
             val tAfterScan = System.currentTimeMillis()
@@ -1441,11 +1482,24 @@ object PdfTextExtractor {
             runCatching { stripper.getText(document) }
             val tAfterStripper = System.currentTimeMillis()
             if (tAfterStripper - tPageStart > 300) {
+                // 2026-08-21 追加诊断：真机复现过"矢量段数=4、原始行数=1 这种几乎没
+                // 内容的页，矢量扫描却要 1.6-1.8 秒"——段数/行数完全解释不了这个耗时，
+                // 怀疑是内容流本身解压后体积很大（比如大量空白/重复指令），扫描引擎
+                // 要先花时间过一遍整个流，跟"扫出来多少条线段"是两回事。加一次内容流
+                // 解码后字节数的测量验证这个猜测，不是每次都测（这本身有开销，只在
+                // 已经判定为慢页之后才测一次）。
+                val contentBytes = runCatching {
+                    val tContentStart = System.currentTimeMillis()
+                    val size = page.contents?.use { it.readBytes().size } ?: -1
+                    size to (System.currentTimeMillis() - tContentStart)
+                }.getOrDefault(-1 to -1L)
                 android.util.Log.d(
                     "PdfReaderDebug",
                     "loadPage(page=$pageNo) 慢页拆分 矢量扫描=${tAfterScan - tPageStart}ms " +
                         "表格检测=${tAfterTableDetect - tAfterScan}ms 文字抽取=${tAfterStripper - tAfterTableDetect}ms " +
-                        "矢量段数=${scanResult.first.size} 原始行数=${stripper.lines.size}",
+                        "矢量段数=${scanResult.first.size} 原始行数=${stripper.lines.size} " +
+                        "内容流解压后字节数=${contentBytes.first} 读取内容流耗时=${contentBytes.second}ms " +
+                        "占满全页图片=$scanHasFullPageImage",
                 )
             }
             val nonTableLines = if (tableRegion != null) {
@@ -1486,8 +1540,15 @@ object PdfTextExtractor {
                     if (index == afterIndex) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
                 }
             } else {
-                filtered.forEachIndexed { index, paragraph ->
-                    blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
+                // 见 PageContentStreamEngine.hasFullPageImage KDoc——图片占满全页时，
+                // 用户明确要求不显示旁边的文字（大概率是扫描工具自动加的隐藏 OCR
+                // 噪音文字，真机复现过"、飞、飞、总"这类反复出现几个常见字的乱码，
+                // 跟图片内容毫无关系）。只跳过整页文字，不影响表格分支（表格区域
+                // 本来就是裁剪成图，跟这里是两回事）。
+                if (!scanHasFullPageImage) {
+                    filtered.forEachIndexed { index, paragraph ->
+                        blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
+                    }
                 }
                 if (hasImages) {
                     // 图片插在这一页最后一个段落之后——跟 extractContent/旧 Session 的
