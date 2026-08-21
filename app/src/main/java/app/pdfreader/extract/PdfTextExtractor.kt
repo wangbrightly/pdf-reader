@@ -392,12 +392,21 @@ object PdfTextExtractor {
      * PDF 图像的原始样本流规则（PDF 规范 8.9.5.2）：每个像素占
      * `numComponents × bitsPerComponent` 位，逐个分量按大端（高位在前）紧密排列；
      * **每一行单独按字节对齐**（一行结束后，哪怕没用满最后一个字节也要跳到下一
-     * 字节开始，不能跨行借位）——这是最容易漏掉的一条，[bytesPerRow] 按这条算，
+     * 字节开始，不能跨行借位）——这是最容易漏掉的一条，`bytesPerRow` 按这条算，
      * 不是简单地"总位数除以 8"。
      *
-     * 范围限定在灰度（[numComponents]=1）/RGB（[numComponents]=3）——调色板索引色、
-     * CMYK 这些颜色空间需要额外的调色板查表/色彩转换逻辑，这次不做，遇到直接
-     * 返回 `null`（调用方会跳过这张图不显示，不展示错误内容）。
+     * 范围限定在灰度（1 分量）/RGB（3 分量）——调色板索引色、CMYK 这些颜色空间
+     * 需要额外的调色板查表/色彩转换逻辑，这次不做，遇到直接返回 `null`（调用方
+     * 会跳过这张图不显示，不展示错误内容）。
+     *
+     * **不直接信 `pdImage.colorSpace.numberOfComponents`，用实际数据反推**：真机
+     * 装机诊断发现，这个库在某些颜色空间（这份文档的图片具体是哪种没有继续深挖，
+     * 但表现跟本类其它地方已经踩过的"CMYK 色彩空间检测不准、静默返回成
+     * DeviceRGB"是同一类问题）上会把 `numberOfComponents` 报错——真机日志实测：
+     * 报的是 3（RGB），但实际样本字节数只够 1 分量（灰度）的量（983×1441 图片，
+     * 4 位深，报 3 分量时"每行字节数×高度"应该是 2,125,475，但实际读到的字节数
+     * 是 708,972，换算下来正好是 1 分量灰度的量——[candidateComponentCounts] 因此
+     * 改成"拿实际字节数反过来验证哪个分量数能对得上"，不是照抄库报出来的数字。
      *
      * 加了一个尺寸安全阀（[MAX_MANUAL_DECODE_PIXELS]）——这条路径是纯 Kotlin 手写
      * 的逐像素循环，没有原生解码器那种性能，遇到异常巨大的图片（真机测过 4232 页
@@ -407,17 +416,26 @@ object PdfTextExtractor {
     private fun decodeRawImageByBitDepth(pdImage: PDImage): Bitmap? {
         val bitsPerComponent = pdImage.bitsPerComponent
         if (bitsPerComponent <= 0 || bitsPerComponent > 16) return null
-        val numComponents = pdImage.colorSpace.numberOfComponents
-        if (numComponents != 1 && numComponents != 3) return null
         val width = pdImage.width
         val height = pdImage.height
         if (width <= 0 || height <= 0) return null
         if (width.toLong() * height.toLong() > MAX_MANUAL_DECODE_PIXELS) return null
 
         val bytes = pdImage.createInputStream().use { it.readBytes() }
-        val bitsPerRow = width.toLong() * numComponents * bitsPerComponent
-        val bytesPerRow = ((bitsPerRow + 7) / 8).toInt()
-        if (bytesPerRow <= 0 || bytesPerRow.toLong() * height > bytes.size.toLong()) return null
+        val reportedComponents = runCatching { pdImage.colorSpace.numberOfComponents }.getOrDefault(-1)
+        // 先试库报出来的分量数（大多数图片这个数字本身是对的），报的不是 1/3 或者
+        // 跟实际字节数对不上时，再试另一个候选——两个都试过还是对不上才放弃。
+        val candidateComponentCounts = listOfNotNull(
+            reportedComponents.takeIf { it == 1 || it == 3 },
+            1,
+            3,
+        ).distinct()
+        val numComponents = candidateComponentCounts.firstOrNull { candidate ->
+            val bytesPerRow = ((width.toLong() * candidate * bitsPerComponent + 7) / 8).toInt()
+            bytesPerRow > 0 && bytesPerRow.toLong() * height == bytes.size.toLong()
+        } ?: return null
+
+        val bytesPerRow = ((width.toLong() * numComponents * bitsPerComponent + 7) / 8).toInt()
 
         val maxSampleValue = (1 shl bitsPerComponent) - 1
         val pixels = IntArray(width * height)
@@ -1376,7 +1394,11 @@ object PdfTextExtractor {
             // 不展示（不展示错误内容），只是把"能覆盖"的范围从"1/8 位"扩大到
             // "任意位深的灰度/RGB"。
             if (pdImage.bitsPerComponent != 1 && pdImage.bitsPerComponent != 8) {
-                val manuallyDecoded = runCatching { decodeRawImageByBitDepth(pdImage) }.getOrNull()
+                val manualResult = runCatching { decodeRawImageByBitDepth(pdImage) }
+                manualResult.exceptionOrNull()?.let {
+                    android.util.Log.d("PdfReaderDebug", "decodeRawImageByBitDepth 抛异常: $it")
+                }
+                val manuallyDecoded = manualResult.getOrNull()
                 if (manuallyDecoded != null) {
                     val ctm = graphicsState.currentTransformationMatrix
                     images.add(applyCtmOrientation(manuallyDecoded, ctm))

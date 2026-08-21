@@ -259,4 +259,70 @@ class PdfTextExtractorImageTest {
         assertEquals(255, android.graphics.Color.green(pixel1))
         assertEquals(0, android.graphics.Color.blue(pixel1))
     }
+
+    /**
+     * 2026-08-21：上一版"按位深自己解码"上线后用户反馈"不正常，没有效果"——加诊断
+     * 日志装机复现才发现真正的坑：`pdImage.colorSpace.numberOfComponents` 对这份
+     * 真机文档的图片报的是 3（RGB），但按 3 分量算出来的"每行字节数×高度"是
+     * 2,125,475，实际读到的原始样本字节数只有 708,972——换算下来正好是 1 分量
+     * （灰度）的量。库报的分量数是错的，跟本类其它地方已经踩过的"某些颜色空间
+     * 检测不准、静默当成 DeviceRGB"是同一类问题（见 CMYK JPEG 那次的教训）。
+     *
+     * 这条测试专门复现这个"库报的分量数是错的"场景：`COSStream` 的 `/ColorSpace`
+     * 字典项故意写成 `DeviceRGB`（3 分量），但底层原始样本数据实际只有 1 分量
+     * （灰度）那么多字节——验证 `decodeRawImageByBitDepth` 会用实际字节数反推出
+     * 正确的分量数（1，不是字典里写的 3），解码出正确的灰度颜色，而不是照抄
+     * 字典里的错误分量数、要么解出乱码要么（原来的写法）直接判定"数据长度不够"
+     * 而放弃整张图。
+     *
+     * 手工打包（1 分量、4 位、宽 2 高 1，天然字节对齐）：
+     * 像素0 灰度=15（纯白）像素1 灰度=0（纯黑）→ 二进制 1111 0000 → 单字节 0xF0。
+     */
+    @Test
+    fun `颜色空间报的分量数是错的时候，用实际字节数反推出正确分量数`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage()
+        document.addPage(page)
+
+        val cosStream = document.document.createCOSStream()
+        // 只写了 1 字节——按字典里写的 DeviceRGB（3 分量）来算，2 像素 4 位深应该要
+        // 3 字节；这里只给 1 分量（灰度）该有的量，模拟"字典里的颜色空间是错的"。
+        cosStream.createOutputStream().use { it.write(byteArrayOf(0xF0.toByte())) }
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.TYPE, com.tom_roush.pdfbox.cos.COSName.XOBJECT)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.SUBTYPE, com.tom_roush.pdfbox.cos.COSName.IMAGE)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.WIDTH, 2)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.HEIGHT, 1)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.BITS_PER_COMPONENT, 4)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.COLORSPACE, com.tom_roush.pdfbox.cos.COSName.DEVICERGB)
+        val mislabeledImage = PDImageXObject(PDStream(cosStream), com.tom_roush.pdfbox.pdmodel.PDResources())
+
+        val drawStream = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(document, page)
+        drawStream.drawImage(mislabeledImage, 0f, 0f, 40f, 20f)
+        drawStream.close()
+
+        val output = File.createTempFile("mislabeled-colorspace-image-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+
+        val content = PdfTextExtractor.extractContent(context, output)
+
+        assertEquals(1, content.images.size)
+        val bitmap = content.images.single().bitmap
+        assertEquals(2, bitmap.width)
+        assertEquals(1, bitmap.height)
+
+        val pixel0 = bitmap.getPixel(0, 0)
+        assertEquals(255, android.graphics.Color.red(pixel0))
+        assertEquals(255, android.graphics.Color.green(pixel0))
+        assertEquals(255, android.graphics.Color.blue(pixel0))
+
+        val pixel1 = bitmap.getPixel(1, 0)
+        assertEquals(0, android.graphics.Color.red(pixel1))
+        assertEquals(0, android.graphics.Color.green(pixel1))
+        assertEquals(0, android.graphics.Color.blue(pixel1))
+    }
 }
