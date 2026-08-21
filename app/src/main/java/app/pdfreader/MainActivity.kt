@@ -1,5 +1,6 @@
 package app.pdfreader
 
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.Typeface
@@ -26,6 +27,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import app.pdfreader.extract.OutlineEntry
 import app.pdfreader.extract.PdfTextExtractor
+import app.pdfreader.progress.LastOpenedFileStore
 import app.pdfreader.progress.ReadingProgressKey
 import app.pdfreader.progress.ReadingProgressStore
 import app.pdfreader.settings.ReaderSettings
@@ -158,6 +160,33 @@ import kotlin.math.roundToInt
  * 恢复出来的 `Uri`；真正冷启动时优先看有没有"用……打开"分享过来的 PDF
  * （[IntentUriResolver]）——两条路径不会冲突，同一次 `onCreate` 最多只会触发一次
  * [loadPdf]。
+ *
+ * ## 真正冷启动（连任务卡片都没了）也要能恢复文档（2026-08-21 真机诊断增量）
+ *
+ * 上一节的"配置变化重建"恢复只覆盖"同一个任务被重新调度到前台"这一种情况。真机
+ * 反馈"打开的书无声无息消失了"，查 `logcat -b events` 找到
+ * `am_kill: ... due to LockScreenClean`——MIUI 锁屏后会主动杀掉后台 App 进程，且
+ * 连带清掉 Recents 任务卡片，下次点图标是彻底的冷启动，`savedInstanceState` 必为
+ * null，上一节那条路径根本不会触发。这不是 MIUI 独有的边界情况，是"进程随时可能被
+ * 系统回收"这个安卓平台级别的常态，只是 MIUI 更激进。
+ *
+ * 不去对抗系统杀进程（前台 Service 之类的手段在 MIUI 上也不保证有效），而是让
+ * "重新打开"本身几乎免费：[LastOpenedFileStore] 记住"最近一次通过系统文件选择器
+ * 主动挑的文件"，真正冷启动（没有重建 Uri，也没有分享过来的 PDF）时读出来自动
+ * [loadPdf] 一次——[PdfTextExtractor.Session.open] 本来就已经优化到大多数文档
+ * 0.1–1.5 秒能打开，效果上跟用户没被打断过一样。完整背景见 [LastOpenedFileStore]
+ * 类 KDoc。
+ *
+ * **只记系统选择器选的文件，不记别的 App 分享过来的**：`content://` Uri 的读权限
+ * 默认一次性，只有 `ACTION_OPEN_DOCUMENT`（[openDocumentLauncher]）允许调用
+ * `takePersistableUriPermission` 换成跨进程重启依然有效的持久授权；`ACTION_VIEW`
+ * 分享过来的 Uri 对它调用会直接抛 `SecurityException`，语义上也不适合冷启动时
+ * 不问自取地重新弹出来——[loadPdf] 的 `rememberAsLastOpened` 参数只在系统选择器
+ * 这条路径为 `true`。
+ *
+ * **持久授权数量有上限**：安卓限制每个 App 最多约 512 条持久 Uri 授权，超过会抛
+ * `SecurityException`。[openDocumentLauncher] 每次选新文件都会先释放上一次记住的
+ * 那条授权，长期最多只占用 1 条，不会随着开过的文件越来越多逼近上限。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -227,8 +256,28 @@ class MainActivity : AppCompatActivity() {
 
     private val openDocumentLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            uri?.let { loadPdf(it) }
+            uri?.let {
+                rememberLastOpenedUriPermission(it)
+                loadPdf(it)
+            }
         }
+
+    /**
+     * 见类注释"真正冷启动也要能恢复文档"一节。只在这条路径（系统文件选择器）调用，
+     * `takePersistableUriPermission` 对 `ACTION_VIEW` 分享过来的 Uri 会直接抛
+     * `SecurityException`，不适合在那条路径上尝试。
+     */
+    private fun rememberLastOpenedUriPermission(uri: Uri) {
+        val previous = LastOpenedFileStore.load(applicationContext)
+        if (previous != null && previous != uri) {
+            runCatching {
+                contentResolver.releasePersistableUriPermission(previous, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+        runCatching {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -279,7 +328,17 @@ class MainActivity : AppCompatActivity() {
             loadPdf(restoredUri)
         } else {
             // 别的 App"用……打开"分享过来的 PDF：启动时就自动开始抽取，不需要用户再点一次按钮。
-            IntentUriResolver.resolvePdfUri(intent)?.let { uri -> loadPdf(uri) }
+            // 这条路径的 Uri 权限是临时的，不适合记成"最近打开的文件"，见类注释
+            // "真正冷启动也要能恢复文档"一节。
+            val sharedUri = IntentUriResolver.resolvePdfUri(intent)
+            if (sharedUri != null) {
+                loadPdf(sharedUri, rememberAsLastOpened = false)
+            } else {
+                // 真正冷启动、也没有分享过来的 PDF：看看有没有"最近一次通过系统文件
+                // 选择器打开的文件"，有就自动重新打开，见类注释"真正冷启动也要能
+                // 恢复文档"一节（MIUI 锁屏清理杀进程导致文档无声消失的修复）。
+                LastOpenedFileStore.load(applicationContext)?.let { uri -> loadPdf(uri) }
+            }
         }
     }
 
@@ -313,7 +372,7 @@ class MainActivity : AppCompatActivity() {
      * 具体内容），[render] 据此设置 `recyclerView.adapter`，剩下的按页加载由
      * [PdfPageAdapter] 负责。
      */
-    private fun loadPdf(uri: Uri) {
+    private fun loadPdf(uri: Uri, rememberAsLastOpened: Boolean = true) {
         currentUri = uri
         // 打开新文件前，先把当前正在显示的文件（如果有）的阅读进度存一次——"打开
         // 另一份 PDF"对上一份文件来说也是"离开"，不用等到 onPause 才存。必须在
@@ -378,6 +437,18 @@ class MainActivity : AppCompatActivity() {
                 )
                 // 只在"打开一份新文件"这条路径自动收起设置面板，给内容腾屏幕。
                 if (state is PdfLoadState.Success) collapseSettingsPanel()
+                // 见类注释"真正冷启动也要能恢复文档"一节。只在系统选择器这条路径维护
+                // "最近打开的文件"这条记录：成功就记住这一份；失败时只有"这次失败的
+                // 正是当前记住的那个文件"才清掉记录（说明它已经打不开了，不该继续
+                // 每次冷启动都重试一遍、弹一次没人问的错误提示）——避免"用户手动挑
+                // 了一份坏文件"误把之前一份好端端的记录冲掉。
+                if (rememberAsLastOpened) {
+                    if (state is PdfLoadState.Success) {
+                        LastOpenedFileStore.save(applicationContext, uri)
+                    } else if (state is PdfLoadState.Error && LastOpenedFileStore.load(applicationContext) == uri) {
+                        LastOpenedFileStore.clear(applicationContext)
+                    }
+                }
             }
         }
     }
