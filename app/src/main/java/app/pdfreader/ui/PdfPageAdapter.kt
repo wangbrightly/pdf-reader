@@ -7,7 +7,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import androidx.recyclerview.widget.RecyclerView
 import app.pdfreader.extract.PdfTextExtractor
-import kotlin.concurrent.thread
+import java.util.concurrent.Executors
 
 /**
  * 文字/图片真正按需加载的核心 `RecyclerView.Adapter`——见
@@ -68,6 +68,30 @@ class PdfPageAdapter(
         }
     }
 
+    /**
+     * 2026-08-21 真机复现过一次严重性能问题：快速连续翻页（用户自己在真机上滑了
+     * 十几下，从第 1 页很快滑到第 90 多页附近，中途反复滚回滚去）之后，日志里出现
+     * `loadPage` 单次耗时 **131 秒**这种离谱数字——不是某一页内容特别复杂，是原来
+     * [onBindViewHolder] 每次绑定都用 `kotlin.concurrent.thread {}` 起一条全新的
+     * 系统线程，没有任何数量上限：快速翻页时 RecyclerView 会在极短时间内连续绑定/
+     * 解绑几十个不同位置，每次绑定都真的起一条线程去跑 PDFBox 解析，短时间内几十
+     * 条线程同时抢 CPU/IO，互相拖累，单个任务反而比"老老实实排队"慢了几十倍——
+     * 这是真机操作直接测出来的，不是靠读代码猜的。
+     *
+     * 改成固定大小的线程池：并发解析页数有上限（[LOAD_POOL_SIZE]），多出来的绑定
+     * 请求乖乖排队，不会互相抢资源拖垮彼此。配合 [onBindViewHolder] 里"任务真正
+     * 开始跑之前，先检查这个 ViewHolder 是不是还绑定着当初提交任务时的那个
+     * position"这道新增的前置检查——快速翻页时排在队列里、等到真正轮到执行时早已
+     * 经不是当前可见页的任务，直接跳过，不浪费 CPU 去解析一个用户已经划走的页。
+     */
+    private val loadExecutor = Executors.newFixedThreadPool(LOAD_POOL_SIZE)
+
+    /** 见 [loadExecutor] KDoc——Adapter 被换掉时（比如用户又打开了另一份文档）线程池要跟着关掉，不然会一直占着线程不释放。 */
+    override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
+        super.onDetachedFromRecyclerView(recyclerView)
+        loadExecutor.shutdownNow()
+    }
+
     override fun getItemCount(): Int = session.pageCount
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PageViewHolder {
@@ -111,7 +135,11 @@ class PdfPageAdapter(
             return
         }
         renderLoadingPlaceholder(holder)
-        thread {
+        loadExecutor.submit {
+            // 见 loadExecutor KDoc："排队等到真正执行时，这个 ViewHolder 可能早就
+            // 被 RecyclerView 挪去绑定别的位置了"——这种情况直接跳过，不做无意义
+            // 的 PDFBox 解析工作。
+            if (holder.bindingAdapterPosition != position) return@submit
             val tStart = System.currentTimeMillis()
             val content = runCatching { session.loadPage(pageNo) }
                 .getOrDefault(PdfTextExtractor.PageContent(emptyList()))
@@ -171,5 +199,14 @@ class PdfPageAdapter(
 
         /** 占位符固定高度（像素，不是 dp——Adapter 不方便拿到 Activity 的 density，直接用一个够用的像素值）。 */
         const val PLACEHOLDER_HEIGHT_PX = 300
+
+        /**
+         * 见 [loadExecutor] KDoc——同时最多几个页面并发解析。固定给 3，不用
+         * `Runtime.availableProcessors()`：解析本身要吃 CPU，留几个核心给 UI
+         * 线程渲染/手势响应，不是核心数越多并发度就该越高；真机快速翻页复现过的
+         * 那次 131 秒离谱耗时，本质是"并发数完全不设上限"，只要有上限（哪怕不是
+         * 精确调过的最优值）就已经能避免那种量级的资源互相拖累。
+         */
+        const val LOAD_POOL_SIZE = 3
     }
 }
