@@ -645,6 +645,39 @@ object PdfTextExtractor {
         return result
     }
 
+    /**
+     * JBIG2 图片解码——尝试 [Jbig2GenericRegionDecoder]（纯 Kotlin 手写的通用区域
+     * 解码器，完整背景/已知局限见该类 KDoc），命中已知局限（非默认 AT 像素、
+     * 用了符号词典/文字区域等这次没实现的段类型、MMR 编码……）时返回 `null`，
+     * 调用方（[PageContentStreamEngine.drawImage]）降级成占位图。
+     *
+     * 解码出的 [Jbig2GenericRegionDecoder.DecodedBitmap] 是按位打包的 1 位位图
+     * （0=白、1=黑，MSB 在前）——转成 Android `Bitmap` 时对应关系是：`bit==1`
+     * （黑）→ RGB 全 0，`bit==0`（白）→ RGB 全 0xFF，跟 [decodeRawImageByBitDepth]
+     * 手写的位深解码是同一套约定，不要弄反。
+     */
+    private fun decodeJbig2OrNull(pdImage: PDImage): Bitmap? {
+        val bytes = pdImage.createInputStream(listOf("JBIG2Decode")).use { it.readBytes() }
+        val decoded = Jbig2GenericRegionDecoder.decode(bytes) ?: return null
+        val width = decoded.width
+        val height = decoded.height
+        val rowStride = decoded.rowStride
+        val packed = decoded.packedBits
+        val pixels = IntArray(width * height)
+        var pixelIndex = 0
+        for (y in 0 until height) {
+            val rowStart = y * rowStride
+            for (x in 0 until width) {
+                val byteIndex = rowStart + (x shr 3)
+                val bitOffset = x and 0x07
+                val bit = (packed[byteIndex].toInt() ushr (7 - bitOffset)) and 1
+                pixels[pixelIndex] = if (bit == 1) (0xFF shl 24) else (0xFF shl 24) or 0xFFFFFF
+                pixelIndex++
+            }
+        }
+        return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+    }
+
     /** 见上方 KDoc"已知问题"一节。键是部首补充区码位，值是对应的常用独立汉字。 */
     private val RADICALS_SUPPLEMENT_FIX = mapOf(
         '⻋' to '车', // C-SIMPLIFIED CART
@@ -1591,21 +1624,29 @@ object PdfTextExtractor {
             // 不展示（不展示错误内容），只是把"能覆盖"的范围从"1/8 位"扩大到
             // "任意位深的灰度/RGB"。
             if (pdImage.suffix == "jb2") {
-                // 见 createUnsupportedImagePlaceholder KDoc"JBIG2 现状"一节完整
-                // 背景：两次装机验证过真正解码走不通（标准 JBIG2ImageReader 入口、
-                // 以及绕开它直接访问库内部的 JBIG2Document，两条路最终都会撞上
-                // Android 运行时完全不存在 javax.imageio.stream 这整个子包），
-                // 改成显示一块诚实的占位图（不是静默消失）。
-                //
-                // **不调用 orientImage**（2026-08-22 真机反馈修复）：占位图是我们
-                // 自己现画的提示文字，不是原图片的像素内容——CTM 朝向修正/页面级
-                // `/Rotate` 这两层修正的意义都是"把扫描仪/生成工具翻转过的原始画面
-                // 转回正确方向"，占位图从头到尾没有"原始方向"这个概念，硬套这两层
-                // 修正只会把提示文字转得倒过来、镜像过去，反而更不可读——真机截图
-                // 实测过这个 bug：`/Rotate 180` 的页面上"图片格式不支持（JBIG2）"
-                // 这行字被转成上下颠倒、左右镜像，读不出来。占位图直接原样加入，
-                // 保持提示文字永远朝上可读。
-                images.add(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"))
+                // 见 decodeJbig2OrNull KDoc 完整背景：第三方库两次都走不通
+                // （NOTES.md #25/#27），改成自己写的纯 Kotlin 通用区域解码器
+                // （[Jbig2GenericRegionDecoder]），只覆盖真机确认过的真实场景
+                // （段类型只有页信息+通用区域，没有符号词典/文字区域）。解不了
+                // （命中已知局限，比如非默认 AT 像素、用了符号词典）时降级成
+                // 占位图，不静默消失也不展示错误画面。
+                val decoded = runCatching { decodeJbig2OrNull(pdImage) }
+                decoded.exceptionOrNull()?.let {
+                    android.util.Log.d("PdfReaderDebug", "decodeJbig2OrNull 抛异常: $it")
+                }
+                val jbig2Bitmap = decoded.getOrNull()
+                if (jbig2Bitmap != null) {
+                    val ctm = graphicsState.currentTransformationMatrix
+                    images.add(orientImage(jbig2Bitmap, ctm))
+                } else {
+                    // **不调用 orientImage**（2026-08-22 真机反馈修复）：占位图是
+                    // 我们自己现画的提示文字，不是原图片的像素内容——CTM 朝向
+                    // 修正/页面级 `/Rotate` 这两层修正的意义都是"把扫描仪/生成
+                    // 工具翻转过的原始画面转回正确方向"，占位图从头到尾没有
+                    // "原始方向"这个概念，硬套这两层修正只会把提示文字转得倒
+                    // 过来、镜像过去，反而更不可读——真机截图实测过这个 bug。
+                    images.add(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"))
+                }
                 return
             }
             if (pdImage.bitsPerComponent != 1 && pdImage.bitsPerComponent != 8) {

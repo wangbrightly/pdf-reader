@@ -56,6 +56,15 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
 
+    // 只在测试范围（不打进 APK）——用来交叉验证 [Jbig2GenericRegionDecoder]（自己
+    // 手写的 JBIG2 通用区域解码器，见该类 KDoc 完整背景）写得对不对。这个库本身
+    // 在 Android 运行时用不了（依赖 javax.imageio.stream，NOTES.md #27 装机验证
+    // 过两次），但纯 JVM 单元测试（Robolectric 跑在桌面 JVM 上，不是 Android
+    // 运行时）没有这个限制，可以正常加载——用它已经证明正确的解码逻辑当"标准
+    // 答案"，喂同一份数据给自己写的解码器，比对结果是否一致，比"我自己觉得抄对了"
+    // 更可靠。
+    testImplementation("org.apache.pdfbox:jbig2-imageio:3.0.5")
+
     // 抽取层需要 Context（PDFBoxResourceLoader.init(context)），纯 JVM 单元测试
     // 拿不到真实 Android Context，用 Robolectric 在 JVM 上模拟一个。
     // 版本：4.16.1，2026-01-21 发布（已核实 GitHub Releases + Maven Central 均有该坐标）。
