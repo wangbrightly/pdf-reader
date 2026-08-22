@@ -19,15 +19,18 @@ import java.io.File
  * ——见该函数 KDoc"第三次尝试"一节的完整背景（前两次靠 PdfBox-Android 自己的解码
  * 路径都失败了）。
  *
- * fixture `large-quadrant.jpg`（3000×2000，四象限红/绿/蓝/黄测试图，quality=85 的真实
+ * fixture `large-quadrant.jpg`（4500×3000，四象限红/绿/蓝/黄测试图，quality=85 的真实
  * JPEG，Python Pillow 生成）特意选了超过 [PdfTextExtractor] 内 `MAX_IMAGE_DIMENSION_PX`
- * （2000px）的尺寸，触发 `subsamplingFactor` 算出 2 倍降采样。
+ * （2026-08-22 从 2000px 调到 3000px，见该常量 KDoc"分辨率优化"一节——这份 fixture
+ * 也跟着从原来的 3000×2000 重新生成成 4500×3000，保持"长边超过阈值 1.5 倍、
+ * 触发一次减半降采样"这个测试意图不变）的尺寸，触发 `subsamplingFactor` 算出
+ * 2 倍降采样。
  *
  * ## 只验证解码尺寸，不验证像素颜色——Robolectric 的 `BitmapFactory` 影子实现不可靠
  *
  * 最初这条测试还想顺带验证"降采样之后四个象限颜色还对不对"（左上红、右上绿……），
  * 程序化验证发现：Robolectric 环境下 `BitmapFactory.decodeByteArray` 解码这份真实
- * JPEG 字节，返回的 `Bitmap` 尺寸是对的（1500×1000，确实按 2 倍降采样了），但四个角
+ * JPEG 字节，返回的 `Bitmap` 尺寸是对的（按 2 倍降采样了），但四个角
  * 采样出来的颜色全部是纯红——不是真的解码出了图片内容，是这个环境下的影子实现在
  * 尺寸计算上是真的（用了真实的 JPEG 头信息），像素内容却是假的。这是 Robolectric
  * 对 Canvas/`BitmapFactory` 这类底层图形解码的影子实现精度限制，跟
@@ -76,10 +79,10 @@ class PdfTextExtractorJpegSubsamplingTest {
 
         assertEquals(1, content.images.size)
         val bitmap = content.images.single().bitmap
-        // 原图 3000x2000，subsamplingFactor 算出来是 2 倍——解码结果应该在 1500x1000
+        // 原图 4500x3000，subsamplingFactor 算出来是 2 倍——解码结果应该在 2250x1500
         // 附近（BitmapFactory 的 inSampleSize 不保证精确到像素，允许小误差）。
-        assertTrue("解码后宽度应该明显小于原图 3000px，实际是 ${bitmap.width}", bitmap.width in 1000..1600)
-        assertTrue("解码后高度应该明显小于原图 2000px，实际是 ${bitmap.height}", bitmap.height in 700..1100)
+        assertTrue("解码后宽度应该明显小于原图 4500px，实际是 ${bitmap.width}", bitmap.width in 1900..2500)
+        assertTrue("解码后高度应该明显小于原图 3000px，实际是 ${bitmap.height}", bitmap.height in 1300..1700)
     }
 
     @Test

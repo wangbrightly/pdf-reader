@@ -96,12 +96,13 @@ class PdfTextExtractorTableTest {
     fun `表格裁剪出的图片高度明显小于整页，证明确实被裁剪了而不是又整页渲染`() {
         val content = extractFixtureContent()
         val bitmap = content.images.first().bitmap
-        // A4 页面（595x842pt）在 TABLE_PAGE_RENDER_DPI（150）下整页渲染大约是
-        // 1240x1754px。这份 fixture 的表格宽度接近整个正文内容区宽度（实测裁剪后
-        // 宽度约 1000px，跟整页宽度差别不大，不是一个有区分度的信号），但只有
-        // 3 列 4 行、高度只占页面一小部分——高度这个维度才是"确实被裁剪了、不是
-        // 整页渲染"的可靠信号，用一个宽松但有区分度的上限，不锁死具体像素数值。
-        assertTrue("裁剪后的高度应该明显小于整页(~1754px)，实际是 ${bitmap.height}", bitmap.height < 900)
+        // A4 页面（595x842pt）在 TABLE_PAGE_RENDER_DPI（2026-08-22 从 150 调到 220，
+        // 见该常量 KDoc"分辨率优化"一节）下整页渲染大约是 1819x2573px。这份 fixture
+        // 的表格宽度接近整个正文内容区宽度（实测裁剪后宽度约整页宽度量级，不是一个
+        // 有区分度的信号），但只有 3 列 4 行、高度只占页面一小部分——高度这个维度
+        // 才是"确实被裁剪了、不是整页渲染"的可靠信号，用一个宽松但有区分度的上限，
+        // 不锁死具体像素数值（上限跟着 DPI 提高按比例放宽，150→220 是 1.4667 倍）。
+        assertTrue("裁剪后的高度应该明显小于整页(~2573px)，实际是 ${bitmap.height}", bitmap.height < 1320)
         // 同时也不能裁没了——至少要有个几十像素，证明确实裁出了有内容的一块区域。
         assertTrue("裁剪后的高度不应该小到像裁剪出错，实际是 ${bitmap.height}", bitmap.height > 50)
     }
