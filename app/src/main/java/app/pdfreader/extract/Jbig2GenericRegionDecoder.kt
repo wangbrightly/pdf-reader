@@ -211,6 +211,39 @@ internal object Jbig2GenericRegionDecoder {
         return DecodedBitmap(width, height, bitmap.bytes, rowStride)
     }
 
+    /**
+     * 供 [Jbig2SymbolDictionaryDecoder] 复用的核心逐行解码逻辑——符号词典解码
+     * "直接编码"的新符号时（6.5.8.1），本质是解一个 `isTPGDon=false`、宽高是
+     * 符号自己尺寸（不是整页）的通用区域，但要用词典级别共享的同一个
+     * [ArithmeticDecoder]/[Cx]（不是每个符号各起一份新的——见参考实现
+     * `SymbolDictionary.decodeDirectlyThroughGenericRegion`：`cx`/`arithmeticDecoder`
+     * 是整个词典共享的字段，只创建一次）。这里只做像素解码，不做段头解析/AT 像素
+     * 默认值校验——调用方负责校验（跟 [decode] 里那份校验共享同一个
+     * [isDefaultAtPixels]，不重复两份判断逻辑）。
+     */
+    internal fun decodeSharedContextBitmap(
+        width: Int,
+        height: Int,
+        gbTemplate: Int,
+        arith: ArithmeticDecoder,
+        cx: Cx,
+    ): PackedBitmap {
+        val rowStride = (width + 7) ushr 3
+        val bitmap = PackedBitmap(width, height, rowStride)
+        val paddedWidth = (width + 7) and -8
+        for (line in 0 until height) {
+            val byteIndex = bitmap.byteIndexOf(0, line)
+            val idx = byteIndex - rowStride
+            when (gbTemplate) {
+                0 -> decodeTemplate0(bitmap, arith, cx, line, width, rowStride, paddedWidth, byteIndex, idx)
+                1 -> decodeTemplate1(bitmap, arith, cx, line, width, rowStride, paddedWidth, byteIndex, idx)
+                2 -> decodeTemplate2(bitmap, arith, cx, line, width, rowStride, paddedWidth, byteIndex, idx)
+                else -> decodeTemplate3(bitmap, arith, cx, line, width, rowStride, paddedWidth, byteIndex, idx)
+            }
+        }
+        return bitmap
+    }
+
     /** 见参考实现 `decodeSLTP`——每种模板固定的上下文索引，用来解码"这一行是不是直接复制上一行"这个标志位。 */
     private fun sltpContextIndex(gbTemplate: Int): Int = when (gbTemplate) {
         0 -> 0x9b25
@@ -222,7 +255,7 @@ internal object Jbig2GenericRegionDecoder {
     /**
      * 默认 AT 像素位置（7.4.6.3 表 7），见类 KDoc"已知局限"一节——只支持这组默认值。
      */
-    private fun isDefaultAtPixels(gbTemplate: Int, atX: IntArray, atY: IntArray): Boolean = when (gbTemplate) {
+    internal fun isDefaultAtPixels(gbTemplate: Int, atX: IntArray, atY: IntArray): Boolean = when (gbTemplate) {
         0 -> atX[0] == 3 && atY[0] == -1 && atX[1] == -3 && atY[1] == -1 &&
             atX[2] == 2 && atY[2] == -2 && atX[3] == -2 && atY[3] == -2
         1 -> atX[0] == 3 && atY[0] == -1
@@ -236,7 +269,7 @@ internal object Jbig2GenericRegionDecoder {
      * = y*rowStride + (x>>3)`，MSB 在前）——[decodeTemplate0]/`1`/`2`/`3` 这几个
      * 函数要跟参考实现的位运算逐行对得上，字段/方法名不一致容易在移植时看错。
      */
-    private class PackedBitmap(val width: Int, val height: Int, val rowStride: Int) {
+    internal class PackedBitmap(val width: Int, val height: Int, val rowStride: Int) {
         val bytes = ByteArray(rowStride * height)
         fun byteIndexOf(x: Int, y: Int): Int = y * rowStride + (x shr 3)
         fun getByteAsInt(index: Int): Int = if (index in bytes.indices) bytes[index].toInt() and 0xFF else 0
@@ -251,6 +284,33 @@ internal object Jbig2GenericRegionDecoder {
                 bytes[target++] = bytes[source++]
             }
         }
+
+        /**
+         * 像素级读写——供 [Jbig2SymbolTextDecoder] 的 blit（把符号位图贴到文字
+         * 区域画布/把文字区域画布贴到页面画布）使用。逐像素而不是照抄参考实现
+         * `Bitmaps.blit` 那套按字节整体位移的写法（见该类源码 `blitShifted`/
+         * `blitSpecialShifted`，需要处理源和目标位偏移不对齐时的移位/借位，写法
+         * 精巧但出错不易察觉）——这次场景下 blit 次数是"每页符号实例数"量级
+         * （几百到几千次，不是逐像素的热路径），性能不是这里的重点，正确性和
+         * 可读性优先，越界坐标直接忽略（跟参考实现"裁掉超出目标位图的部分"是
+         * 同一个语义）。
+         */
+        fun getPixel(x: Int, y: Int): Int {
+            if (x < 0 || x >= width || y < 0 || y >= height) return 0
+            val byteIndex = byteIndexOf(x, y)
+            val bitOffset = x and 0x07
+            return (getByteAsInt(byteIndex) ushr (7 - bitOffset)) and 1
+        }
+
+        fun setPixel(x: Int, y: Int, value: Int) {
+            if (x < 0 || x >= width || y < 0 || y >= height) return
+            val byteIndex = byteIndexOf(x, y)
+            val bitOffset = x and 0x07
+            val shift = 7 - bitOffset
+            val old = getByteAsInt(byteIndex)
+            val newByte = if (value == 1) old or (1 shl shift) else old and (1 shl shift).inv()
+            setByte(byteIndex, newByte and 0xFF)
+        }
     }
 
     /**
@@ -258,7 +318,7 @@ internal object Jbig2GenericRegionDecoder {
      * 见类 KDoc"已知局限"一节），context 的位掩码/移位量是标准定死的常量，不重新
      * 推导。
      */
-    private fun decodeTemplate0(
+    internal fun decodeTemplate0(
         bitmap: PackedBitmap,
         arith: ArithmeticDecoder,
         cx: Cx,
@@ -309,7 +369,7 @@ internal object Jbig2GenericRegionDecoder {
     }
 
     /** 模板 1——照抄参考实现 `decodeTemplate1`。 */
-    private fun decodeTemplate1(
+    internal fun decodeTemplate1(
         bitmap: PackedBitmap,
         arith: ArithmeticDecoder,
         cx: Cx,
@@ -360,7 +420,7 @@ internal object Jbig2GenericRegionDecoder {
     }
 
     /** 模板 2——照抄参考实现 `decodeTemplate2`。 */
-    private fun decodeTemplate2(
+    internal fun decodeTemplate2(
         bitmap: PackedBitmap,
         arith: ArithmeticDecoder,
         cx: Cx,
@@ -411,7 +471,7 @@ internal object Jbig2GenericRegionDecoder {
     }
 
     /** 模板 3——照抄参考实现 `decodeTemplate3`（只有当前行和上一行，没有 line2）。 */
-    private fun decodeTemplate3(
+    internal fun decodeTemplate3(
         bitmap: PackedBitmap,
         arith: ArithmeticDecoder,
         cx: Cx,
@@ -464,7 +524,7 @@ internal object Jbig2GenericRegionDecoder {
      * 概率状态编号和"更可能的符号"，解码之后原地更新，跟参考实现的 `CX` 类是
      * 同一个数据结构。
      */
-    private class Cx(size: Int) {
+    internal class Cx(size: Int) {
         var index = 0
         val cxState = IntArray(size)
         val mps = IntArray(size)
@@ -479,7 +539,7 @@ internal object Jbig2GenericRegionDecoder {
      * 算术编码流里 0xFF 字节的位填充规则，避免跟真正的标记码混淆），照抄参考
      * 实现的调用顺序，没有做任何"看起来可以简化"的改动。
      */
-    private class ArithmeticDecoder(private val data: ByteArray, start: Int, private val end: Int) {
+    internal class ArithmeticDecoder(private val data: ByteArray, start: Int, private val end: Int) {
         private var readPos = start
         private val streamPos0: Int = start
         private var a = 0

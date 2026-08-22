@@ -450,6 +450,24 @@ object PdfTextExtractor {
      * 占位图，不展示纯黑色块（纯黑块看起来像"图片整个坏掉了"，比一块写清楚
      * 原因的占位图更容易让人误以为是软件本身的严重故障）。
      *
+     * **2026-08-23 补充排查：确认了带 Adobe APP14 标记（`transform=0`），但
+     * "简单反色能救回内容"这条低成本路径已经验证过走不通，别再重复试**——
+     * 真机加诊断确认这批图片的确带 Adobe 标记（Photoshop/印刷软件产出 CMYK
+     * JPEG 的标准做法），一开始猜测"安卓的解码器把反色约定的数据当成正常
+     * 数据处理，所以背景（该是白）算出全黑、文字（该是黑）也可能算出全黑，
+     * 两者混一起就是通篇黑"——如果这个猜测成立，把 `BitmapFactory` 解出来的
+     * （已知纯黑的）结果直接做一次 RGB 反相，应该能大致救回内容（不要求数学
+     * 上完全精确，只要求"看得出这是扫描页"）。真机测过十几张图，反相后
+     * 结果压倒性地是**均匀纯白，不是"大部分白+少量黑字"**——比如
+     * `2317/2337` 纯黑像素反相后 `2320` 接近白、`0` 接近黑、仅 `17` 落在
+     * 中间调，这种分布不是"颜色算错了但内容还在"，是解码这一步本身几乎
+     * 没有保留任何图像细节（近乎均匀输出），推测是这台设备的解码器对这类
+     * 4 分量数据在更早的阶段就出了问题（比如色度通道处理/饱和截断），不是
+     * 一个能靠事后颜色空间转换修正的"错位"问题。这意味着"绕开这两条现成
+     * 解码路径、自己重新实现 JPEG 熵解码+DCT+色彩转换"这条路目前看不到更
+     * 便宜的替代方案，工作量评估维持不变（跟 JBIG2 符号词典是同一个数量级，
+     * 需要额外投入才能做，这次没有做）。
+     *
      * 检测本身很轻量——只读 JPEG 头部的 SOF 标记算分量数（[JpegComponentCount]
      * 不需要解码整张图），4 分量就直接判定为"这台设备解不出来"，不用真的跑一遍
      * 解码再看结果是不是纯黑（那样反而更慢，白白解码一遍还是要扔掉）。
@@ -646,23 +664,76 @@ object PdfTextExtractor {
     }
 
     /**
-     * JBIG2 图片解码——尝试 [Jbig2GenericRegionDecoder]（纯 Kotlin 手写的通用区域
-     * 解码器，完整背景/已知局限见该类 KDoc），命中已知局限（非默认 AT 像素、
-     * 用了符号词典/文字区域等这次没实现的段类型、MMR 编码……）时返回 `null`，
-     * 调用方（[PageContentStreamEngine.drawImage]）降级成占位图。
+     * JBIG2 图片解码——依次尝试两个纯 Kotlin 手写的解码器：
+     * 1. [Jbig2GenericRegionDecoder]（"整页当一张位图算术编码"这种简单画风，
+     *    完整背景见该类 KDoc）。
+     * 2. [Jbig2SymbolTextDecoder]（"符号词典+文字区域"这种复杂画风，
+     *    2026-08-23 用户明确要求"解决 JBIG2 图片显示的问题"后新增，完整背景
+     *    见该类 KDoc）——这条路径需要额外查一下 PDF 的 `/DecodeParms` 字典
+     *    有没有声明 `/JBIG2Globals`（多张图片共享的全局符号词典，装机诊断
+     *    真机数据确认过这本书确实用了这个机制：本地词典只占一小部分符号，
+     *    绝大多数常用字形是共享的全局词典）；有就把那份共享流也解出来一起
+     *    传进去，没有就传 `null`（[Jbig2SymbolTextDecoder.decode] 处理这种
+     *    情况——文字区域引用的段号如果解不出来对应的词典，直接返回
+     *    `null`，走占位图降级，不会因为找不到 Globals 就崩溃）。
+     *
+     * 两个解码器命中各自的已知局限（比如非默认 AT 像素、Huffman 编码、
+     * 精细化聚合……）都返回 `null`，调用方（[PageContentStreamEngine
+     * .drawImage]）降级成占位图，不静默消失也不展示错误画面。
      *
      * 解码出的 [Jbig2GenericRegionDecoder.DecodedBitmap] 是按位打包的 1 位位图
      * （0=白、1=黑，MSB 在前）——转成 Android `Bitmap` 时对应关系是：`bit==1`
      * （黑）→ RGB 全 0，`bit==0`（白）→ RGB 全 0xFF，跟 [decodeRawImageByBitDepth]
      * 手写的位深解码是同一套约定，不要弄反。
      */
+    // 临时诊断字段，配合 decodeJbig2OrNull 里的一次性 fixture 导出，见那边注释。诊断完会删掉。
+    private var fixtureDumped = false
+
     private fun decodeJbig2OrNull(pdImage: PDImage): Bitmap? {
         val bytes = pdImage.createInputStream(listOf("JBIG2Decode")).use { it.readBytes() }
-        val decoded = Jbig2GenericRegionDecoder.decode(bytes) ?: return null
-        val width = decoded.width
-        val height = decoded.height
-        val rowStride = decoded.rowStride
-        val packed = decoded.packedBits
+        val globals = findJbig2GlobalsBytes(pdImage)
+        // 临时诊断：把最小的一份真实数据（主流+Globals）完整导出成十六进制，
+        // 用来当交叉验证测试的 fixture——本机没有 JBIG2 编码器，没法凭空造
+        // 合法的符号词典/文字区域测试数据，只能用真机上这本书的真实字节。
+        // 只在字节数不太大时导出（挑最小的那张图片），避免刷屏。诊断完会删掉。
+        if (bytes.size < 20000 && !fixtureDumped) {
+            fixtureDumped = true
+            fun dumpHex(tag: String, data: ByteArray) {
+                android.util.Log.d("PdfReaderDebug", "$tag 开始 字节数=${data.size}")
+                data.toList().chunked(40).forEach { chunk ->
+                    android.util.Log.d("PdfReaderDebug", "$tag " + chunk.joinToString(" ") { "%02X".format(it) })
+                }
+                android.util.Log.d("PdfReaderDebug", "$tag 结束")
+            }
+            dumpHex("FIXTURE_MAIN", bytes)
+            globals?.let { dumpHex("FIXTURE_GLOBALS", it) }
+        }
+        val decoded = Jbig2GenericRegionDecoder.decode(bytes)
+            ?: Jbig2SymbolTextDecoder.decode(bytes, globals)
+            ?: return null
+        return decoded.toAndroidBitmap()
+    }
+
+    /**
+     * 查这张 JBIG2 图片的 `/DecodeParms` 字典有没有声明 `/JBIG2Globals`（PDF
+     * 规范约定的"多张图片共享一份全局符号词典"机制，见 [decodeJbig2OrNull]
+     * KDoc）——有就把那份流解出来（这份流本身可能又被 FlateDecode 之类的
+     * 通用过滤器压缩过一层，`createInputStream()` 不带参数会自动应用完剩下
+     * 的过滤器，拿到的就是纯 JBIG2 段字节，不需要跟 `pdImage` 那边一样手动
+     * 指定"停在 JBIG2Decode 之前"——Globals 流本身不会再叠一层 JBIG2Decode
+     * 过滤器，它已经是最终的 JBIG2 段数据）。查不到就返回 `null`。
+     */
+    private fun findJbig2GlobalsBytes(pdImage: PDImage): ByteArray? = runCatching {
+        val cosDict = pdImage.cosObject as? com.tom_roush.pdfbox.cos.COSDictionary ?: return null
+        val decodeParms = cosDict.getDictionaryObject(com.tom_roush.pdfbox.cos.COSName.DECODE_PARMS)
+            as? com.tom_roush.pdfbox.cos.COSDictionary ?: return null
+        val globalsStream = decodeParms.getDictionaryObject(com.tom_roush.pdfbox.cos.COSName.getPDFName("JBIG2Globals"))
+            as? com.tom_roush.pdfbox.cos.COSStream ?: return null
+        globalsStream.createInputStream().use { it.readBytes() }
+    }.getOrNull()
+
+    /** 见 [decodeJbig2OrNull] KDoc"按位打包→Android Bitmap"一节，两个 JBIG2 解码器共用同一套转换逻辑。 */
+    private fun Jbig2GenericRegionDecoder.DecodedBitmap.toAndroidBitmap(): Bitmap {
         val pixels = IntArray(width * height)
         var pixelIndex = 0
         for (y in 0 until height) {
@@ -670,7 +741,7 @@ object PdfTextExtractor {
             for (x in 0 until width) {
                 val byteIndex = rowStart + (x shr 3)
                 val bitOffset = x and 0x07
-                val bit = (packed[byteIndex].toInt() ushr (7 - bitOffset)) and 1
+                val bit = (packedBits[byteIndex].toInt() ushr (7 - bitOffset)) and 1
                 pixels[pixelIndex] = if (bit == 1) (0xFF shl 24) else (0xFF shl 24) or 0xFFFFFF
                 pixelIndex++
             }
@@ -1624,12 +1695,11 @@ object PdfTextExtractor {
             // 不展示（不展示错误内容），只是把"能覆盖"的范围从"1/8 位"扩大到
             // "任意位深的灰度/RGB"。
             if (pdImage.suffix == "jb2") {
-                // 见 decodeJbig2OrNull KDoc 完整背景：第三方库两次都走不通
-                // （NOTES.md #25/#27），改成自己写的纯 Kotlin 通用区域解码器
-                // （[Jbig2GenericRegionDecoder]），只覆盖真机确认过的真实场景
-                // （段类型只有页信息+通用区域，没有符号词典/文字区域）。解不了
-                // （命中已知局限，比如非默认 AT 像素、用了符号词典）时降级成
-                // 占位图，不静默消失也不展示错误画面。
+                // 见 decodeJbig2OrNull KDoc 完整背景：依次尝试
+                // Jbig2GenericRegionDecoder（简单画风）和 Jbig2SymbolTextDecoder
+                // （符号词典+文字区域这种复杂画风，含 JBIG2Globals 共享词典
+                // 处理）。两个都解不出来（命中各自已知局限）时降级成占位图，
+                // 不静默消失也不展示错误画面。
                 val decoded = runCatching { decodeJbig2OrNull(pdImage) }
                 decoded.exceptionOrNull()?.let {
                     android.util.Log.d("PdfReaderDebug", "decodeJbig2OrNull 抛异常: $it")
