@@ -709,28 +709,9 @@ object PdfTextExtractor {
      * （黑）→ RGB 全 0，`bit==0`（白）→ RGB 全 0xFF，跟 [decodeRawImageByBitDepth]
      * 手写的位深解码是同一套约定，不要弄反。
      */
-    // 临时诊断字段，配合 decodeJbig2OrNull 里的一次性 fixture 导出，见那边注释。诊断完会删掉。
-    private var fixtureDumped = false
-
     private fun decodeJbig2OrNull(pdImage: PDImage): Bitmap? {
         val bytes = pdImage.createInputStream(listOf("JBIG2Decode")).use { it.readBytes() }
         val globals = findJbig2GlobalsBytes(pdImage)
-        // 临时诊断：把最小的一份真实数据（主流+Globals）完整导出成十六进制，
-        // 用来当交叉验证测试的 fixture——本机没有 JBIG2 编码器，没法凭空造
-        // 合法的符号词典/文字区域测试数据，只能用真机上这本书的真实字节。
-        // 只在字节数不太大时导出（挑最小的那张图片），避免刷屏。诊断完会删掉。
-        if (bytes.size < 20000 && !fixtureDumped) {
-            fixtureDumped = true
-            fun dumpHex(tag: String, data: ByteArray) {
-                android.util.Log.d("PdfReaderDebug", "$tag 开始 字节数=${data.size}")
-                data.toList().chunked(40).forEach { chunk ->
-                    android.util.Log.d("PdfReaderDebug", "$tag " + chunk.joinToString(" ") { "%02X".format(it) })
-                }
-                android.util.Log.d("PdfReaderDebug", "$tag 结束")
-            }
-            dumpHex("FIXTURE_MAIN", bytes)
-            globals?.let { dumpHex("FIXTURE_GLOBALS", it) }
-        }
         val decoded = Jbig2GenericRegionDecoder.decode(bytes)
             ?: Jbig2SymbolTextDecoder.decode(bytes, globals)
             ?: return null
