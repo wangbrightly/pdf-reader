@@ -65,6 +65,17 @@ dependencies {
     // 更可靠。
     testImplementation("org.apache.pdfbox:jbig2-imageio:3.0.5")
 
+    // 交叉验证新写的 [JpegDecoder]（自己手写、支持 CMYK 的 JPEG 解码器）本来想
+    // 用 TwelveMonkeys 的 imageio-jpeg 插件当参考实现（标准 JDK 自带的
+    // javax.imageio 不支持 4 分量 CMYK JPEG，这正是这次要解决的问题本身）——
+    // 试过之后放弃了：喂一张已知纯黑（CMYK 全部拉满 C/M/Y、K=0）的最小测试图，
+    // 这个库解出 (44,48,49)，不是预期的 (0,0,0)，偏差量级不是"合理的有损压缩
+    // 误差"，是这个库自己在处理这类极端 CMYK 组合时有问题（没有深挖具体原因，
+    // 重要的是不能拿一个自己都有已知偏差的实现当标准答案）。改成用 Python
+    // Pillow（底层 libjpeg-turbo）离线预先解码成 PNG 存进测试 fixture，见
+    // [app.pdfreader.extract.JpegDecoderCrossValidationTest] KDoc 完整背景，
+    // 所以这里不需要额外的测试期第三方 JPEG 解码依赖。
+
     // 抽取层需要 Context（PDFBoxResourceLoader.init(context)），纯 JVM 单元测试
     // 拿不到真实 Android Context，用 Robolectric 在 JVM 上模拟一个。
     // 版本：4.16.1，2026-01-21 发布（已核实 GitHub Releases + Maven Central 均有该坐标）。

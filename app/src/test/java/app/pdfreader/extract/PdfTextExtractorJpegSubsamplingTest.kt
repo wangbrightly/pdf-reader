@@ -112,7 +112,7 @@ class PdfTextExtractorJpegSubsamplingTest {
     }
 
     @Test
-    fun `CMYK JPEG 不走原生降采样路径，也不回退到 pdImage-image，显示占位图`() {
+    fun `CMYK JPEG 不走原生降采样路径，也不回退到 pdImage-image，由自己的解码器真正解出`() {
         // 2026-08-20 最初的修法：安卓 BitmapFactory 解码 CMYK（4 通道）JPEG 有已知
         // 老毛病，把 4 通道数据当 3 通道 RGB 硬读，视觉上是对角线彩色噪点花屏——见
         // decodeJpegWithNativeSubsampling KDoc"已修"一节完整背景，当时的结论是
@@ -125,8 +125,14 @@ class PdfTextExtractorJpegSubsamplingTest {
         // JPEG 字节（不带降采样参数）结果同样纯黑。两条独立解码路径（PdfBox 纯
         // Java 实现 + 安卓自带 Skia/libjpeg-turbo 原生实现）给出一致的失败结果，
         // 证明"pdImage.image 能正确处理 CMYK"这个假设是错的，至少对这类 CMYK/
-        // YCCK 编码变体不成立。改成跟 JBIG2 一样显示诚实的占位图（见
-        // decodeCmykJpegPlaceholderOrNull KDoc 完整背景），不展示纯黑块。
+        // YCCK 编码变体不成立。当时改成跟 JBIG2 一样显示诚实的占位图。
+        //
+        // 2026-08-23 再进一步：手写的 [JpegDecoder] 接进取代了占位图——范围内
+        // （真机确认过的数据形状：4 分量、Adobe transform=0、1x1 采样、baseline）
+        // 的 CMYK JPEG 现在真正解码出原始像素。这条测试的断言因此从"占位图小尺寸"
+        // 翻转成"解码结果是原图尺寸"：既验证没走原生降采样路径（那条路径对
+        // 4 分量直接返回），也没回退到 `pdImage.image`（那条路径在 Robolectric
+        // 里解不出这种数据），只有 [JpegDecoder] 这条自己的路径能产出原尺寸结果。
         //
         // 注意：这里不能用 `imageXObject.colorSpace.numberOfComponents` 验证 fixture
         // 确实是 CMYK——反编译确认过 `PDImageXObject.createFromByteArray` 内部固定
@@ -134,7 +140,8 @@ class PdfTextExtractorJpegSubsamplingTest {
         // 直接断言 fixture 文件本身的字节，跟 JpegComponentCountTest 用的是同一份
         // fixture、同一个判断依据。
         //
-        // fixture `cmyk-quadrant.jpg`（3000×2000，4 通道 CMYK，Python Pillow 生成）。
+        // fixture `cmyk-quadrant.jpg`（3000×2000，4 通道 CMYK，Python Pillow 生成，
+        // 结构在 [JpegDecoder] 范围内）。
         val context = RuntimeEnvironment.getApplication()
         PDFBoxResourceLoader.init(context)
         val document = PDDocument()
@@ -155,16 +162,10 @@ class PdfTextExtractorJpegSubsamplingTest {
         val content = PdfTextExtractor.extractContent(context, output)
         assertEquals(1, content.images.size)
         val bitmap = content.images.single().bitmap
-        // 占位图长边缩到很小（远小于原图 3000px），且保留原图 3000x2000（3:2）
-        // 的长宽比——用这两点间接验证走的是占位图路径，不是真的解码出原图。
-        assertTrue(
-            "占位图长边应该远小于原图，不该是 pdImage.image 解码出来的原始尺寸，实际=${bitmap.width}x${bitmap.height}",
-            maxOf(bitmap.width, bitmap.height) < 1000,
-        )
-        val aspectRatioDiff = kotlin.math.abs(bitmap.width.toFloat() / bitmap.height - 3000f / 2000f)
-        assertTrue(
-            "占位图应该保留原图 3000x2000 的长宽比，实际长宽比=${bitmap.width.toFloat() / bitmap.height}",
-            aspectRatioDiff < 0.05f,
-        )
+        // [JpegDecoder] 按 SOF 声明的原始尺寸输出（3000x2000）——如果漏拦截掉进
+        // 占位图路径，长边会是 400；掉进常规解码路径，这个环境下根本解不出 4 分量
+        // 数据。原尺寸是"走了自己的解码器"最强的间接证据。
+        assertEquals("解码结果宽度应该是原图尺寸", 3000, bitmap.width)
+        assertEquals("解码结果高度应该是原图尺寸", 2000, bitmap.height)
     }
 }

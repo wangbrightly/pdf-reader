@@ -380,7 +380,7 @@ object PdfTextExtractor {
      * （3 通道），把 4 通道数据硬当 3 通道读，色彩通道错位，视觉上就是这种对角线
      * 噪点/条纹。`pdImage.image`（PdfBox-Android 自己的解码路径）内部会调
      * `PDColorSpace.toRGBImage` 做色彩空间转换，理论上能正确处理 CMYK，只是慢
-     * ——**这句话 2026-08-22 被推翻了，见 [decodeCmykJpegPlaceholderOrNull] KDoc**：
+     * ——**这句话 2026-08-22 被推翻了，见 [decodeCmykJpegOrNull] KDoc**：
      * 另一本书的 CMYK JPEG 真机验证过，回退到 `pdImage.image` 解码结果是纯黑，
      * 不是花屏也不是正确颜色。当时（这次注释写的时候）只验证到"挡住快速路径能
      * 消除花屏"，没有反过来验证"回退路径解码结果真的颜色正确"，是这次判断不完整
@@ -444,11 +444,15 @@ object PdfTextExtractor {
      *    识这批 JPEG 用的这种 CMYK/YCCK 编码变体（推测是 Adobe 反色 CMYK 之类
      *    的非标准约定，具体是哪一种没有继续深挖字节级细节）。
      *
-     * **真正正确解码 CMYK JPEG 需要自己实现或引入一个支持 CMYK 的 JPEG 解码器**
-     * ——跟 [createUnsupportedImagePlaceholder] KDoc"JBIG2 现状"一节记录的
-     * JBIG2 困境是同一个数量级的工作量，这次不做。改成跟 JBIG2 一样显示诚实的
-     * 占位图，不展示纯黑色块（纯黑块看起来像"图片整个坏掉了"，比一块写清楚
-     * 原因的占位图更容易让人误以为是软件本身的严重故障）。
+     * **真正正确解码 CMYK JPEG 需要自己实现一个支持 CMYK 的 JPEG 解码器**
+     * ——2026-08-23 已经做了：[JpegDecoder]，手写完整 JPEG 解码（熵解码+反量化
+     * +IDCT+Adobe 反色约定下的 CMYK→RGB 转换），范围严格限定在真机确认过的
+     * 数据形状（4 分量、Adobe APP14 transform=0、1×1 采样、baseline/extended
+     * sequential），范围外明确返回 `null`。正确性用 Pillow（libjpeg-turbo）
+     * 参考逐像素交叉验证过，含真机取回的原始数据，见 [JpegDecoderCrossValidationTest]。
+     * 解码失败（范围外）时仍然显示诚实的占位图，不展示纯黑色块（纯黑块看起来
+     * 像"图片整个坏掉了"，比一块写清楚原因的占位图更容易让人误以为是软件本身
+     * 的严重故障）。
      *
      * **2026-08-23 补充排查：确认了带 Adobe APP14 标记（`transform=0`），但
      * "简单反色能救回内容"这条低成本路径已经验证过走不通，别再重复试**——
@@ -468,21 +472,38 @@ object PdfTextExtractor {
      * 便宜的替代方案，工作量评估维持不变（跟 JBIG2 符号词典是同一个数量级，
      * 需要额外投入才能做，这次没有做）。
      *
-     * 检测本身很轻量——只读 JPEG 头部的 SOF 标记算分量数（[JpegComponentCount]
-     * 不需要解码整张图），4 分量就直接判定为"这台设备解不出来"，不用真的跑一遍
-     * 解码再看结果是不是纯黑（那样反而更慢，白白解码一遍还是要扔掉）。
+     * 检测本身分两步：先只读 JPEG 头部的 SOF 标记算分量数（[JpegComponentCount]
+     * 不需要解码整张图），不是 4 分量直接返回 `null`，不碰解码；确认是 4 分量才
+     * 读完整字节交给 [JpegDecoder] 真正解码。
      *
      * @return 不是 4 分量 JPEG（不需要这条特殊处理）时返回 `null`，调用方按正常
-     * 流程继续走 [decodeJpegWithNativeSubsampling]/`pdImage.image`。
+     * 流程继续走 [decodeJpegWithNativeSubsampling]/`pdImage.image`；是 4 分量时
+     * 返回 [CmykJpegOutcome]——[CmykJpegOutcome.decoded] 为 `true` 表示真正解出了
+     * 像素内容（调用方要像其它真实图片一样走朝向修正），`false` 表示解码器明确
+     * 拒绝（范围外数据，见 [JpegDecoder] 类 KDoc"范围"一节），退回诚实占位图。
      */
-    private fun decodeCmykJpegPlaceholderOrNull(pdImage: PDImage): Bitmap? {
+    private fun decodeCmykJpegOrNull(pdImage: PDImage): CmykJpegOutcome? {
         if (pdImage.suffix != "jpg") return null
-        val components = runCatching {
-            pdImage.createInputStream(listOf("DCTDecode", "DCT")).use { JpegComponentCount.of(it.readBytes()) }
-        }.getOrNull()
-        if (components != 4) return null
-        return createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（CMYK JPEG）")
+        val bytes = runCatching {
+            pdImage.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
+        }.getOrNull() ?: return null
+        if (JpegComponentCount.of(bytes) != 4) return null
+        val decoded = runCatching { JpegDecoder.decode(bytes) }.getOrNull()
+        return if (decoded != null) {
+            CmykJpegOutcome(
+                Bitmap.createBitmap(decoded.argb, decoded.width, decoded.height, Bitmap.Config.ARGB_8888),
+                decoded = true,
+            )
+        } else {
+            CmykJpegOutcome(
+                createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（CMYK JPEG）"),
+                decoded = false,
+            )
+        }
     }
+
+    /** [decodeCmykJpegOrNull] 的返回值：真正解码成功还是退回占位图，调用方要区别对待（朝向修正只适用于真实像素内容）。 */
+    private data class CmykJpegOutcome(val bitmap: Bitmap, val decoded: Boolean)
 
     /**
      * "解不出来的图片"用一块诚实的占位图代替，不静默消失——真机反馈"有的图片干脆
@@ -526,12 +547,14 @@ object PdfTextExtractor {
      * （长边 [PLACEHOLDER_LONG_SIDE_PX]）——原图可能几千像素见方，占位图不需要
      * 那么大内存。
      *
-     * ## 第二个使用场景：CMYK JPEG（2026-08-22 新增）
+     * ## 第二个使用场景：CMYK JPEG（2026-08-22 新增，2026-08-23 收窄）
      *
-     * 见 [decodeCmykJpegPlaceholderOrNull] KDoc 完整背景——4 分量 CMYK/YCCK
+     * 见 [decodeCmykJpegOrNull] KDoc 完整背景——4 分量 CMYK/YCCK
      * JPEG 在这台设备上无论走 PdfBox-Android 自己的解码还是安卓原生
-     * `BitmapFactory` 都会解出纯黑图片（真机验证过，两条独立路径结果一致），
-     * 同样改成显示这块占位图，不展示看起来像"整个坏掉了"的纯黑色块。
+     * `BitmapFactory` 都会解出纯黑图片（真机验证过，两条独立路径结果一致）。
+     * 2026-08-23 起范围内的数据（真机确认过的那种形状）已经由手写的
+     * [JpegDecoder] 真正解码显示；只有解码器明确拒绝的范围外变体（如
+     * YCCK/渐进式/色度子采样）才落回这块占位图，仍然不展示纯黑色块。
      */
     private fun createUnsupportedImagePlaceholder(originalWidth: Int, originalHeight: Int, reason: String): Bitmap {
         val safeWidth = if (originalWidth > 0) originalWidth else 1
@@ -1744,16 +1767,24 @@ object PdfTextExtractor {
                 }
                 return
             }
-            // 见 decodeCmykJpegPlaceholderOrNull KDoc 完整背景：CMYK/YCCK JPEG 在这台
-            // 设备上无论走哪条解码路径最终都会解出纯黑图片，真机验证过后改成跟
-            // JBIG2 一样显示诚实占位图，不显示纯黑色块。检测放在 [decodeJpegWithNative
-            // Subsampling] 之前——那个函数内部虽然也会跳过非 3 分量的 JPEG（避免带
-            // 降采样参数那条路径的对角线花屏），但跳过之后仍然会走到下面的 `pdImage
-            // .image`，那条路径同样会产出纯黑图片，不提前拦截的话用户还是会看到
-            // 纯黑块。
-            val cmykPlaceholder = decodeCmykJpegPlaceholderOrNull(pdImage)
-            if (cmykPlaceholder != null) {
-                images.add(cmykPlaceholder)
+            // 见 decodeCmykJpegOrNull KDoc 完整背景：4 分量 CMYK/YCCK JPEG 在这台
+            // 设备上走 PdfBox-Android 自己的解码和安卓原生 BitmapFactory 都会解出
+            // 纯黑图片（两条路径真机验证过），所以提前拦截、交给自己的 [JpegDecoder]。
+            // 拦截必须放在 [decodeJpegWithNativeSubsampling] 之前——那个函数内部虽然
+            // 也会跳过非 3 分量的 JPEG（避免带降采样参数那条路径的对角线花屏），但
+            // 跳过之后仍然会走到下面的 `pdImage.image`，那条路径同样会产出纯黑图片，
+            // 不提前拦截的话用户还是会看到纯黑块。
+            val cmykResult = decodeCmykJpegOrNull(pdImage)
+            if (cmykResult != null) {
+                if (cmykResult.decoded) {
+                    // 真正解出来的原始像素内容，跟其它正常图片一样走两层朝向修正。
+                    val ctm = graphicsState.currentTransformationMatrix
+                    images.add(orientImage(cmykResult.bitmap, ctm))
+                } else {
+                    // 解码器明确拒绝（范围外数据）：占位图不走朝向修正，理由跟
+                    // JBIG2 占位图一样（见下面 JBIG2 分支的注释）。
+                    images.add(cmykResult.bitmap)
+                }
                 return
             }
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
