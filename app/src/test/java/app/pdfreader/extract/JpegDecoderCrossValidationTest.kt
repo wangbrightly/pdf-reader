@@ -104,6 +104,35 @@ class JpegDecoderCrossValidationTest {
     }
 
     /**
+     * 2026-08-23 装机验证抓出的真 bug：那本 CMYK 教科书（印刷行业扫描数据）虽然
+     * 也带 Adobe APP14 transform=0 标记，但存的是**不反色**的 CMYK（不符合 Adobe
+     * 约定，但真实存在）——按反色约定解（Pillow 和我原来的写法都这样）整幅纯黑，
+     * 用户在真机上看到的就是这个。fixture `cmyk-book-noinv.jpg` 直接从这本书的 PDF
+     * 里原样抽出（1725×955 的页面装饰图），不反色解码应该是正常页面画面
+     * （绝大部分白/浅色），断言明暗分布而不是逐像素（这种数据没有可信的第三方
+     * 参考——所有按 Adobe 约定实现的库都会跟我原来一样解错）。
+     */
+    @Test
+    fun `真书不反色存储的CMYK 解码结果是正常页面不是全黑`() {
+        val bytes = loadBytes("cmyk-book-noinv.jpg")
+        val decoded = requireNotNull(JpegDecoder.decode(bytes)) { "cmyk-book-noinv.jpg：JpegDecoder 返回 null" }
+
+        var dark = 0
+        var light = 0
+        val total = decoded.argb.size
+        for (argb in decoded.argb) {
+            val sum = ((argb ushr 16) and 0xFF) + ((argb ushr 8) and 0xFF) + (argb and 0xFF)
+            if (sum < 150) dark++
+            if (sum > 600) light++
+        }
+        assertTrue(
+            "不反色存储的真书页面解出来应该是大部分浅色（实际亮 ${100L * light / total}% 暗 ${100L * dark / total}%）——" +
+                "如果暗像素占绝大多数，说明又按反色约定解了",
+            dark.toDouble() / total < 0.05 && light.toDouble() / total > 0.8,
+        )
+    }
+
+    /**
      * 真机导出的原始数据（不是本地合成的）也要跟 Pillow 参考解码逐像素一致——
      * 本地合成的 6 组 fixture 证明了算法本身对，但"真机那批书到底是不是这个
      * 结构"是另一回事。这份 `cmyk-quadrant.jpg` 是 2026-08-23 从真机应用私有
