@@ -40,19 +40,22 @@ import kotlin.math.min
  * 支持 8 位精度、任意宽高（不要求是 8 的倍数，最后一行/列的块按实际边界裁剪）、
  * 重启间隔（DRI/RSTn 标记，扫描图片常见）。
  *
- * ## 核心机制：Adobe 反色 CMYK 约定（真机+本地双重验证过，不是凭印象）
+ * ## 核心机制：两种存储约定并存，逐图投票决定反不反色（装机抓出的真坑）
  *
  * Adobe 系工具（Photoshop、专业印刷软件）存 CMYK JPEG 时，四个通道的采样值是
- * **反过来存的**：存的值 = 255 − 真实值。真机诊断已经确认过这批图片带
- * `transform=0` 的 Adobe APP14 标记；这次本地用 Python Pillow 生成了同构的
- * 测试数据（同样是 Adobe 标记 + `transform=0` + baseline + 4 分量 1×1 采样，
- * 字节结构跟真机数据一致），拿两个独立的可信参考实现交叉验证过这个反色约定：
- * Pillow 自己的读取路径（`Image.open(...).convert('CMYK')`）和 TwelveMonkeys
- * 的 `imageio-jpeg` 插件（这次新增的测试专用依赖，纯 Java、Apache 2.0 许可证，
- * 只在 JVM 单元测试里用，见 `build.gradle.kts` 注释），两者对同一份新造的
- * 纯黄色测试图都给出了正确的解码结果（不反色的话会得到色彩完全错误的图片，
- * 两个独立实现都不会犯这种错误），确认了"存的值需要做 `255 − 值` 才是真实
- * CMYK 分量"这个约定站得住脚，不是凭印象猜的。
+ * **反过来存的**：存的值 = 255 − 真实值，这是 Adobe APP14 标记约定的标准做法。
+ * 但 2026-08-23 装机验证发现用户的教科书（印刷行业扫描数据）虽然**同样带
+ * Adobe APP14 `transform=0` 标记**，存的却是**不反色**的真实 CMYK 值——不符合
+ * 约定但真实存在。按反色约定解这种数据整幅纯黑（真机上用户看到的就是这个），
+ * 而且所有按 Adobe 约定实现的库（Pillow/libjpeg、Skia）都会犯同样的错，所以
+ * 逐像素比对第三方参考**测不出这个 bug**——参考实现自己就解错了。
+ *
+ * 标记层面没有任何信号能区分两种约定（都长一样），只能看内容：逐图对原始
+ * 采样值投票——存的值偏亮（四通道和 > 700 的采样多于偏暗的）按反色约定解；
+ * 存的值偏暗按不反色解。推导过四种组合（两种约定 × 内容偏白/偏暗）这条规则
+ * 全部给出正确画面：偏白内容投票必然选对它自己的约定；偏暗内容即使选错约定，
+ * 解出来也还是偏暗（错约定下偏暗内容的解码结果恰好不变）。扫描/印刷页面
+ * 绝大部分是白底，这条规则在这类数据上等于"永远选对"。
  *
  * 反色之后是标准的 CMYK→RGB 转换（没有实现色彩管理/ICC 曲线那一套，是
  * "够用"的朴素公式，扫描/印刷场景下这条公式是行业惯例，不是本项目发明的）：
@@ -175,6 +178,18 @@ internal object JpegDecoder {
             }
         }
 
+        // 见类 KDoc"核心机制"一节：对原始采样值投票决定这张图按哪种存储约定解。
+        // 每 8 个采样取一票（全图投票没必要，白底页面几千票足够稳定，也省时间）。
+        var hiVotes = 0
+        var loVotes = 0
+        var voteIndex = 0
+        while (voteIndex < planes[0].size) {
+            val s = planes[0][voteIndex] + planes[1][voteIndex] + planes[2][voteIndex] + planes[3][voteIndex]
+            if (s > 700) hiVotes++ else if (s < 300) loVotes++
+            voteIndex += 8
+        }
+        val invert = hiVotes >= loVotes
+
         val width = frame.width
         val height = frame.height
         val argb = IntArray(width * height)
@@ -183,11 +198,11 @@ internal object JpegDecoder {
             val rowBase = y * planeWidth
             for (x in 0 until width) {
                 val p = rowBase + x
-                // 见类 KDoc"核心机制"一节：存的值是反色的，先 255-值 还原真实 CMYK。
-                val realC = 255 - planes[0][p].coerceIn(0, 255)
-                val realM = 255 - planes[1][p].coerceIn(0, 255)
-                val realY = 255 - planes[2][p].coerceIn(0, 255)
-                val realK = 255 - planes[3][p].coerceIn(0, 255)
+                // 反色约定：存的值先 255-值 还原真实 CMYK；不反色约定：存的值即真实值。
+                val realC = if (invert) 255 - planes[0][p].coerceIn(0, 255) else planes[0][p].coerceIn(0, 255)
+                val realM = if (invert) 255 - planes[1][p].coerceIn(0, 255) else planes[1][p].coerceIn(0, 255)
+                val realY = if (invert) 255 - planes[2][p].coerceIn(0, 255) else planes[2][p].coerceIn(0, 255)
+                val realK = if (invert) 255 - planes[3][p].coerceIn(0, 255) else planes[3][p].coerceIn(0, 255)
                 val r = 255 - min(255, realC + realK)
                 val g = 255 - min(255, realM + realK)
                 val b = 255 - min(255, realY + realK)
