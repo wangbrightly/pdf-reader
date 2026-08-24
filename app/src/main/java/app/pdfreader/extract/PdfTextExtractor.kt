@@ -24,9 +24,7 @@ import java.io.File
 import java.text.Normalizer
 import kotlin.math.abs
 import kotlin.concurrent.thread
-import kotlin.concurrent.read
-import kotlin.concurrent.write
-import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.withLock
 import kotlin.math.sign
 
 /**
@@ -1879,8 +1877,30 @@ object PdfTextExtractor {
          * 重新加锁一直插队饿死。教训：即使按页拆分成"细粒度、短暂持锁"，
          * 默认非公平锁在一方持续高频重新加锁时仍然可能让另一方等很久，光靠
          * "锁的粒度细"不够，还需要显式要公平性。
+         *
+         * **2026-08-25 第三次修复：`loadPage` 之间的并发本身就不安全，读写锁
+         * "多个读者"这个模型从一开始就用错了**——引入读写锁时留了一句"loadPage
+         * 之间会不会互相踩到彼此，是没有实证过的另一个问题"，没有验证就假设
+         * 安全。补了一个专门的受控实验（[SessionConcurrentLoadPageTest]，3
+         * 线程各自反复对不同页调 `loadPage`，覆盖真实的 `PdfPageAdapter
+         * .LOAD_POOL_SIZE=3` 并发度）——180 次调用里就复现了 1 次真实的数据
+         * 损坏：一页本该正常解码出的 767×2159 YCCK 图片，在并发压力下解码
+         * 失败退化成了 142×400 的占位图（`JpegDecoder.decode` 返回了 `null`，
+         * 大概率是并发读同一个 `PDDocument`/`COSStream` 时字节被读错/读乱了）。
+         * `PDDocument` 不是"多个读者安全、只有写者需要互斥"的资源——它是
+         * PDFBox 内部一整套带懒加载缓存的对象图，任何访问都可能触发内部状态
+         * 的读写，"读锁允许并发"这个语义对它根本不成立。
+         *
+         * 改成 [ReentrantLock]`(true)`（公平模式的普通互斥锁）：`loadPage`、
+         * `footerLearningThread`、`outlineThread` 三处全部改成互斥访问，不再
+         * 区分"读"和"写"。代价是 `loadExecutor` 那 3 个线程不再能真正并发解码
+         * 3 个不同页面——但这份"3 路并发"从建 `PdfPageAdapter` 那天起就没有
+         * 验证过对 `PDDocument` 是安全的，这次实证直接推翻了这个假设，不能因为
+         * "并发看起来更快"就继续冒数据损坏的风险。公平模式保住了上一轮修好的
+         * 那部分（`loadPage` 不会被 footerLearning 饿死）。真机耗时有没有
+         * 回退，装机复测的真实数据见 NOTES.md #36，这里不预先断言。
          */
-        private val documentLock = ReentrantReadWriteLock(true)
+        private val documentLock = java.util.concurrent.locks.ReentrantLock(true)
 
         /**
          * 2026-08-21 改成后台异步（用户要求"一秒之内打开 PDF，后台加载数据"）：真机
@@ -1904,7 +1924,7 @@ object PdfTextExtractor {
         private fun extractOutlineInBackground(onOutlineReady: () -> Unit) {
             outlineThread = thread {
                 // 见 documentLock KDoc——写锁，独占排斥所有 loadPage。
-                outline = runCatching { documentLock.write { extractOutline(document) } }.getOrDefault(emptyList())
+                outline = runCatching { documentLock.withLock { extractOutline(document) } }.getOrDefault(emptyList())
                 onOutlineReady()
             }
         }
@@ -1951,13 +1971,14 @@ object PdfTextExtractor {
                     val sampleEndPage = minOf(FOOTER_SAMPLE_PAGE_COUNT, pageCount)
                     if (sampleEndPage < 1) return@runCatching emptySet()
                     val stripper = LineCollectingStripper()
-                    // 见 documentLock KDoc——写锁，故意按页逐次加锁/放锁，不是一次性锁住
-                    // 整个 150 页样本区间：后者会让 loadPage（尤其是 open() 后紧接着调用
-                    // 的第一页）最坏情况等这整批后台学习跑完才能拿到锁，等于把 NOTES.md
+                    // 见 documentLock KDoc——故意按页逐次加锁/放锁，不是一次性锁住整个
+                    // 150 页样本区间：后者会让 loadPage（尤其是 open() 后紧接着调用的
+                    // 第一页）最坏情况等这整批后台学习跑完才能拿到锁，等于把 NOTES.md
                     // #23 特意做的"后台学习不阻塞打开"这个优化又变相锁死了。按页拆开后
-                    // loadPage 最多等一页的学习耗时（通常几十毫秒量级），不会等整批。
+                    // loadPage 最多等一页的学习耗时（通常几十毫秒量级），不会等整批
+                    // ——公平锁保证这个"最多等一页"的上限真的成立，不会被饿死。
                     for (p in 1..sampleEndPage) {
-                        documentLock.write {
+                        documentLock.withLock {
                             stripper.startPage = p
                             stripper.endPage = p
                             stripper.getText(document)
@@ -1996,13 +2017,12 @@ object PdfTextExtractor {
          * 每一页只应该被调用一次，调用方（[app.pdfreader.ui.PdfPageAdapter]）负责
          * 这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
          */
-        // 见 documentLock KDoc——读锁，多个 loadPage 之间可以照旧互相并发（不新增
-        // 保护也不新增风险，维持这次改动之前的并发度），只排斥后台的
-        // footerLearningThread/outlineThread 写锁。整个函数体一起拿锁，不做更细
-        // 粒度的拆分：函数体内部有好几处独立 touch document/page 的调用（矢量
-        // 扫描、文字抽取、表格整页渲染、图片解码各一次），拆开加锁需要对每一处都
-        // 判断"这段中间夹着的纯内存计算安不安全被打断"，出错代价高。
-        fun loadPage(pageNo: Int): PageContent = documentLock.read { loadPageLocked(pageNo) }
+        // 见 documentLock KDoc——2026-08-25 起 loadPage 之间也互斥（受控实验实锤
+        // 过并发不安全，PDDocument 不是"多读者安全"的资源）。整个函数体一起拿锁，
+        // 不做更细粒度的拆分：函数体内部有好几处独立 touch document/page 的调用
+        // （矢量扫描、文字抽取、表格整页渲染、图片解码各一次），拆开加锁需要对
+        // 每一处都判断"这段中间夹着的纯内存计算安不安全被打断"，出错代价高。
+        fun loadPage(pageNo: Int): PageContent = documentLock.withLock { loadPageLocked(pageNo) }
 
         private fun loadPageLocked(pageNo: Int): PageContent {
             // 2026-08-20 临时诊断日志：追查真机反馈"这本书打开后翻某些页要好几秒"——
