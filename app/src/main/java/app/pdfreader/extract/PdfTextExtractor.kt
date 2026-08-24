@@ -1835,6 +1835,19 @@ object PdfTextExtractor {
         val pageCount: Int = document.numberOfPages
 
         /**
+         * 2026-08-24 探测出的并发竞争 bug（不是真机反馈，是主动用 pdf.js 语料库
+         * 找边缘情况时撞出来的）：[open] 起的 [footerLearningThread]/[outlineThread]
+         * 两个后台线程和调用方紧接着同步调的 [loadPage] 会并发读同一个 [document]
+         * （`PDDocument`）——PDFBox-Android 没有声明这个类线程安全。受控实验实锤：
+         * 同一份文件、同一个 JVM，不加锁时 8 次里 2 次结果反常（该有的图片/文字
+         * 数量对不上），全部访问都用这把锁串行化之后 8 次全部一致。所有直接或间接
+         * touch [document]/`PDPage`/PDFBox 内部对象图的代码都要包在
+         * `synchronized(documentLock)` 里——见 [loadPage]、[learnFooterTitlesInBackground]、
+         * [extractOutlineInBackground] 三处。
+         */
+        private val documentLock = Any()
+
+        /**
          * 2026-08-21 改成后台异步（用户要求"一秒之内打开 PDF，后台加载数据"）：真机
          * 诊断日志实测确认过，大纲抽取本身也能占到 Session 构造耗时的好几秒（某份
          * 文档 `PDDocument.load`=9.7s、`Session构造(pageCount+outline)`=2.95s——
@@ -1855,7 +1868,8 @@ object PdfTextExtractor {
 
         private fun extractOutlineInBackground(onOutlineReady: () -> Unit) {
             outlineThread = thread {
-                outline = runCatching { extractOutline(document) }.getOrDefault(emptyList())
+                // 见 documentLock KDoc——跟 loadPage/footerLearning 并发读同一个 document。
+                outline = runCatching { synchronized(documentLock) { extractOutline(document) } }.getOrDefault(emptyList())
                 onOutlineReady()
             }
         }
@@ -1902,9 +1916,18 @@ object PdfTextExtractor {
                     val sampleEndPage = minOf(FOOTER_SAMPLE_PAGE_COUNT, pageCount)
                     if (sampleEndPage < 1) return@runCatching emptySet()
                     val stripper = LineCollectingStripper()
-                    stripper.startPage = 1
-                    stripper.endPage = sampleEndPage
-                    stripper.getText(document)
+                    // 见 documentLock KDoc——故意按页逐次加锁/放锁，不是一次性锁住整个
+                    // 150 页样本区间：后者会让 loadPage（尤其是 open() 后紧接着调用的
+                    // 第一页）最坏情况等这整批后台学习跑完才能拿到锁，等于把 NOTES.md
+                    // #23 特意做的"后台学习不阻塞打开"这个优化又变相锁死了。按页拆开后
+                    // loadPage 最多等一页的学习耗时（通常几十毫秒量级），不会等整批。
+                    for (p in 1..sampleEndPage) {
+                        synchronized(documentLock) {
+                            stripper.startPage = p
+                            stripper.endPage = p
+                            stripper.getText(document)
+                        }
+                    }
                     RunningFooterFilter.learnTitleLikeNoiseTexts(stripper.lines.map { PageTextLine(it.text, it.page) })
                 }.getOrDefault(emptySet())
             }
@@ -1938,7 +1961,14 @@ object PdfTextExtractor {
          * 每一页只应该被调用一次，调用方（[app.pdfreader.ui.PdfPageAdapter]）负责
          * 这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
          */
-        fun loadPage(pageNo: Int): PageContent {
+        // 见 documentLock KDoc——整个函数体包在锁里，不做更细粒度的拆分：函数体内部
+        // 有好几处独立 touch document/page 的调用（矢量扫描、文字抽取、表格整页
+        // 渲染、图片解码各一次），拆开加锁需要对每一处都判断"这段中间夹着的纯内存
+        // 计算安不安全被打断"，出错代价高；loadPage 本身按 KDoc 就是"几十毫秒量级"
+        // 的操作，直接整体加锁足够安全，也足够快，不值得为了更细粒度的并发度冒风险。
+        fun loadPage(pageNo: Int): PageContent = synchronized(documentLock) { loadPageLocked(pageNo) }
+
+        private fun loadPageLocked(pageNo: Int): PageContent {
             // 2026-08-20 临时诊断日志：追查真机反馈"这本书打开后翻某些页要好几秒"——
             // 拆开量每一步耗时，看是矢量扫描/表格检测慢，还是文字抽取本身慢，定位完
             // 会删掉。阈值 300ms 只是不想让正常页也刷屏。
