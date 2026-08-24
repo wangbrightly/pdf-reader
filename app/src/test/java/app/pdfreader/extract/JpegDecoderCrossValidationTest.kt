@@ -133,19 +133,25 @@ class JpegDecoderCrossValidationTest {
     }
 
     /**
-     * 真机导出的原始数据（不是本地合成的）也要跟 Pillow 参考解码逐像素一致——
-     * 本地合成的 6 组 fixture 证明了算法本身对，但"真机那批书到底是不是这个
-     * 结构"是另一回事。这份 `cmyk-quadrant.jpg` 是 2026-08-23 从真机应用私有
-     * 目录取回的（一次性诊断导出，见 [PdfTextExtractor] 里已删除的导出代码），
-     * 字节级核对过结构：baseline SOF0、8 位、3000x2000、4 分量全 1x1 采样、
-     * Adobe APP14 transform=0，跟解码器 KDoc"范围"一节逐条对上。参考 PNG 同样
-     * 是 Pillow（底层 libjpeg-turbo）预先解码存的。这条测试是"合成数据上验证过
-     * 的算法"和"真机真实数据"之间的桥：真机数据解出来跟工业界最广泛使用的
-     * JPEG 库一个像素都不差，才能确认装机后用户看到的画面是对的。
+     * 真机导出的原始数据（不是本地合成的）——`cmyk-quadrant.jpg` 是 2026-08-23
+     * 从真机应用私有目录取回的（一次性诊断导出，见 [PdfTextExtractor] 里已删除
+     * 的导出代码），字节级核对过结构：baseline SOF0、8 位、3000x2000、4 分量
+     * 全 1x1 采样、Adobe APP14 transform=0，本来跟解码器 KDoc"范围"一节逐条
+     * 对得上，也确实逐像素比对过 Pillow 参考解码完全一致（这份验证记录还留着，
+     * 见本文件历史）。
+     *
+     * **2026-08-24 更新**：3000×2000（600 万像素）超过了 [JpegDecoder
+     * .MAX_CMYK_JPEG_PIXELS]（400 万）——这个上限是另一本真机教科书封面图
+     * （4469×3871，1730 万像素）真机装机 OOM 之后加的安全阀，详情见
+     * [JpegDecoder.MAX_CMYK_JPEG_PIXELS] KDoc。这份 fixture 比新上限大，现在
+     * 按设计应该被拒绝，不再尝试解码——断言从"逐像素比对参考答案"改成"确认
+     * 明确拒绝"，算法正确性已经由范围内的 6 组合成 fixture + 下面
+     * [cmyk-book-noinv.jpg]（真机取回、在范围内）覆盖，不因为上限收紧而失去
+     * 验证。
      */
     @Test
-    fun `真机导出的CMYK fixture 跟Pillow参考解码逐像素比对`() {
-        assertMatchesReference("cmyk-quadrant")
+    fun `真机导出的CMYK fixture 超过尺寸上限 明确拒绝不冒险硬解`() {
+        assertNull(JpegDecoder.decode(loadBytes("cmyk-quadrant.jpg")))
     }
 
     @Test
@@ -170,6 +176,18 @@ class JpegDecoderCrossValidationTest {
         // 3 分量 RGB JPEG——不是这个解码器的服务范围（见类 KDoc"范围"一节），
         // 用现有 fixture 验证明确拒绝而不是硬解出一个可能错误的结果。
         assertNull(JpegDecoder.decode(loadBytes("small-quadrant.jpg")))
+    }
+
+    /**
+     * 见 [JpegDecoder.MAX_CMYK_JPEG_PIXELS] KDoc——超过像素上限直接拒绝，不
+     * 冒 OOM 风险。`large-quadrant.jpg`（4500×3000，1350 万像素）远超上限
+     * （400 万），必须返回 null；`cmyk-quadrant-64.jpg`（64×64）远低于上限，
+     * 必须正常解码——一次测试覆盖阈值两侧，不只测"超限会拒绝"这一半。
+     */
+    @Test
+    fun `超过像素上限的CMYK JPEG 明确返回null 不冒OOM风险`() {
+        assertNull(JpegDecoder.decode(loadBytes("large-quadrant.jpg")))
+        assertNotNull(JpegDecoder.decode(loadBytes("cmyk-quadrant-64.jpg")))
     }
 
     @Test

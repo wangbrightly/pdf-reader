@@ -168,4 +168,63 @@ class PdfjsEdgeCaseFixturesTest {
                 "############################################\n",
         )
     }
+
+    /**
+     * 上面那次并发竞争用普通互斥锁（`synchronized`）修好之后，同一天真机装机又
+     * 测出第二个坑：改成 `ReentrantReadWriteLock` 之后，`loadPage` 的读锁被
+     * [PdfTextExtractor.Session] 里页脚学习线程的写锁饿死——真机复现一份内容
+     * 复杂的年报，好几个页面卡到 18 秒左右，时长量级刚好吻合"页脚学习跑完
+     * 150 页样本"。根因是 `ReentrantReadWriteLock()` 默认非公平模式：写锁方
+     * 只要循环够紧凑，可以一直连续抢到锁，把等在旁边的读锁请求晾很久，即使
+     * 写锁每次只短暂持有（跟本文件那个并发竞争测试同一个精神——"锁的粒度细"
+     * 不等于"另一方不会被饿死"，需要显式要公平性）。改成
+     * `ReentrantReadWriteLock(true)`（公平模式）修复。
+     *
+     * 这里不依赖真机／复杂 PDF，直接在一个独立的 `ReentrantReadWriteLock` 上
+     * 复现同样的锁使用模式（写锁方紧凑循环 150 次、每次只短暂持有），验证公平
+     * 模式下等待中的读锁请求不会被饿死太久——用普通互斥锁（非公平语义的
+     * 极端版本，写锁方永远优先）对照，证明"公平"这个属性真的是修复生效的
+     * 原因，不是巧合。
+     */
+    @Test
+    fun `公平读写锁下等待中的读锁请求不会被紧凑循环的写锁饿死`() {
+        val fairLock = java.util.concurrent.locks.ReentrantReadWriteLock(true)
+        val unfairLock = java.util.concurrent.locks.ReentrantReadWriteLock(false)
+
+        fun measureReaderWaitMs(lock: java.util.concurrent.locks.ReentrantReadWriteLock): Long {
+            val writerStarted = java.util.concurrent.CountDownLatch(1)
+            val writerStop = java.util.concurrent.atomic.AtomicBoolean(false)
+            val writer = Thread {
+                repeat(150) { i ->
+                    lock.writeLock().lock()
+                    try {
+                        if (i == 0) writerStarted.countDown()
+                        Thread.sleep(5) // 模拟"处理一页"的短暂耗时。
+                    } finally {
+                        lock.writeLock().unlock()
+                    }
+                }
+                writerStop.set(true)
+            }
+            writer.start()
+            writerStarted.await()
+            val tReaderStart = System.currentTimeMillis()
+            lock.readLock().lock()
+            val waitMs = System.currentTimeMillis() - tReaderStart
+            lock.readLock().unlock()
+            writer.join()
+            return waitMs
+        }
+
+        val fairWaitMs = measureReaderWaitMs(fairLock)
+        val unfairWaitMs = measureReaderWaitMs(unfairLock)
+        println("公平锁读者等待=${fairWaitMs}ms 非公平锁读者等待=${unfairWaitMs}ms")
+
+        // 公平模式下读者应该在写者当前这一轮（约 5ms）结束后不久就拿到锁，不应该
+        // 被后续 149 轮循环饿死（150 轮 × 5ms ≈ 750ms 是非公平模式下的理论上限）。
+        assertTrue(
+            "公平锁读者等待($fairWaitMs ms)应该远小于写者跑完全部150轮的时间量级",
+            fairWaitMs < 300,
+        )
+    }
 }

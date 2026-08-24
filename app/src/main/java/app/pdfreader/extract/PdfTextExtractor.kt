@@ -24,6 +24,9 @@ import java.io.File
 import java.text.Normalizer
 import kotlin.math.abs
 import kotlin.concurrent.thread
+import kotlin.concurrent.read
+import kotlin.concurrent.write
+import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.math.sign
 
 /**
@@ -488,6 +491,10 @@ object PdfTextExtractor {
             pdImage.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
         }.getOrNull() ?: return null
         if (JpegComponentCount.of(bytes) != 4) return null
+        // 见 JpegDecoder.MAX_CMYK_JPEG_PIXELS KDoc——这条判断只是为了给用户看的占位图
+        // 文案更准确（"太大"和"格式不认识"是两件事），真正拦住解码、避免 OOM 的判断
+        // 在 JpegDecoder.decodeInternal 内部，这里重复算一遍不影响安全性。
+        val tooLarge = pdImage.width.toLong() * pdImage.height.toLong() > JpegDecoder.MAX_CMYK_JPEG_PIXELS
         val decoded = runCatching { JpegDecoder.decode(bytes) }.getOrNull()
         return if (decoded != null) {
             CmykJpegOutcome(
@@ -495,8 +502,9 @@ object PdfTextExtractor {
                 decoded = true,
             )
         } else {
+            val reason = if (tooLarge) "图片过大，暂不支持解码（CMYK JPEG）" else "图片格式不支持（CMYK JPEG）"
             CmykJpegOutcome(
-                createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（CMYK JPEG）"),
+                createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, reason),
                 decoded = false,
             )
         }
@@ -1840,12 +1848,38 @@ object PdfTextExtractor {
          * 两个后台线程和调用方紧接着同步调的 [loadPage] 会并发读同一个 [document]
          * （`PDDocument`）——PDFBox-Android 没有声明这个类线程安全。受控实验实锤：
          * 同一份文件、同一个 JVM，不加锁时 8 次里 2 次结果反常（该有的图片/文字
-         * 数量对不上），全部访问都用这把锁串行化之后 8 次全部一致。所有直接或间接
-         * touch [document]/`PDPage`/PDFBox 内部对象图的代码都要包在
-         * `synchronized(documentLock)` 里——见 [loadPage]、[learnFooterTitlesInBackground]、
-         * [extractOutlineInBackground] 三处。
+         * 数量对不上），全部访问都用同一把互斥锁串行化之后 8 次全部一致。
+         *
+         * **同一天追加修复：第一版用普通互斥锁（`Any()` + `synchronized`）真机上
+         * 引入了明显的性能回归**——`PdfPageAdapter.loadExecutor` 是固定 3 线程池，
+         * 本来就是设计成让最多 3 个页面并发解码图片（见该类 KDoc），普通互斥锁把
+         * `loadPage` 整个函数体串成互斥访问，等于把这 3 路并发全部压成了串行。
+         * 真机复现：一份图片较多的年报，3 个页面几乎同时卡到 18-19 秒才全部加载完
+         * （`慢页拆分`诊断显示矢量扫描/文字抽取都只要几百毫秒，真正的耗时在图片
+         * 解码，而 3 页几乎同一时刻完工，是排队等同一把锁的典型症状）。
+         *
+         * 改用 [ReentrantReadWriteLock]：[loadPage] 只拿**读锁**（多个 `loadPage`
+         * 之间照旧可以互相并发，跟这次改动之前的并发度完全一样，没有新增保护也
+         * 没有新增风险——`loadPage` 之间会不会互相踩到彼此，是这次改动之前就存在
+         * 的、没有实证过的另一个问题，不在这次修复范围内）；[footerLearningThread]/
+         * [outlineThread] 拿**写锁**（独占，运行期间会排斥所有 `loadPage`）——这样
+         * 唯一被真机受控实验证实过的那个场景（后台线程 vs `loadPage`）继续被挡住，
+         * 同时把"`loadPage` 之间原有的并发度"原样还给了 3 线程池。
+         *
+         * **同一天再追加一次修复：读写锁本身也真机装机测出了饿死（starvation）
+         * 问题**——`ReentrantReadWriteLock()` 默认是非公平模式，[learnFooterTitlesInBackground]
+         * 那个"逐页加锁/放锁"的循环虽然每次只短暂持锁，但循环本身跑得很紧凑，
+         * 非公平模式下可以一直连续抢到写锁、把等在旁边的 `loadPage` 读锁请求
+         * 饿死很久——真机复现：一份 12 页、内容复杂的英文年报，好几个页面
+         * 卡到 18 秒左右才加载完，时长跟"页脚学习跑完前 150 页样本"的量级
+         * 吻合，且卡住的页面自己的渲染诊断只有两三百毫秒——说明真正的等待
+         * 发生在"拿到读锁之前"，不是页面自己处理慢。改成 `ReentrantReadWriteLock
+         * (true)`（公平模式）后，读锁请求按到达顺序排队，不会被写锁的连续
+         * 重新加锁一直插队饿死。教训：即使按页拆分成"细粒度、短暂持锁"，
+         * 默认非公平锁在一方持续高频重新加锁时仍然可能让另一方等很久，光靠
+         * "锁的粒度细"不够，还需要显式要公平性。
          */
-        private val documentLock = Any()
+        private val documentLock = ReentrantReadWriteLock(true)
 
         /**
          * 2026-08-21 改成后台异步（用户要求"一秒之内打开 PDF，后台加载数据"）：真机
@@ -1868,8 +1902,8 @@ object PdfTextExtractor {
 
         private fun extractOutlineInBackground(onOutlineReady: () -> Unit) {
             outlineThread = thread {
-                // 见 documentLock KDoc——跟 loadPage/footerLearning 并发读同一个 document。
-                outline = runCatching { synchronized(documentLock) { extractOutline(document) } }.getOrDefault(emptyList())
+                // 见 documentLock KDoc——写锁，独占排斥所有 loadPage。
+                outline = runCatching { documentLock.write { extractOutline(document) } }.getOrDefault(emptyList())
                 onOutlineReady()
             }
         }
@@ -1916,13 +1950,13 @@ object PdfTextExtractor {
                     val sampleEndPage = minOf(FOOTER_SAMPLE_PAGE_COUNT, pageCount)
                     if (sampleEndPage < 1) return@runCatching emptySet()
                     val stripper = LineCollectingStripper()
-                    // 见 documentLock KDoc——故意按页逐次加锁/放锁，不是一次性锁住整个
-                    // 150 页样本区间：后者会让 loadPage（尤其是 open() 后紧接着调用的
-                    // 第一页）最坏情况等这整批后台学习跑完才能拿到锁，等于把 NOTES.md
+                    // 见 documentLock KDoc——写锁，故意按页逐次加锁/放锁，不是一次性锁住
+                    // 整个 150 页样本区间：后者会让 loadPage（尤其是 open() 后紧接着调用
+                    // 的第一页）最坏情况等这整批后台学习跑完才能拿到锁，等于把 NOTES.md
                     // #23 特意做的"后台学习不阻塞打开"这个优化又变相锁死了。按页拆开后
                     // loadPage 最多等一页的学习耗时（通常几十毫秒量级），不会等整批。
                     for (p in 1..sampleEndPage) {
-                        synchronized(documentLock) {
+                        documentLock.write {
                             stripper.startPage = p
                             stripper.endPage = p
                             stripper.getText(document)
@@ -1961,12 +1995,13 @@ object PdfTextExtractor {
          * 每一页只应该被调用一次，调用方（[app.pdfreader.ui.PdfPageAdapter]）负责
          * 这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
          */
-        // 见 documentLock KDoc——整个函数体包在锁里，不做更细粒度的拆分：函数体内部
-        // 有好几处独立 touch document/page 的调用（矢量扫描、文字抽取、表格整页
-        // 渲染、图片解码各一次），拆开加锁需要对每一处都判断"这段中间夹着的纯内存
-        // 计算安不安全被打断"，出错代价高；loadPage 本身按 KDoc 就是"几十毫秒量级"
-        // 的操作，直接整体加锁足够安全，也足够快，不值得为了更细粒度的并发度冒风险。
-        fun loadPage(pageNo: Int): PageContent = synchronized(documentLock) { loadPageLocked(pageNo) }
+        // 见 documentLock KDoc——读锁，多个 loadPage 之间可以照旧互相并发（不新增
+        // 保护也不新增风险，维持这次改动之前的并发度），只排斥后台的
+        // footerLearningThread/outlineThread 写锁。整个函数体一起拿锁，不做更细
+        // 粒度的拆分：函数体内部有好几处独立 touch document/page 的调用（矢量
+        // 扫描、文字抽取、表格整页渲染、图片解码各一次），拆开加锁需要对每一处都
+        // 判断"这段中间夹着的纯内存计算安不安全被打断"，出错代价高。
+        fun loadPage(pageNo: Int): PageContent = documentLock.read { loadPageLocked(pageNo) }
 
         private fun loadPageLocked(pageNo: Int): PageContent {
             // 2026-08-20 临时诊断日志：追查真机反馈"这本书打开后翻某些页要好几秒"——

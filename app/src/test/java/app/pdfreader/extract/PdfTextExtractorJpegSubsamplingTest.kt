@@ -140,16 +140,20 @@ class PdfTextExtractorJpegSubsamplingTest {
         // 直接断言 fixture 文件本身的字节，跟 JpegComponentCountTest 用的是同一份
         // fixture、同一个判断依据。
         //
-        // fixture `cmyk-quadrant.jpg`（3000×2000，4 通道 CMYK，Python Pillow 生成，
-        // 结构在 [JpegDecoder] 范围内）。
+        // fixture `cmyk-book-noinv.jpg`（1725×955，真机从真实教科书取回的 4 通道
+        // CMYK，结构在 [JpegDecoder] 范围内，也在 [JpegDecoder.MAX_CMYK_JPEG_PIXELS]
+        // 尺寸上限之内——2026-08-24 之前这里用的是 `cmyk-quadrant.jpg`
+        // （3000×2000），真机装机撞出 OOM 加了尺寸上限之后这份 fixture 超出了
+        // 新上限，换成这份同样是真机数据、但在范围内的 fixture，见
+        // [JpegDecoderCrossValidationTest] 里对应的尺寸上限说明。
         val context = RuntimeEnvironment.getApplication()
         PDFBoxResourceLoader.init(context)
         val document = PDDocument()
         val page = PDPage()
         document.addPage(page)
         val cmykJpegBytes = requireNotNull(
-            javaClass.classLoader?.getResourceAsStream("cmyk-quadrant.jpg")?.readBytes(),
-        ) { "找不到测试 fixture：src/test/resources/cmyk-quadrant.jpg" }
+            javaClass.classLoader?.getResourceAsStream("cmyk-book-noinv.jpg")?.readBytes(),
+        ) { "找不到测试 fixture：src/test/resources/cmyk-book-noinv.jpg" }
         assertEquals("这份 fixture 应该是 4 通道 CMYK，不是的话这条测试没测到目标场景", 4, JpegComponentCount.of(cmykJpegBytes))
         val imageXObject = PDImageXObject.createFromByteArray(document, cmykJpegBytes, "cmyk")
         assertEquals("createFromByteArray 应该把这份 JPEG 字节识别成 jpg 后缀", "jpg", imageXObject.suffix)
@@ -162,10 +166,10 @@ class PdfTextExtractorJpegSubsamplingTest {
         val content = PdfTextExtractor.extractContent(context, output)
         assertEquals(1, content.images.size)
         val bitmap = content.images.single().bitmap
-        // [JpegDecoder] 按 SOF 声明的原始尺寸输出（3000x2000）——如果漏拦截掉进
+        // [JpegDecoder] 按 SOF 声明的原始尺寸输出（1725x955）——如果漏拦截掉进
         // 占位图路径，长边会是 400；掉进常规解码路径，这个环境下根本解不出 4 分量
         // 数据。原尺寸是"走了自己的解码器"最强的间接证据。
-        assertEquals("解码结果宽度应该是原图尺寸", 3000, bitmap.width)
-        assertEquals("解码结果高度应该是原图尺寸", 2000, bitmap.height)
+        assertEquals("解码结果宽度应该是原图尺寸", 1725, bitmap.width)
+        assertEquals("解码结果高度应该是原图尺寸", 955, bitmap.height)
     }
 }

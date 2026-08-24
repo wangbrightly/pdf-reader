@@ -93,6 +93,29 @@ internal object JpegDecoder {
         53, 60, 61, 54, 47, 55, 62, 63,
     )
 
+    /**
+     * 2026-08-24 真机撞出的 OOM 修复：这个解码器同时把 4 个分量各存一份跟原图
+     * 等分辨率的 `IntArray`（[planes]，每分量 4 字节/像素）+ 最终 [DecodedImage.argb]
+     * 又是一份等分辨率 `IntArray`——巅峰同时存活的内存约等于
+     * `20 字节/像素 × 像素数`（4 个分量 plane 共 16 字节/像素 + argb 4 字节/像素，
+     * `Bitmap` 自己的原生缓冲区另算）。真机装机验证时一本教科书封面的
+     * 4469×3871（约 1730 万像素）CMYK 图片直接把这台设备 256MB 堆占爆，
+     * `Throwing OutOfMemoryError "Failed to allocate a 95744012 byte
+     * allocation..."`——不是"格式不支持"，是真的内存不够，只是异常被
+     * [decode] 的 `runCatching` 接住后误导性地显示成占位图"格式不支持"文案。
+     *
+     * 这里按同一次真机 session 里的两个实测数据点定阈值：1795×1181（约 212 万
+     * 像素）反复解码多次都正常，4469×3871（约 1730 万像素）稳定 OOM——取
+     * 400 万像素（约等于 2000×2000），是"经验安全值"的将近 2 倍、"经验失败值"
+     * 的不到四分之一，按 20 字节/像素峰值内存估算约 80MB，在 256MB 堆里留了
+     * 足够余量给其它同时占用的内存（PDF 文档缓冲、RecyclerView 页面缓存等）。
+     * 超过这个阈值直接拒绝解码、退回占位图——跟本类"范围外数据一律返回
+     * null"的一贯降级精神一致，比冒 OOM 崩溃风险划算。真正的解决办法是把
+     * `planes` 从 `IntArray` 换成占内存更小的存储、或者实现按需降采样解码
+     * （工作量高一个级别，这次没做，见 NOTES.md #34）。
+     */
+    internal const val MAX_CMYK_JPEG_PIXELS = 4_000_000
+
     fun decode(bytes: ByteArray): DecodedImage? = runCatching { decodeInternal(bytes) }.getOrNull()
 
     private fun decodeInternal(bytes: ByteArray): DecodedImage? {
@@ -103,6 +126,7 @@ internal object JpegDecoder {
         if (frame.sofMarker != 0xC0 && frame.sofMarker != 0xC1) return null
         if (frame.adobeTransform != 0) return null
         if (frame.scanComponents.size != 4) return null
+        if (frame.width.toLong() * frame.height.toLong() > MAX_CMYK_JPEG_PIXELS) return null
 
         val blocksPerLine = (frame.width + 7) / 8
         val blocksPerColumn = (frame.height + 7) / 8
