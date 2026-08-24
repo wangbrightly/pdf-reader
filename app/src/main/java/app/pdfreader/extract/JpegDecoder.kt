@@ -22,15 +22,13 @@ import kotlin.math.roundToInt
  *    2026-08-24 补上，见下面"YCCK 支持"一节）。没有 Adobe 标记的 4 分量数据
  *    （既不是 transform=0 也不是 transform=2 这种约定）没有实现——没在真机
  *    数据里见过这种情况，不确定就不处理。
- * 2. **只处理 4 个分量的色度采样比例都是 1×1（不做色度子采样）**——2026-08-24
- *    真机数据（那份年报 97 张 CMYK 图片里 93 张）确认色度子采样在 YCCK 场景
- *    下其实很常见（不像最初以为的"CMYK 没有子采样的理由"，那条判断只对
- *    transform=0 直接存 CMYK 成立，YCCK 本质是 YCbCr+K，YCbCr 部分完全可能
- *    像普通照片 JPEG 一样做色度子采样）。这个限定还没解除，遇到任何分量采样
- *    比例不是 1×1 仍然直接返回 `null`——MCU 内多分量按不同分辨率交织、色度
- *    上采样这块工作量比 YCCK 颜色转换本身更大，是下一步的候选（如实记录：
- *    这份年报 97 张 CMYK 图片里现在只有 4 张能真正解码，另外 93 张还是走
- *    占位图，没有全部修完）。
+ * 2. **色度采样比例支持 1~4 之间任意组合（2026-08-24 补上，见下面"色度
+ *    子采样支持"一节）**——2026-08-24 真机数据（那份年报 97 张 CMYK 图片里
+ *    93 张）确认色度子采样在 YCCK 场景下其实很常见（不像最初以为的"CMYK
+ *    没有子采样的理由"，那条判断只对 transform=0 直接存 CMYK 成立，YCCK
+ *    本质是 YCbCr+K，YCbCr 部分完全可能像普通照片 JPEG 一样做子采样）。
+ *    只对不合法的采样比例（不在 1~4 范围，JPEG 标准里 Hi/Vi 的合法范围）
+ *    返回 `null`。
  * 3. **只处理 baseline（SOF0）/ extended sequential（SOF1）单扫描**——渐进式
  *    JPEG（SOF2，频谱选择+逐次逼近）编码结构复杂得多（同一张图片分多次扫描，
  *    每次只传一部分频率系数），真机数据没见过（没有反过来的证据能证明这台
@@ -90,14 +88,32 @@ import kotlin.math.roundToInt
  * 是负片效果，说明符号约定不是唯一的（类似 transform=0 CMYK 那次教训），
  * 到时候再补检测逻辑，这次没有预先做。
  *
+ * ## 色度子采样支持（2026-08-24 补上）
+ *
+ * 真机那份年报 97 张 CMYK 图片里 93 张（96%）采样比例是
+ * `[(0,2,2),(1,1,1),(2,1,1),(3,2,2)]`——分量 0（Y）和分量 3（K）是全分辨率
+ * （Hmax=2,Vmax=2 这个基准），分量 1/2（Cb/Cr）是 4:2:0 子采样（标准 JPEG
+ * 照片最常见的子采样比例，不是这份文件特有的）。MCU（Minimum Coded Unit）
+ * 覆盖 `8×Hmax × 8×Vmax` 像素，采样比例低的分量在一个 MCU 里只贡献
+ * `Hi×Vi` 个块（子采样分量块少，全分辨率分量块多），每个分量按自己的
+ * 采样比例单独开一份 plane（不再强行按统一尺寸分配，子采样分量的 plane
+ * 天然更小，顺带比"先都按满分辨率分配再降采样"更省内存）。
+ *
+ * 子采样分量在最终图像坐标系下取样时用**最近邻**（整数除法
+ * `x*Hi/Hmax`），不是双线性插值——JPEG 解码器"快速"色度上采样的常见做法，
+ * 跟本类一贯"够用就行、不追求更精细"的尺度一致。真机 fixture 交叉验证
+ * 平均像素差只有 1.44（对比 libjpeg-turbo 的"精细"上采样），只有色彩剧烈
+ * 变化的交界处（0.15% 像素）有肉眼可辨的差异，大片纯色/渐变区域结果
+ * 几乎一致，见 [JpegDecoderCrossValidationTest] 里带子采样的那条测试。
+ *
  * ## 已知局限（如实告知，别在测试之外假装能处理）
  *
  * - 不支持渐进式 JPEG（SOF2）
- * - 不支持色度子采样（任何分量采样比例不是 1×1，YCCK 场景下这个限制命中率
- *   比想象中高很多，见上面"范围"一节 2 的更新）
  * - 不支持没有 Adobe 标记的 4 分量数据
  * - 不支持算术编码（只支持 Huffman 熵编码，JPEG 里的算术编码变体极少见）
  * - 不支持 12 位精度（只支持 8 位，绝大多数 JPEG 是这个精度）
+ * - 色度子采样的上采样是最近邻，不是双线性/更精细的滤波器，色彩剧烈变化的
+ *   交界处会有小幅可辨差异（见上面"色度子采样支持"一节的真机验证数据）
  *
  * 命中以上任何一条，[decode] 返回 `null`，调用方（[PdfTextExtractor]）应该
  * 降级到诚实的占位图，不展示错误内容。
@@ -147,7 +163,9 @@ internal object JpegDecoder {
         val frame = MarkerParser(bytes).parse() ?: return null
         if (frame.precision != 8) return null
         if (frame.components.size != 4) return null
-        if (frame.components.any { it.samplingH != 1 || it.samplingV != 1 }) return null
+        // 见类 KDoc"色度子采样支持"一节——采样比例限定在 1~4（JPEG 标准里
+        // Hi/Vi 的合法范围本来就是 1~4），避免畸形/伪造数据让 MCU 尺寸失控。
+        if (frame.components.any { it.samplingH !in 1..4 || it.samplingV !in 1..4 }) return null
         if (frame.sofMarker != 0xC0 && frame.sofMarker != 0xC1) return null
         // 见类 KDoc"YCCK（transform=2）支持"一节——transform=0（直接存 CMYK）
         // 和 transform=2（YCCK，先做 YCbCr 变换再存）两种约定都收，色彩换算
@@ -157,11 +175,25 @@ internal object JpegDecoder {
         if (frame.scanComponents.size != 4) return null
         if (frame.width.toLong() * frame.height.toLong() > MAX_CMYK_JPEG_PIXELS) return null
 
-        val blocksPerLine = (frame.width + 7) / 8
-        val blocksPerColumn = (frame.height + 7) / 8
-        val planeWidth = blocksPerLine * 8
-        val planeHeight = blocksPerColumn * 8
-        val planes = Array(4) { IntArray(planeWidth * planeHeight) }
+        // 见类 KDoc"色度子采样支持"一节：每个分量的 blocksPerMCU = samplingH×
+        // samplingV，MCU 覆盖的像素范围是 8×hMax × 8×vMax（hMax/vMax = 全部
+        // 分量里最大的采样比例）。没有子采样（全部 1×1，YCCK 之外的既有场景）
+        // 时 hMax=vMax=1，这套通用逻辑退化成原来的"一个块=一个 MCU"，不是
+        // 单独分支，同一套代码两种场景都走。
+        val hMax = frame.components.maxOf { it.samplingH }
+        val vMax = frame.components.maxOf { it.samplingV }
+        val mcuWidthPx = 8 * hMax
+        val mcuHeightPx = 8 * vMax
+        val mcusPerLine = (frame.width + mcuWidthPx - 1) / mcuWidthPx
+        val mcusPerColumn = (frame.height + mcuHeightPx - 1) / mcuHeightPx
+
+        // 每个分量按自己的采样比例单独开一份 plane（不再是 4 个分量共用同一个
+        // 尺寸）——采样比例低的分量（比如 4:2:0 里的 Cb/Cr）plane 天然更小，
+        // 总内存比"强行按满分辨率分配 4 份"更省，不需要因为加了子采样支持就
+        // 调高 [MAX_CMYK_JPEG_PIXELS]。
+        val compPlaneWidth = IntArray(4) { mcusPerLine * frame.components[it].samplingH * 8 }
+        val compPlaneHeight = IntArray(4) { mcusPerColumn * frame.components[it].samplingV * 8 }
+        val planes = Array(4) { IntArray(compPlaneWidth[it] * compPlaneHeight[it]) }
 
         val decodeTables = frame.scanComponents.map { sc ->
             val dc = frame.huffmanTables[HuffKey(0, sc.dcTableId)] ?: return null
@@ -176,54 +208,64 @@ internal object JpegDecoder {
         val block = IntArray(64)
         val spatial = IntArray(64)
 
-        for (blockRow in 0 until blocksPerColumn) {
-            for (blockCol in 0 until blocksPerLine) {
+        for (mcuRow in 0 until mcusPerColumn) {
+            for (mcuCol in 0 until mcusPerLine) {
                 for (ci in frame.scanComponents.indices) {
                     val sc = frame.scanComponents[ci]
+                    val comp = frame.components[sc.componentIndex]
                     val (dcTable, acTable, quant) = decodeTables[ci]
-                    java.util.Arrays.fill(block, 0)
-                    val s = dcTable.decode(bitReader) ?: return null
-                    val diff = if (s == 0) 0 else extend(bitReader.receive(s), s)
-                    val dc = dcPredictors[sc.componentIndex] + diff
-                    dcPredictors[sc.componentIndex] = dc
-                    block[0] = dc * quant[0]
-
-                    var k = 1
-                    while (k < 64) {
-                        val rs = acTable.decode(bitReader) ?: return null
-                        val run = rs ushr 4
-                        val size = rs and 0x0F
-                        if (size == 0) {
-                            if (run == 15) {
-                                k += 16 // ZRL：16 个连续 0 系数
-                                continue
-                            }
-                            break // EOB：剩余系数全 0
-                        }
-                        k += run
-                        if (k >= 64) return null
-                        val coeff = extend(bitReader.receive(size), size)
-                        block[ZIGZAG[k]] = coeff * quant[k]
-                        k++
-                    }
-
-                    idct8x8(block, spatial)
                     val plane = planes[sc.componentIndex]
-                    val baseX = blockCol * 8
-                    val baseY = blockRow * 8
-                    for (y in 0 until 8) {
-                        val rowOffset = (baseY + y) * planeWidth + baseX
-                        val srcOffset = y * 8
-                        for (x in 0 until 8) {
-                            plane[rowOffset + x] = spatial[srcOffset + x]
+                    val planeW = compPlaneWidth[sc.componentIndex]
+                    // 子采样分量在一个 MCU 里贡献 samplingH×samplingV 个块（不是
+                    // 1 个）——比如 4:2:0 的 Y/K 在 2×2 采样下每个 MCU 4 个块，
+                    // Cb/Cr 1×1 采样下每个 MCU 1 个块，这就是"同一个 MCU 内不同
+                    // 分量分辨率不同"的具体体现。
+                    for (blockYInMcu in 0 until comp.samplingV) {
+                        for (blockXInMcu in 0 until comp.samplingH) {
+                            java.util.Arrays.fill(block, 0)
+                            val s = dcTable.decode(bitReader) ?: return null
+                            val diff = if (s == 0) 0 else extend(bitReader.receive(s), s)
+                            val dc = dcPredictors[sc.componentIndex] + diff
+                            dcPredictors[sc.componentIndex] = dc
+                            block[0] = dc * quant[0]
+
+                            var k = 1
+                            while (k < 64) {
+                                val rs = acTable.decode(bitReader) ?: return null
+                                val run = rs ushr 4
+                                val size = rs and 0x0F
+                                if (size == 0) {
+                                    if (run == 15) {
+                                        k += 16 // ZRL：16 个连续 0 系数
+                                        continue
+                                    }
+                                    break // EOB：剩余系数全 0
+                                }
+                                k += run
+                                if (k >= 64) return null
+                                val coeff = extend(bitReader.receive(size), size)
+                                block[ZIGZAG[k]] = coeff * quant[k]
+                                k++
+                            }
+
+                            idct8x8(block, spatial)
+                            val baseX = (mcuCol * comp.samplingH + blockXInMcu) * 8
+                            val baseY = (mcuRow * comp.samplingV + blockYInMcu) * 8
+                            for (y in 0 until 8) {
+                                val rowOffset = (baseY + y) * planeW + baseX
+                                val srcOffset = y * 8
+                                for (x in 0 until 8) {
+                                    plane[rowOffset + x] = spatial[srcOffset + x]
+                                }
+                            }
                         }
                     }
                 }
 
                 mcuCount++
                 if (frame.restartInterval > 0 && mcuCount % frame.restartInterval == 0) {
-                    val isLastBlock = blockRow == blocksPerColumn - 1 && blockCol == blocksPerLine - 1
-                    if (!isLastBlock) {
+                    val isLastMcu = mcuRow == mcusPerColumn - 1 && mcuCol == mcusPerLine - 1
+                    if (!isLastMcu) {
                         bitReader.alignAndConsumeRestart()
                         java.util.Arrays.fill(dcPredictors, 0)
                     }
@@ -231,18 +273,34 @@ internal object JpegDecoder {
             }
         }
 
+        // 子采样分量（比例低于 hMax/vMax 的）在整幅图坐标系下要按比例缩小取样
+        // 位置——最近邻取样（整数除法），不是双线性插值：JPEG 解码器里"快速"
+        // 色度上采样的常见做法，跟本类其它地方"够用就行、不追求更精细"的一贯
+        // 尺度一致，真机 YCCK 数据交叉验证也是照这个假设通过的（见下方测试）。
+        fun sample(ci: Int, x: Int, y: Int): Int {
+            val comp = frame.components[ci]
+            val sx = x * comp.samplingH / hMax
+            val sy = y * comp.samplingV / vMax
+            return planes[ci][sy * compPlaneWidth[ci] + sx].coerceIn(0, 255)
+        }
+
         // 见类 KDoc"核心机制"一节：对原始采样值投票决定这张图按哪种存储约定解。
         // 只对 transform=0（直接存 CMYK）有意义——见"YCCK 支持"一节，transform=2
         // 的数据存的是 YCbCr+K，不存在"反色/不反色"这个维度，投票没有意义。
-        // 每 8 个采样取一票（全图投票没必要，白底页面几千票足够稳定，也省时间）。
+        // 按最终图像坐标每隔 8 像素取一票（全图投票没必要，白底页面几千票足够
+        // 稳定，也省时间；改成按最终坐标取样后子采样分量也能正确参与投票）。
         var hiVotes = 0
         var loVotes = 0
         if (!isYcck) {
-            var voteIndex = 0
-            while (voteIndex < planes[0].size) {
-                val s = planes[0][voteIndex] + planes[1][voteIndex] + planes[2][voteIndex] + planes[3][voteIndex]
-                if (s > 700) hiVotes++ else if (s < 300) loVotes++
-                voteIndex += 8
+            var vy = 0
+            while (vy < frame.height) {
+                var vx = 0
+                while (vx < frame.width) {
+                    val s = sample(0, vx, vy) + sample(1, vx, vy) + sample(2, vx, vy) + sample(3, vx, vy)
+                    if (s > 700) hiVotes++ else if (s < 300) loVotes++
+                    vx += 8
+                }
+                vy += 8
             }
         }
         val invert = hiVotes >= loVotes
@@ -252,9 +310,7 @@ internal object JpegDecoder {
         val argb = IntArray(width * height)
         var idx = 0
         for (y in 0 until height) {
-            val rowBase = y * planeWidth
             for (x in 0 until width) {
-                val p = rowBase + x
                 val realC: Int
                 val realM: Int
                 val realY: Int
@@ -266,19 +322,23 @@ internal object JpegDecoder {
                     // 直接读出的 (C,M,Y,K) 真值核对过，整数级精确匹配，不是"接近"。
                     // 标准 JFIF YCbCr→RGB 公式算出的 r1/g1/b1 直接就是 C/M/Y
                     // （不需要再 255-r1 那一步），K 则要 255-K 才是真值。
-                    val yy = planes[0][p].coerceIn(0, 255)
-                    val cb = planes[1][p].coerceIn(0, 255) - 128
-                    val cr = planes[2][p].coerceIn(0, 255) - 128
+                    val yy = sample(0, x, y)
+                    val cb = sample(1, x, y) - 128
+                    val cr = sample(2, x, y) - 128
                     realC = (yy + 1.402 * cr).roundToInt().coerceIn(0, 255)
                     realM = (yy - 0.344136 * cb - 0.714136 * cr).roundToInt().coerceIn(0, 255)
                     realY = (yy + 1.772 * cb).roundToInt().coerceIn(0, 255)
-                    realK = 255 - planes[3][p].coerceIn(0, 255)
+                    realK = 255 - sample(3, x, y)
                 } else {
                     // 反色约定：存的值先 255-值 还原真实 CMYK；不反色约定：存的值即真实值。
-                    realC = if (invert) 255 - planes[0][p].coerceIn(0, 255) else planes[0][p].coerceIn(0, 255)
-                    realM = if (invert) 255 - planes[1][p].coerceIn(0, 255) else planes[1][p].coerceIn(0, 255)
-                    realY = if (invert) 255 - planes[2][p].coerceIn(0, 255) else planes[2][p].coerceIn(0, 255)
-                    realK = if (invert) 255 - planes[3][p].coerceIn(0, 255) else planes[3][p].coerceIn(0, 255)
+                    val s0 = sample(0, x, y)
+                    val s1 = sample(1, x, y)
+                    val s2 = sample(2, x, y)
+                    val s3 = sample(3, x, y)
+                    realC = if (invert) 255 - s0 else s0
+                    realM = if (invert) 255 - s1 else s1
+                    realY = if (invert) 255 - s2 else s2
+                    realK = if (invert) 255 - s3 else s3
                 }
                 // 2026-08-24 真机数据核实：Pillow（libjpeg-turbo）CMYK→RGB 用的是
                 // 乘法公式 (255-C)×(255-K)/255，不是原来这里用的加法公式

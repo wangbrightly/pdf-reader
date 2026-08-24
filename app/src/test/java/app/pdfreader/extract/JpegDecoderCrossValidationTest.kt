@@ -76,6 +76,15 @@ class JpegDecoderCrossValidationTest {
             "$baseName：跟 Pillow 参考解码最大像素差 $maxDiff 超过容差 $tolerance（平均差 $avgDiff）",
             maxDiff <= tolerance,
         )
+        // 单独测平均差（不止测最大差）：色度子采样场景的 tolerance 放宽到 35
+        // 是为了容忍色彩交界处的上采样滤波器差异（见调用方注释），但那条放宽
+        // 只应该覆盖"少数交界像素"，不该变成"整体都不准还能通过"的漏洞——
+        // 平均差单独卡在 5 以内，真出现大范围偏色（比如取样分量搞混、符号
+        // 反了）会在这里先被拦下，不会被放宽的 tolerance 掩盖过去。
+        assertTrue(
+            "$baseName：平均差 $avgDiff 超过 5——即使最大差在容差内，大范围偏色本身就是 bug",
+            avgDiff <= 5.0,
+        )
     }
 
     @Test
@@ -119,6 +128,30 @@ class JpegDecoderCrossValidationTest {
     @Test
     fun `真机YCCK真书数据 跟Pillow参考解码逐像素比对`() {
         assertMatchesReference("cmyk-ycck-book")
+    }
+
+    /**
+     * 2026-08-24 补上色度子采样支持：这份年报 97 张 CMYK 图片里 93 张（96%）
+     * 带色度子采样（`[(0,2,2),(1,1,1),(2,1,1),(3,2,2)]`——Y/K 全分辨率、Cb/Cr
+     * 4:2:0 子采样，是最常见的 JPEG 子采样比例，不是这份文件特有的），上面
+     * 那条 `cmyk-ycck-book` 测试只覆盖了不带子采样的 4 张。`cmyk-ycck-
+     * subsampled.jpg`（263×256，真机取回）就是这 93 张里的一张——选它是
+     * 因为色彩变化明显（不是纯色块），能测出"子采样分量取错最近邻位置"这类
+     * 错位 bug（纯色图片即使取样位置算错，因为周围颜色一样，也测不出来）。
+     */
+    @Test
+    fun `真机YCCK色度子采样数据 跟Pillow参考解码逐像素比对`() {
+        // 容差比其它 fixture 松（35 而不是默认 10）：加诊断打印过误差分布——
+        // 67328 像素里只有 101 个（0.15%）diff>15，平均差只有 1.44，且这些点
+        // 散落在图片内容的颜色交界处（不是集中在图片边缘或某个规律位置，排除
+        // 了"子采样取样位置算错"这类系统性 bug）。根因是色度上采样滤波器的
+        // 差异：这里用最近邻取样（最简单、最快，見 [JpegDecoder] 的
+        // `sample` 函数），libjpeg-turbo 默认用更平滑的"fancy upsampling"，
+        // 两者只在色彩剧烈变化的交界处才会有肉眼可辨的差异，大片纯色/渐变
+        // 区域结果几乎一致——这是"够用就行、不追求更精细"的既定尺度（见类
+        // KDoc），不是 bug，容差放宽反映的是这个已知、如实记录的简化，不是
+        // 放松对真正 bug 的检出力度。
+        assertMatchesReference("cmyk-ycck-subsampled", tolerance = 35)
     }
 
     /**
