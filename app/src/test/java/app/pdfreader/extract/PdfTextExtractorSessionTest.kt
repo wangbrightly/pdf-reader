@@ -157,7 +157,15 @@ class PdfTextExtractorSessionTest {
                 stream.showText(text)
                 stream.endText()
             }
-            (0 until bodyLineCount).forEach { i -> writeLine(bodyYRaw[i], "page$pageNo line$i") }
+            // 2026-08-25：每行加填充词让右边界接近页宽——原来"page1 line0"这种短
+            // 文本远短于半页宽，[linesToParagraphs] 补上"紧凑列表识别"（见该函数
+            // KDoc、NOTES.md #14/#37）之后，15 行连续短行会被新规则当成列表逐行
+            // 拆开，这条测试真正要验证的是"per-page 样本量小、中位数统计不稳定"
+            // 这件事（见本函数上方注释），跟行宽无关，补宽内容只是避开新规则，
+            // 不改变这条测试原本的意图。
+            (0 until bodyLineCount).forEach { i ->
+                writeLine(bodyYRaw[i], "page$pageNo line$i with extra filler words for testing width thresholds here")
+            }
             writeLine(footerYRaw[0], "2026/7/10 23:21")
             writeLine(footerYRaw[1], "Happy Life Handbook (2025)")
             writeLine(footerYRaw[2], "https://baike.azpdl.net/#/entry/abc-123")

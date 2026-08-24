@@ -287,6 +287,15 @@ object PdfTextExtractor {
     /** 见 [classifyHeadings] KDoc——字号超过本页中位数的这个倍数才算"明显偏大"。 */
     private const val HEADING_FONT_SIZE_RATIO = 1.15f
 
+    /**
+     * 见 [linesToParagraphs] KDoc"紧凑列表识别"一节——一行文字的右边界不到页宽的
+     * 这个比例，才算"短行"。真机 fixture（`sample-compact-list.pdf`）实测：7 个
+     * 列表项的右边界比例落在 0.10-0.25，两段自然段落里真正的整行（非最后一行）
+     * 落在 0.90-0.94，最后一行落在 0.17-0.33——0.5 卡在两簇数据正中间，两边都留了
+     * 一倍以上的余量，不是贴着某一侧的边界值。
+     */
+    private const val LIST_ITEM_MAX_WIDTH_RATIO = 0.5f
+
     /** 见 [decodeRawImageByBitDepth] KDoc"尺寸安全阀"一节——超过这个像素数（宽×高）直接跳过，不手动解码。 */
     private const val MAX_MANUAL_DECODE_PIXELS = 30_000_000L
 
@@ -1168,25 +1177,87 @@ object PdfTextExtractor {
         var currentPage = lines[0].page
         var currentFontSize = lines[0].fontSize
         var currentBold = lines[0].isBold
+        var currentStartX = lines[0].startX
+        var currentEndX = lines[0].endX
+        var currentPageWidth = lines[0].pageWidth
         for (i in 1 until lines.size) {
             val sameLine = lines[i].page == currentPage && abs(lines[i].y - currentY) < 0.01f
             if (sameLine) {
                 appendLine(currentText, lines[i].text)
                 currentFontSize = maxOf(currentFontSize, lines[i].fontSize)
                 currentBold = currentBold || lines[i].isBold
+                // 同一条视觉行的几个片段合并后，真实覆盖范围是"最左片段的左边界"到
+                // "最右片段的右边界"——见 Line.startX/endX KDoc。
+                currentStartX = minOf(currentStartX, lines[i].startX)
+                currentEndX = maxOf(currentEndX, lines[i].endX)
             } else {
-                merged.add(Line(currentText.toString(), currentY, currentPage, currentFontSize, currentBold))
+                merged.add(
+                    Line(
+                        currentText.toString(), currentY, currentPage, currentFontSize, currentBold,
+                        currentStartX, currentEndX, currentPageWidth,
+                    ),
+                )
                 currentText = StringBuilder(lines[i].text)
                 currentY = lines[i].y
                 currentPage = lines[i].page
                 currentFontSize = lines[i].fontSize
                 currentBold = lines[i].isBold
+                currentStartX = lines[i].startX
+                currentEndX = lines[i].endX
+                currentPageWidth = lines[i].pageWidth
             }
         }
-        merged.add(Line(currentText.toString(), currentY, currentPage, currentFontSize, currentBold))
+        merged.add(
+            Line(
+                currentText.toString(), currentY, currentPage, currentFontSize, currentBold,
+                currentStartX, currentEndX, currentPageWidth,
+            ),
+        )
         return merged
     }
 
+    /** 见 [linesToParagraphs] KDoc"紧凑列表识别"一节。[Line.pageWidth] 为 0（没有提供这个信息）时恒为 `false`。 */
+    private fun isShortLine(line: Line): Boolean =
+        line.pageWidth > 0f && line.endX / line.pageWidth < LIST_ITEM_MAX_WIDTH_RATIO
+
+    /**
+     * 见类注释"段落切分"一节主逻辑，这里补一段专门的说明。
+     *
+     * ## 紧凑列表识别（2026-08-25 补上，见 NOTES.md #14/#37）
+     *
+     * 真机反馈：目录/大纲这类紧凑列表（每一项该独立一行）被这里的段落合并启发式
+     * 粘成一大段——根因是原来只看"相邻行 y 间距是否明显大于本页典型行距"，紧凑
+     * 列表的行间距（CSS `margin:0` 的相邻块）和一段自然语言内部的行间距量级
+     * 往往接近，纯 y 间距分不出这两种排版意图。
+     *
+     * **2026-08-19 已经尝试过一次、是错的，别重复踩**：直接拿"这一行本身是不是
+     * 比中位数短"当信号，命中率太高——一段自然语言的**最后一行**天然比其它行短
+     * （词语刚好排不满一行就换行了），这个信号会把正常段落的最后一行也当成列表
+     * 边界切开。真机复现过更严重的连锁反应：`PdfTextExtractorFooterNoiseTest`
+     * 里"This is page 1 body"这句话被拆成"This is page"+"1 body"两段，"This is
+     * page"又因为在多页上逐字重复被 [RunningFooterFilter] 当成页眉页脚水印删掉，
+     * 最终只剩"1 body"。
+     *
+     * **这次改成要求"连续两行都短"才触发**（[isShortLine]，[LIST_ITEM_MAX_WIDTH_RATIO]）：
+     * 单独一行短不算数，必须是相邻两行的右边界都远没到页宽。这条规则的可靠性
+     * 建立在一个真实观察上——自然段落里，**非最后一行**的右边界几乎总是接近整页
+     * 宽度（排版算法本来就是"能塞多少词就塞多少"，只有最后一行会天然更短），
+     * 所以"连续两行都短"这个组合在正常段落里几乎不会出现，只会出现在"每一项都
+     * 刻意独立成行"的列表里。用真机 fixture（`sample-compact-list.pdf`，7 项列表
+     * + 2 段自然语言）验证过：7 个列表项两两相邻的比例落在 0.10-0.25，两段自然
+     * 语言里真正的整行落在 0.90-0.94（远高于阈值，不会跟后面的短尾行组成"连续两
+     * 短"），列表最后一项跟第一段第一行相邻的那对是（0.10, 0.94）——单边短、
+     * 单边不短，不满足"两边都短"，但这个边界本来就已经被 y 间距差异正确切开了
+     * （HTML 里自然段落 `<p>` 标签自带的默认外边距比列表项 `margin:0` 大很多），
+     * 这条新规则没有实际参与那次切分，是"锦上添花"而不是"独木难支"。
+     *
+     * `PdfTextExtractorFooterNoiseTest` 里那份合成 fixture 用"每行一个单词"
+     * 构造正文（`This`/`is`/`page`/`1`/`body` 各自单独一行）——不是真实文档会
+     * 出现的排版，是当年为了少写几行 PDFBox 绘制代码图省事的写法，5 个单词全都
+     * 远短于半页宽，会被新规则误判成 5 项列表。这次改成了更接近真实段落的两行
+     * 换行（第一行接近页宽，第二行天然更短），不影响该测试原本要验证的东西
+     * （页脚水印过滤），见该文件里的改动记录。
+     */
     internal fun linesToParagraphs(rawLines: List<Line>): List<Paragraph> {
         val lines = mergeSameLineRuns(rawLines)
         if (lines.isEmpty()) return emptyList()
@@ -1212,9 +1283,19 @@ object PdfTextExtractor {
         for (i in 1 until lines.size) {
             val gap = lines[i].y - lines[i - 1].y
             val pageChanged = lines[i].page != lines[i - 1].page
+            // 见类注释"紧凑列表识别"一节：相邻两行都是"短行"（右边界远没到页宽）
+            // 时强制切段落，哪怕 y 间距本身没有超过 paragraphThreshold。只看单独
+            // 一行"短"不够——一段自然语言的最后一行天然更短，这是正常现象，不该
+            // 被切开（上一行如果是正常长度的整行，这里不会误触发）；要求"连续两行
+            // 都短"才是列表的可靠信号：真正的自然段落里，非最后一行几乎总是接近
+            // 页宽（词语刚好排不下才换行），连续两行都明显短于半页宽的情况在正常
+            // 段落里基本不会发生。[Line.pageWidth] 为 0（旧测试直接构造 `Line` 没
+            // 传这个字段）时 [isShortLine] 恒为 false，这条新规则完全不生效，
+            // 行为退化成这次改动之前的样子，不影响任何没有提供这个信息的调用方。
+            val compactListBoundary = isShortLine(lines[i - 1]) && isShortLine(lines[i])
             // 跨页强制切段落：y 坐标每翻一页就从页顶重新开始，纯按 gap 判断在跨页处
             // 没有意义，见类注释"图片抽取"一节。
-            if (pageChanged || gap > paragraphThreshold) {
+            if (pageChanged || gap > paragraphThreshold || compactListBoundary) {
                 texts.add(StringBuilder(lines[i].text))
                 pages.add(lines[i].page)
                 topYs.add(lines[i].y)
@@ -1453,6 +1534,12 @@ object PdfTextExtractor {
      * 见 [isBoldTextPosition]，避免行内偶尔一两个字符加粗就把整行误判）。默认值 0f/
      * false 只是给旧测试调用点（没传这两个参数）一个安全默认，不代表"没有字号信息"
      * 有特殊含义。
+     *
+     * [startX]/[endX]/[pageWidth]（2026-08-25 新增）：给 [linesToParagraphs]
+     * KDoc"紧凑列表识别"一节用——这一行文字实际覆盖的水平范围（取行内全部
+     * `TextPosition` 的最小左边界/最大右边界，不只看首尾两个，`sortByPosition`
+     * 排过序但留点余量更稳妥）和这一页的宽度。默认值 0f 同样只是给旧测试调用点
+     * 一个安全默认。
      */
     internal data class Line(
         val text: String,
@@ -1460,6 +1547,9 @@ object PdfTextExtractor {
         val page: Int,
         val fontSize: Float = 0f,
         val isBold: Boolean = false,
+        val startX: Float = 0f,
+        val endX: Float = 0f,
+        val pageWidth: Float = 0f,
     )
 
     private class LineCollectingStripper : PDFTextStripper() {
@@ -1484,7 +1574,13 @@ object PdfTextExtractor {
             val fontSize = textPositions.maxOfOrNull { it.fontSizeInPt } ?: 0f
             val boldCount = textPositions.count { isBoldTextPosition(it) }
             val isBold = textPositions.isNotEmpty() && boldCount * 2 > textPositions.size
-            lines.add(Line(fixRadicalVariants(text), y, currentPageNo, fontSize, isBold))
+            // 见 [linesToParagraphs] KDoc"紧凑列表识别"一节——取整行内所有 TextPosition
+            // 的最小/最大 x（不是只看首尾两个，`sortByPosition` 排过序但留一点余量更
+            // 稳妥），得到这一行真实覆盖的水平范围，用于跟"一整行该有多宽"做比较。
+            val startX = textPositions.minOfOrNull { it.xDirAdj } ?: 0f
+            val endX = textPositions.maxOfOrNull { it.xDirAdj + it.widthDirAdj } ?: 0f
+            val pageWidth = textPositions.firstOrNull()?.pageWidth ?: 0f
+            lines.add(Line(fixRadicalVariants(text), y, currentPageNo, fontSize, isBold, startX, endX, pageWidth))
         }
     }
 
