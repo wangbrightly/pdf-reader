@@ -32,13 +32,24 @@
 
 信号是矢量网格线（填充矩形，不是描边直线——Chromium 打印出来的表格边框是这样），不是文字列对齐。策略保守，≥3 横线 + ≥3 竖线才判定为表格，宁可漏检。命中页整页渲染成 Bitmap，复用图片展示的双指缩放机制。
 
+## CMYK/YCCK JPEG、JBIG2：自己手写的解码器
+
+PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式——两者只在低 K 值时接近，改动前这条公式实际算错了很久没被测出来，见 NOTES #35。CMYK JPEG 有个特殊坑：Adobe 约定"存的值反色"，但真实文档存在"带 Adobe 标记却不反色"的例外，靠逐图对采样值投票判断，见 NOTES #29/#32。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 400 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，真机 OOM 撞出来的上限）。
+
+## `Session` 并发安全
+
+`PdfTextExtractor.Session` 内部有个 `documentLock`（`ReentrantLock(true)`，公平模式），`loadPage`/后台页脚学习线程/后台目录抽取线程全部互斥访问同一个 `PDDocument`——**改这块代码前一定要读 NOTES #33/#34/#36**：`PDDocument` 不是"多读者安全"的资源，`loadPage` 之间并发访问会导致真实的数据损坏（不是理论风险，受控实验实锤过），读写锁的"多读者"模型在这里从设计上就是错的；公平性同样重要，非公平锁在后台线程高频重新加锁时会把 `loadPage` 饿死很久（真机复现过 18 秒卡顿）。
+
 ## 已知局限（如实告知过用户）
 
 - 表格和正文混排同一页时，正文也会跟着变图片，丢失重排/调字号能力
 - 只有外框无内部分隔线的表格会漏检，继续按文字重排（行列打散）
 - 完全无边框线的表格（纯空白对齐）检测不到
 - `ReadingProgressStore` 无清理机制，条目随打开过的文件数线性增长（当前量级不算问题）
-- 全程没有 adb 装机验证，真机型号未知，minSdk 26 起不影响开发但没有真机实测
+- 扫描版 PDF（没有文字层）无法重排/调字号，需要 OCR，用户 2026-08-18 决定暂缓（见 NOTES #10）
+- 大文件（126MB+）`PDDocument.load` 本身耗时几秒到十几秒，试过换成临时文件缓冲但反而更慢，已回退，没找到有效优化手段（见 NOTES #23）
+
+真机型号是小米 mondrian，装机验证是这个项目的日常工作方式（几乎每次改动都真机复测），不是没做过。
 
 ## 工作流约定
 
