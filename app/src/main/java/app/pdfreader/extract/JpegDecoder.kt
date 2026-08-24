@@ -1,7 +1,7 @@
 package app.pdfreader.extract
 
 import kotlin.math.cos
-import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * 自己手写的 JPEG 解码器，专门解决 [PdfTextExtractor] 里
@@ -17,20 +17,20 @@ import kotlin.math.min
  * "这个格式所有可能的变体"，这次也严格按"观察到的真实数据形状"限定范围，
  * 碰到范围外的情况直接返回 `null`，不猜、不冒险给出可能错误的解码结果：
  *
- * 1. **只处理 4 分量数据**，且必须带 Adobe APP14 标记、`transform=0`——这是
- *    真机字节级验证过的（见 [PdfTextExtractor] 里的排查记录）。`transform=2`
- *    （YCCK，先做一次 YCbCr→RGB 再转 CMYK 那种变体）本地造不出测试数据
- *    （Python Pillow 的 `Image.convert('CMYK')` 只会产出 `transform=0` 这一种，
- *    没有可信的交叉验证手段），**没有实现，遇到直接返回 `null`**。没有 Adobe
- *    标记的 4 分量数据（"纯 CMYK 不反色"这种约定）同样没有实现——没在真机
+ * 1. **只处理 4 分量数据**，且必须带 Adobe APP14 标记、`transform=0`（直接存
+ *    CMYK）或 `transform=2`（YCCK，先做一次 YCbCr→RGB 再转 CMYK 那种变体，
+ *    2026-08-24 补上，见下面"YCCK 支持"一节）。没有 Adobe 标记的 4 分量数据
+ *    （既不是 transform=0 也不是 transform=2 这种约定）没有实现——没在真机
  *    数据里见过这种情况，不确定就不处理。
- * 2. **只处理 4 个分量的色度采样比例都是 1×1（不做色度子采样）**——真机拿到的
- *    fixture（`cmyk-quadrant.jpg`）和本地用 Pillow 生成的测试数据，色度采样
- *    比例全部是 1×1（这也是 Adobe 系工具处理 CMYK JPEG 的标准做法：CMYK 四个
- *    通道本来就没有"亮度更重要，色度可以降采样"这种 YCbCr 才有的心理视觉假设，
- *    没有理由做子采样）。这个限定顺带把最复杂的一块（MCU 内多分量按不同分辨率
- *    交织、色度上采样滤波器选择）整个避开了，遇到任何分量采样比例不是 1×1
- *    直接返回 `null`。
+ * 2. **只处理 4 个分量的色度采样比例都是 1×1（不做色度子采样）**——2026-08-24
+ *    真机数据（那份年报 97 张 CMYK 图片里 93 张）确认色度子采样在 YCCK 场景
+ *    下其实很常见（不像最初以为的"CMYK 没有子采样的理由"，那条判断只对
+ *    transform=0 直接存 CMYK 成立，YCCK 本质是 YCbCr+K，YCbCr 部分完全可能
+ *    像普通照片 JPEG 一样做色度子采样）。这个限定还没解除，遇到任何分量采样
+ *    比例不是 1×1 仍然直接返回 `null`——MCU 内多分量按不同分辨率交织、色度
+ *    上采样这块工作量比 YCCK 颜色转换本身更大，是下一步的候选（如实记录：
+ *    这份年报 97 张 CMYK 图片里现在只有 4 张能真正解码，另外 93 张还是走
+ *    占位图，没有全部修完）。
  * 3. **只处理 baseline（SOF0）/ extended sequential（SOF1）单扫描**——渐进式
  *    JPEG（SOF2，频谱选择+逐次逼近）编码结构复杂得多（同一张图片分多次扫描，
  *    每次只传一部分频率系数），真机数据没见过（没有反过来的证据能证明这台
@@ -57,19 +57,44 @@ import kotlin.math.min
  * 解出来也还是偏暗（错约定下偏暗内容的解码结果恰好不变）。扫描/印刷页面
  * 绝大部分是白底，这条规则在这类数据上等于"永远选对"。
  *
- * 反色之后是标准的 CMYK→RGB 转换（没有实现色彩管理/ICC 曲线那一套，是
- * "够用"的朴素公式，扫描/印刷场景下这条公式是行业惯例，不是本项目发明的）：
+ * 反色之后是 CMYK→RGB 转换：
  * ```
- * R = 255 − min(255, C + K)
- * G = 255 − min(255, M + K)
- * B = 255 − min(255, Y + K)
+ * R = (255 − C) × (255 − K) / 255
+ * G = (255 − M) × (255 − K) / 255
+ * B = (255 − Y) × (255 − K) / 255
  * ```
+ * **2026-08-24 修正**：原来这里写的是加法公式 `R = 255 − min(255, C + K)`，
+ * 当时的注释断言"这是行业惯例"——这个断言没有真正验证过，K 值低的测试
+ * fixture 让加法/乘法两条公式的差异小到被现有 10 容差的交叉验证盖过去了。
+ * 装机验证 YCCK 支持时用高 K 值的真机数据（K=107~220）重新核对 Pillow
+ * （libjpeg-turbo）的输出，才发现 Pillow 用的其实是乘法公式，加法公式在
+ * 高 K 值区域最大单通道差超过 60——不是"够用的朴素近似"，是算错了。换成
+ * 乘法公式后所有 transform=0 的既有交叉验证 fixture 依然通过（K 值本来就低，
+ * 两条公式该有的差异这次真的测出来是"没差异"，不是"没测到差异"）。
+ *
+ * ## YCCK 支持（transform=2，2026-08-24 补上）
+ *
+ * YCCK 数据的分量 0/1/2 是 Y/Cb/Cr（不是直接的 C/M/Y），分量 3 是 K。换算
+ * 公式是拿真机数据（那份年报的 `cmyk-ycck-book.jpg`）反推出来的，**不是**
+ * 教科书 libjpeg 源码里那条公式（`C=255−R`、K 不变）——两处符号都相反：
+ * ```
+ * R = Y + 1.402 × (Cr−128)              C = round(R)   （不是 255−R）
+ * G = Y − 0.344136×(Cb−128) − 0.714136×(Cr−128)   M = round(G)
+ * B = Y + 1.772 × (Cb−128)              Yellow = round(B)
+ * K_true = 255 − K                      （K 要反色，libjpeg 教科书公式里 K 不变）
+ * ```
+ * 3 个真机采样点用 Pillow 的 CMYK 模式直接读出的 `(C,M,Y,K)` 真值核对过，
+ * 整数级精确匹配。YCCK 不像 transform=0 CMYK 那样有"反色/不反色"两种存储
+ * 约定并存的问题——`transform` 标记本身已经把换算方式钉死了，不需要投票。
+ * 这套符号是这一份真机文件反推出来的，如果以后遇到另一份 YCCK 文件解出来
+ * 是负片效果，说明符号约定不是唯一的（类似 transform=0 CMYK 那次教训），
+ * 到时候再补检测逻辑，这次没有预先做。
  *
  * ## 已知局限（如实告知，别在测试之外假装能处理）
  *
  * - 不支持渐进式 JPEG（SOF2）
- * - 不支持色度子采样（任何分量采样比例不是 1×1）
- * - 不支持 YCCK（`transform=2`）
+ * - 不支持色度子采样（任何分量采样比例不是 1×1，YCCK 场景下这个限制命中率
+ *   比想象中高很多，见上面"范围"一节 2 的更新）
  * - 不支持没有 Adobe 标记的 4 分量数据
  * - 不支持算术编码（只支持 Huffman 熵编码，JPEG 里的算术编码变体极少见）
  * - 不支持 12 位精度（只支持 8 位，绝大多数 JPEG 是这个精度）
@@ -124,7 +149,11 @@ internal object JpegDecoder {
         if (frame.components.size != 4) return null
         if (frame.components.any { it.samplingH != 1 || it.samplingV != 1 }) return null
         if (frame.sofMarker != 0xC0 && frame.sofMarker != 0xC1) return null
-        if (frame.adobeTransform != 0) return null
+        // 见类 KDoc"YCCK（transform=2）支持"一节——transform=0（直接存 CMYK）
+        // 和 transform=2（YCCK，先做 YCbCr 变换再存）两种约定都收，色彩换算
+        // 路径在下面按 adobeTransform 分叉。
+        val isYcck = frame.adobeTransform == 2
+        if (frame.adobeTransform != 0 && !isYcck) return null
         if (frame.scanComponents.size != 4) return null
         if (frame.width.toLong() * frame.height.toLong() > MAX_CMYK_JPEG_PIXELS) return null
 
@@ -203,14 +232,18 @@ internal object JpegDecoder {
         }
 
         // 见类 KDoc"核心机制"一节：对原始采样值投票决定这张图按哪种存储约定解。
+        // 只对 transform=0（直接存 CMYK）有意义——见"YCCK 支持"一节，transform=2
+        // 的数据存的是 YCbCr+K，不存在"反色/不反色"这个维度，投票没有意义。
         // 每 8 个采样取一票（全图投票没必要，白底页面几千票足够稳定，也省时间）。
         var hiVotes = 0
         var loVotes = 0
-        var voteIndex = 0
-        while (voteIndex < planes[0].size) {
-            val s = planes[0][voteIndex] + planes[1][voteIndex] + planes[2][voteIndex] + planes[3][voteIndex]
-            if (s > 700) hiVotes++ else if (s < 300) loVotes++
-            voteIndex += 8
+        if (!isYcck) {
+            var voteIndex = 0
+            while (voteIndex < planes[0].size) {
+                val s = planes[0][voteIndex] + planes[1][voteIndex] + planes[2][voteIndex] + planes[3][voteIndex]
+                if (s > 700) hiVotes++ else if (s < 300) loVotes++
+                voteIndex += 8
+            }
         }
         val invert = hiVotes >= loVotes
 
@@ -222,14 +255,39 @@ internal object JpegDecoder {
             val rowBase = y * planeWidth
             for (x in 0 until width) {
                 val p = rowBase + x
-                // 反色约定：存的值先 255-值 还原真实 CMYK；不反色约定：存的值即真实值。
-                val realC = if (invert) 255 - planes[0][p].coerceIn(0, 255) else planes[0][p].coerceIn(0, 255)
-                val realM = if (invert) 255 - planes[1][p].coerceIn(0, 255) else planes[1][p].coerceIn(0, 255)
-                val realY = if (invert) 255 - planes[2][p].coerceIn(0, 255) else planes[2][p].coerceIn(0, 255)
-                val realK = if (invert) 255 - planes[3][p].coerceIn(0, 255) else planes[3][p].coerceIn(0, 255)
-                val r = 255 - min(255, realC + realK)
-                val g = 255 - min(255, realM + realK)
-                val b = 255 - min(255, realY + realK)
+                val realC: Int
+                val realM: Int
+                val realY: Int
+                val realK: Int
+                if (isYcck) {
+                    // 见类 KDoc"YCCK 支持"一节：这套符号是拿真机数据反推出来的，
+                    // 不是教科书 libjpeg 公式（那个公式是 C=255-R、K 不变，两处
+                    // 符号都跟这里相反）——3 个真机采样点用 Pillow 的 CMYK 模式
+                    // 直接读出的 (C,M,Y,K) 真值核对过，整数级精确匹配，不是"接近"。
+                    // 标准 JFIF YCbCr→RGB 公式算出的 r1/g1/b1 直接就是 C/M/Y
+                    // （不需要再 255-r1 那一步），K 则要 255-K 才是真值。
+                    val yy = planes[0][p].coerceIn(0, 255)
+                    val cb = planes[1][p].coerceIn(0, 255) - 128
+                    val cr = planes[2][p].coerceIn(0, 255) - 128
+                    realC = (yy + 1.402 * cr).roundToInt().coerceIn(0, 255)
+                    realM = (yy - 0.344136 * cb - 0.714136 * cr).roundToInt().coerceIn(0, 255)
+                    realY = (yy + 1.772 * cb).roundToInt().coerceIn(0, 255)
+                    realK = 255 - planes[3][p].coerceIn(0, 255)
+                } else {
+                    // 反色约定：存的值先 255-值 还原真实 CMYK；不反色约定：存的值即真实值。
+                    realC = if (invert) 255 - planes[0][p].coerceIn(0, 255) else planes[0][p].coerceIn(0, 255)
+                    realM = if (invert) 255 - planes[1][p].coerceIn(0, 255) else planes[1][p].coerceIn(0, 255)
+                    realY = if (invert) 255 - planes[2][p].coerceIn(0, 255) else planes[2][p].coerceIn(0, 255)
+                    realK = if (invert) 255 - planes[3][p].coerceIn(0, 255) else planes[3][p].coerceIn(0, 255)
+                }
+                // 2026-08-24 真机数据核实：Pillow（libjpeg-turbo）CMYK→RGB 用的是
+                // 乘法公式 (255-C)×(255-K)/255，不是原来这里用的加法公式
+                // 255-min(255,C+K)——两者在 K 值低时接近，K 值高时差异明显（真机
+                // YCCK 数据有 K=107-220 的像素，加法公式算出的结果比参考解码暗
+                // 得多，最大单通道差过 60）。改成乘法公式后跟 Pillow 逐像素比对。
+                val r = ((255 - realC) * (255 - realK) / 255)
+                val g = ((255 - realM) * (255 - realK) / 255)
+                val b = ((255 - realY) * (255 - realK) / 255)
                 argb[idx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                 idx++
             }

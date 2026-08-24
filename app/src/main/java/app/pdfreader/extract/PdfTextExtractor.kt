@@ -449,9 +449,10 @@ object PdfTextExtractor {
      *
      * **真正正确解码 CMYK JPEG 需要自己实现一个支持 CMYK 的 JPEG 解码器**
      * ——2026-08-23 已经做了：[JpegDecoder]，手写完整 JPEG 解码（熵解码+反量化
-     * +IDCT+Adobe 反色约定下的 CMYK→RGB 转换），范围严格限定在真机确认过的
-     * 数据形状（4 分量、Adobe APP14 transform=0、1×1 采样、baseline/extended
-     * sequential），范围外明确返回 `null`。正确性用 Pillow（libjpeg-turbo）
+     * +IDCT+CMYK→RGB 转换，2026-08-24 补上 YCCK/`transform=2`），范围严格限定
+     * 在真机确认过的数据形状（4 分量、Adobe APP14 transform=0 或 transform=2、
+     * 1×1 采样、baseline/extended sequential），范围外明确返回 `null`。正确性用
+     * Pillow（libjpeg-turbo）
      * 参考逐像素交叉验证过，含真机取回的原始数据，见 [JpegDecoderCrossValidationTest]。
      * 解码失败（范围外）时仍然显示诚实的占位图，不展示纯黑色块（纯黑块看起来
      * 像"图片整个坏掉了"，比一块写清楚原因的占位图更容易让人误以为是软件本身

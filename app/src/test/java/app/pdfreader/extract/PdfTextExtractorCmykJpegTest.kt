@@ -111,20 +111,26 @@ class PdfTextExtractorCmykJpegTest {
     }
 
     /**
-     * 范围外回归保护：把四象限图的 Adobe APP14 `transform` 字节从 0 改成 2
-     * （YCCK 变体），[JpegDecoder] 会明确拒绝（本地造不出可信的 transform=2 参考
-     * 数据，见其类 KDoc"范围"一节）——这时必须退回诚实的占位图，而不是漏过拦截、
+     * 范围外回归保护：把四象限图的 Adobe APP14 `transform` 字节从 0 改成 99
+     * （标准里没定义过的值——0=直接存CMYK、1=YCbCr、2=YCCK，3 以上没有意义），
+     * [JpegDecoder] 会明确拒绝——这时必须退回诚实的占位图，而不是漏过拦截、
      * 掉进 `pdImage.image` 那条会产出纯黑块的路径。
+     *
+     * 2026-08-24 更新：这条测试原来патch成 2（YCCK），但当天补上了 YCCK（1×1
+     * 采样场景）支持之后，2 不再是"范围外"，得换一个真正没实现过的值才能继续
+     * 保护"漏过拦截、掉进纯黑路径"这条防线——见 [JpegDecoderCrossValidationTest]
+     * 里新增的 YCCK 交叉验证测试，那边测的是"支持了之后解码对不对"，这条测的是
+     * "真正不支持的范围还会不会被正确拦下"，两条测试职责不重叠。
      *
      * APP14 载荷结构：`"Adobe"(5字节) + version(2) + flags0(2) + flags1(2) +
      * transform(1)`——transform 在 `"Adobe"` 字面量起始偏移 +11 处。
      */
     @Test
-    fun `范围外的CMYK JPEG(如YCCK) 解码器拒绝时退回占位图 不掉进纯黑路径`() {
+    fun `范围外的CMYK JPEG(未定义的transform值) 解码器拒绝时退回占位图 不掉进纯黑路径`() {
         val context = RuntimeEnvironment.getApplication()
         val bytes = loadBytes("cmyk-quadrant-64.jpg")
         val adobeIndex = findAdobeTagIndex(bytes)
-        bytes[adobeIndex + 11] = 2 // transform: 0（反色 CMYK）→ 2（YCCK）
+        bytes[adobeIndex + 11] = 99 // transform: 0（反色 CMYK）→ 99（未定义，标准范围外）
 
         val doc = buildDocumentWithCmykJpeg(bytes, 64, 64)
         val content = PdfTextExtractor.extractContent(context, doc)

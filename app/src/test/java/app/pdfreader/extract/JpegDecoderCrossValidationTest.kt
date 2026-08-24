@@ -104,6 +104,24 @@ class JpegDecoderCrossValidationTest {
     }
 
     /**
+     * 2026-08-24 用户反馈"这本书的图片大部分都不正常"，字节级核实过：那份
+     * 年报（iFASTCorp-AR2023.pdf）97 张 CMYK 图片全部是 Adobe APP14
+     * transform=2（YCCK），不是这个解码器原来唯一支持的 transform=0——67%
+     * 的图片因此全走占位图。YCCK 比 transform=0（直接存 CMYK）更常见（是
+     * Adobe 系工具的标准做法），这次补上支持。
+     *
+     * `cmyk-ycck-book.jpg` 直接从这份年报原样抽出（767×2159，1×1 采样，不带
+     * 色度子采样——真机确认过的 97 张里只有 4 张是这种"最简单"的形状，先啃
+     * 这批，色度子采样是下一步）。YCCK 这个 transform 标记本身把换算方式
+     * 钉死了，不像 transform=0 CMYK 那样有"反色/不反色"的存储约定歧义，
+     * Pillow（libjpeg-turbo）的解码结果可以直接当参考，逐像素比对。
+     */
+    @Test
+    fun `真机YCCK真书数据 跟Pillow参考解码逐像素比对`() {
+        assertMatchesReference("cmyk-ycck-book")
+    }
+
+    /**
      * 2026-08-23 装机验证抓出的真 bug：那本 CMYK 教科书（印刷行业扫描数据）虽然
      * 也带 Adobe APP14 transform=0 标记，但存的是**不反色**的 CMYK（不符合 Adobe
      * 约定，但真实存在）——按反色约定解（Pillow 和我原来的写法都这样）整幅纯黑，
