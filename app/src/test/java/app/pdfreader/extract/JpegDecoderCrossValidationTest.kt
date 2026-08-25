@@ -121,9 +121,17 @@ class JpegDecoderCrossValidationTest {
      *
      * `cmyk-ycck-book.jpg` 直接从这份年报原样抽出（767×2159，1×1 采样，不带
      * 色度子采样——真机确认过的 97 张里只有 4 张是这种"最简单"的形状，先啃
-     * 这批，色度子采样是下一步）。YCCK 这个 transform 标记本身把换算方式
-     * 钉死了，不像 transform=0 CMYK 那样有"反色/不反色"的存储约定歧义，
-     * Pillow（libjpeg-turbo）的解码结果可以直接当参考，逐像素比对。
+     * 这批，色度子采样是下一步）。
+     *
+     * **2026-08-25 参考答案重新生成过，见 [JpegDecoder] 类 KDoc"YCCK 支持"
+     * 一节完整教训**：这条测试当初直接拿 Pillow 默认解码当参考——那次判断
+     * 是错的，Pillow 对这张图的默认解码同样需要整体反色，跟我们自己当初的
+     * 实现在同一个方向上犯了同一个错，逐像素比对完全测不出这类"参考实现
+     * 自己也解错"的 bug。这张图实际内容是一张蓝紫色"数字光效数据高速路"
+     * 设计图（这份年报里到处都是这种美术风格），不是字面意义上的"书页"——
+     * `cmyk-ycck-book` 这个名字是最初以为它来自"用户的教科书"、误判内容
+     * 类型留下的历史命名，不是真的一页书。参考 PNG 现在是本地手动把 Pillow
+     * 的四个通道整体反色之后转出来的，不是 Pillow 默认输出。
      */
     @Test
     fun `真机YCCK真书数据 跟Pillow参考解码逐像素比对`() {
@@ -138,20 +146,28 @@ class JpegDecoderCrossValidationTest {
      * subsampled.jpg`（263×256，真机取回）就是这 93 张里的一张——选它是
      * 因为色彩变化明显（不是纯色块），能测出"子采样分量取错最近邻位置"这类
      * 错位 bug（纯色图片即使取样位置算错，因为周围颜色一样，也测不出来）。
+     *
+     * **2026-08-25 参考答案重新生成过，见 [JpegDecoder] 类 KDoc"YCCK 支持"
+     * 一节完整教训**：真机把这张图所在的那一整页（年报第 5 页，"FY2023
+     * Achievements and Key Milestones"，7 张颁奖照片拼贴）用独立于 Pillow
+     * 的 poppler 渲染工具整页渲染出来核对，这张图其实是拼贴里的一张真人
+     * 颁奖合影，7 张里全部都需要整体反色，这张也不例外——原来的参考答案
+     * （Pillow 默认解码）跟 `cmyk-ycck-book` 那次是同一类错误。参考 PNG
+     * 现在是手动反色后的 Pillow 输出，不是默认输出。
      */
     @Test
     fun `真机YCCK色度子采样数据 跟Pillow参考解码逐像素比对`() {
-        // 容差比其它 fixture 松（35 而不是默认 10）：加诊断打印过误差分布——
-        // 67328 像素里只有 101 个（0.15%）diff>15，平均差只有 1.44，且这些点
-        // 散落在图片内容的颜色交界处（不是集中在图片边缘或某个规律位置，排除
-        // 了"子采样取样位置算错"这类系统性 bug）。根因是色度上采样滤波器的
-        // 差异：这里用最近邻取样（最简单、最快，見 [JpegDecoder] 的
+        // 容差比其它 fixture 松（35 而不是默认 10）：根因是色度上采样滤波器
+        // 的差异——这里用最近邻取样（最简单、最快，見 [JpegDecoder] 的
         // `sample` 函数），libjpeg-turbo 默认用更平滑的"fancy upsampling"，
         // 两者只在色彩剧烈变化的交界处才会有肉眼可辨的差异，大片纯色/渐变
         // 区域结果几乎一致——这是"够用就行、不追求更精细"的既定尺度（见类
-        // KDoc），不是 bug，容差放宽反映的是这个已知、如实记录的简化，不是
-        // 放松对真正 bug 的检出力度。
-        assertMatchesReference("cmyk-ycck-subsampled", tolerance = 35)
+        // KDoc），不是 bug。参考答案 2026-08-25 重新生成（见上面 KDoc）之后
+        // 最大像素差变成 43（原来 35 容差内），平均差仍然只有 2.9（远低于
+        // 下面单独卡的 5.0 硬上限）——反色不改变边缘局部差异的量级，35→45
+        // 只是把容差跟着新参考答案重新对齐，硬上限没有跟着放松，真出现系统性
+        // 偏色一样会被拦下。
+        assertMatchesReference("cmyk-ycck-subsampled", tolerance = 45)
     }
 
     /**
@@ -243,6 +259,42 @@ class JpegDecoderCrossValidationTest {
     @Test
     fun `空字节数组 返回null 不抛异常`() {
         assertNull(JpegDecoder.decode(ByteArray(0)))
+    }
+
+    /**
+     * 2026-08-25 用户反馈"颜色不对"（封面误判表格修好之后，另一份真机截图
+     * 里两张人物照片脸部/背景发黑发绿）追出来的：不是那两张照片本身，是
+     * 同一份年报第 6 页的整页背景设计图（YCCK，K 通道原始采样值均值
+     * 238.7，接近拉满）——用当时"YCCK 不存在反色歧义、固定公式"这套实现
+     * 解出来几乎是纯黑负片，Pillow 默认解码同一张图也是同样的负片（两个
+     * 独立实现在这张图上犯了同一个方向的错，`cmyk-ycck-book`/
+     * `cmyk-ycck-subsampled` 那两条测试当初用 Pillow 当参考时测不出这个
+     * bug，就是因为参考实现自己也解错了）。
+     *
+     * 定位过程：真机 `adb shell run-as` 把这份 PDF 整份拉回本地，`pdfimages`
+     * 抽出这张图的原始 JPEG 字节，确认 PDF 的 XObject 字典没有 `/Decode`
+     * 数组（排除"PDF 自己声明了反色、只是没读"这种可能）；用直方图拉伸
+     * （`ImageOps.autocontrast`）验证过负片版本和反色之后的版本是同一份
+     * 图像数据、结构完全一致（同样的楔形光束轮廓），只是整体反色，不是
+     * 解码结构性出错；试过"只反 C/M/Y、K 保持原样"和"C/M/Y/K 一起反"两种
+     * 范围，只有后者能同时解对这张新图又不破坏另外两份已验证 fixture——
+     * 结论是 YCCK 的反色也是四个分量一起整体翻转，跟 transform=0 CMYK
+     * 同一个模式。fixture 本身（`cmyk-ycck-inverted-design.jpg`）就是这份
+     * 真机截图，参考答案是本地用 Pillow 手动反色四个通道之后转出来的
+     * （`im.split()` 四个 band 各自 `ImageChops.invert`，再 `Image.merge
+     * ("CMYK",...).convert("RGB")`）——Pillow 自己默认解码这张图是错的，
+     * 不能直接当参考，这一点在这份 fixture 上是刻意反过来验证的。
+     *
+     * 见 [JpegDecoder] 类 KDoc"YCCK 支持"一节完整教训：一开始以为这是"需要
+     * 给 YCCK 补一套跟 transform=0 一样的逐图投票机制"，但顺着这条线索回头
+     * 核对已有的两份 YCCK fixture（`cmyk-ycck-book`/`cmyk-ycck-subsampled`），
+     * 发现它们当初的参考答案（Pillow 默认解码）也是错的——真机当天新查的
+     * 11+ 张 YCCK 图片没有一张需要"不反色"。最终没有做投票，直接把 YCCK
+     * 改成固定整体反色，比投票更简单，也更符合目前掌握的全部证据。
+     */
+    @Test
+    fun `真机YCCK需要整体反色的设计图 跟手动反色Pillow参考解码逐像素比对`() {
+        assertMatchesReference("cmyk-ycck-inverted-design", tolerance = 35)
     }
 
     @Test

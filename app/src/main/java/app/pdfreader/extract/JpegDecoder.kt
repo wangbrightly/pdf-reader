@@ -48,12 +48,15 @@ import kotlin.math.roundToInt
  * 而且所有按 Adobe 约定实现的库（Pillow/libjpeg、Skia）都会犯同样的错，所以
  * 逐像素比对第三方参考**测不出这个 bug**——参考实现自己就解错了。
  *
- * 标记层面没有任何信号能区分两种约定（都长一样），只能看内容：逐图对原始
- * 采样值投票——存的值偏亮（四通道和 > 700 的采样多于偏暗的）按反色约定解；
- * 存的值偏暗按不反色解。推导过四种组合（两种约定 × 内容偏白/偏暗）这条规则
+ * 标记层面没有任何信号能区分两种约定（都长一样），只能看内容：逐图对"默认
+ * 朝向"的 C/M/Y/K 采样值投票——偏亮（四通道和 > 700 的采样多于偏暗的）按反色
+ * 约定解；偏暗按不反色解。推导过四种组合（两种约定 × 内容偏白/偏暗）这条规则
  * 全部给出正确画面：偏白内容投票必然选对它自己的约定；偏暗内容即使选错约定，
  * 解出来也还是偏暗（错约定下偏暗内容的解码结果恰好不变）。扫描/印刷页面
  * 绝大部分是白底，这条规则在这类数据上等于"永远选对"。
+ *
+ * 这套投票只覆盖 transform=0——transform=2（YCCK）**不投票，固定整体反色**，
+ * 见下面"YCCK 支持"一节最后一段的完整教训（2026-08-25）。
  *
  * 反色之后是 CMYK→RGB 转换：
  * ```
@@ -82,11 +85,48 @@ import kotlin.math.roundToInt
  * K_true = 255 − K                      （K 要反色，libjpeg 教科书公式里 K 不变）
  * ```
  * 3 个真机采样点用 Pillow 的 CMYK 模式直接读出的 `(C,M,Y,K)` 真值核对过，
- * 整数级精确匹配。YCCK 不像 transform=0 CMYK 那样有"反色/不反色"两种存储
- * 约定并存的问题——`transform` 标记本身已经把换算方式钉死了，不需要投票。
- * 这套符号是这一份真机文件反推出来的，如果以后遇到另一份 YCCK 文件解出来
- * 是负片效果，说明符号约定不是唯一的（类似 transform=0 CMYK 那次教训），
- * 到时候再补检测逻辑，这次没有预先做。
+ * 整数级精确匹配。当时的假设是"YCCK 不像 transform=0 CMYK 那样有'反色/不
+ * 反色'两种存储约定并存的问题——`transform` 标记本身已经把换算方式钉死了，
+ * 不需要投票"，同时预留了一句话："如果以后遇到另一份 YCCK 文件解出来是
+ * 负片效果，说明符号约定不是唯一的，到时候再补检测逻辑"。
+ *
+ * **2026-08-25 这个预留的反例真机撞上了，而且比预想的严重得多——不是"需要
+ * 补投票"，是"当初验证用的参考答案从一开始就是错的"**：
+ *
+ * 1. 同一份年报里另一张背景图（真机反馈"颜色不对"追出来的，K 通道原始采样
+ *    值均值 238.7，接近拉满）用上面这套固定符号解出来几乎是纯黑负片。用
+ *    Pillow 单独核对这张图，默认解码同样是负片——**两个独立实现在这张图上
+ *    犯了同一个方向的错**，不是"参考实现更可信"就能绕开的坑，跟 transform=0
+ *    那次"所有按 Adobe 约定实现的库都会犯同样的错"是同一类教训。PDF 里这张
+ *    图的 XObject 字典确认没有 `/Decode` 数组（PDF 规范里能显式声明反色的
+ *    地方），排除了"PDF 自己说清楚了、只是没读"这种可能；直方图拉伸验证过
+ *    负片版本和正常版本是同一份图像数据、只是整体反色，不是解码结构性出错。
+ * 2. 顺着这条线索，回头重新核对了当初用来反推这套符号、且被当成"已验证"
+ *    的 `cmyk-ycck-book.jpg`——**这份 fixture 当年的参考答案（Pillow 默认
+ *    解码）同样是错的**：默认解码是一团模糊的褐绿色污渍，手动把 Pillow 的
+ *    四个通道整体反色之后，是一张清晰的蓝紫色"数字光效数据高速路"设计图，
+ *    跟这份年报里其它设计页的美术风格完全一致，肉眼判断不存在任何歧义。
+ *    `cmyk-ycck-subsampled.jpg` 同样中招——真机把这份年报第 5 页那组 7 张
+ *    颁奖照片拉下来逐张核对（用页面级渲染工具 poppler 独立渲染整页作对照，
+ *    不再依赖 Pillow 单张解码），这张 fixture 原来就是那 7 张里的一张，7 张
+ *    里全部 7 张都需要整体反色，`cmyk-ycck-subsampled.jpg` 也不例外。
+ * 3. 结论：**当天新查的 11+ 张真机 YCCK 图片（背景设计图、真人颁奖照混合），
+ *    没有一张需要"不反色"**，包括两份原来被误判成"不反色"的旧 fixture。
+ *    "YCCK 需要投票才能两边都覆盖"这个 2026-08-25 当天早些时候的设计（3 倍
+ *    优势门槛）站不住——它是拿两个错误的参考答案校准出来的阈值，凑巧能让
+ *    错误的旧 fixture 通过，而不是真的发现了"YCCK 也有双约定"。回退成固定
+ *    整体反色（`invert = true`，不投票），比投票机制更简单，也更符合目前
+ *    掌握的全部真实证据——如果以后真的找到一份验证充分（不是简单信一次
+ *    Pillow 默认输出）的、确实不需要反色的 YCCK 真机样本，再重新考虑要不要
+ *    加回投票，这次没有这样的样本，不预先加没有证据支撑的复杂度。
+ * 4. 方法论教训：**"跟成熟第三方库的输出比对"不能替代"肉眼/独立工具核实
+ *    这个输出本身对不对"**——这次连续两次被同一类问题绊倒（这一节第 1
+ *    点、[JpegDecoderCrossValidationTest] 全篇"参考实现的选择"一节记录的
+ *    TwelveMonkeys 那次），根源都是"该库处理这类小众数据没问题"这个假设
+ *    没有独立验证过。这次改用 `pdftoppm`/poppler 整页渲染做交叉验证——
+ *    poppler 是完全独立于 Pillow/libjpeg-turbo 调用路径的另一套实现，两者
+ *    同时出错的概率低得多，配合"这批图片美术风格高度一致、肉眼能判断"这个
+ *    额外信号，才敢确定原来的参考答案是错的。
  *
  * ## 色度子采样支持（2026-08-24 补上）
  *
@@ -297,11 +337,44 @@ internal object JpegDecoder {
             return planes[ci][sy * compPlaneWidth[ci] + sx].coerceIn(0, 255)
         }
 
-        // 见类 KDoc"核心机制"一节：对原始采样值投票决定这张图按哪种存储约定解。
-        // 只对 transform=0（直接存 CMYK）有意义——见"YCCK 支持"一节，transform=2
-        // 的数据存的是 YCbCr+K，不存在"反色/不反色"这个维度，投票没有意义。
-        // 按最终图像坐标每隔 8 像素取一票（全图投票没必要，白底页面几千票足够
-        // 稳定，也省时间；改成按最终坐标取样后子采样分量也能正确参与投票）。
+        // "默认朝向"下的 C/M/Y/K：transform=0 就是原始采样值本身；transform=2
+        // （YCCK）是 YCbCr→RGB 那套线性变换的结果当 C/M/Y、K 不反色——见下面
+        // "核心机制"一节，这一步只是给投票和最终反色判断提供一个统一的起点，
+        // 不代表这就是最终真值。
+        fun baseC(x: Int, y: Int): Int = if (isYcck) {
+            val yy = sample(0, x, y)
+            val cr = sample(2, x, y) - 128
+            (yy + 1.402 * cr).roundToInt().coerceIn(0, 255)
+        } else {
+            sample(0, x, y)
+        }
+        fun baseM(x: Int, y: Int): Int = if (isYcck) {
+            val yy = sample(0, x, y)
+            val cb = sample(1, x, y) - 128
+            val cr = sample(2, x, y) - 128
+            (yy - 0.344136 * cb - 0.714136 * cr).roundToInt().coerceIn(0, 255)
+        } else {
+            sample(1, x, y)
+        }
+        fun baseY(x: Int, y: Int): Int = if (isYcck) {
+            val yy = sample(0, x, y)
+            val cb = sample(1, x, y) - 128
+            (yy + 1.772 * cb).roundToInt().coerceIn(0, 255)
+        } else {
+            sample(2, x, y)
+        }
+        // transform=0 的 K 就是原始采样值；transform=2（YCCK）K 默认朝向是
+        // 255-采样值——原来（反色投票只覆盖 transform=0 之前）YCCK 的 K 固定
+        // 用 255-采样值，这里保留同一个默认朝向，让 invert=false 时跟当初只
+        // 用一份真机样本反推出来、已经验证过的公式完全一致。
+        fun baseK(x: Int, y: Int): Int = if (isYcck) 255 - sample(3, x, y) else sample(3, x, y)
+
+        // 见类 KDoc"核心机制"一节：对原始采样值投票决定这张图按哪种存储约定
+        // 解——只对 transform=0（直接存 CMYK）有意义。transform=2（YCCK）
+        // 2026-08-25 真机数据证明固定要整体反色（见类 KDoc"YCCK 支持"一节
+        // 完整背景），不再投票。按最终图像坐标每隔 8 像素取一票（全图投票
+        // 没必要，白底页面几千票就足够稳定，也省时间；按最终坐标取样后
+        // 子采样分量也能正确参与投票）。
         var hiVotes = 0
         var loVotes = 0
         if (!isYcck) {
@@ -309,14 +382,14 @@ internal object JpegDecoder {
             while (vy < frame.height) {
                 var vx = 0
                 while (vx < frame.width) {
-                    val s = sample(0, vx, vy) + sample(1, vx, vy) + sample(2, vx, vy) + sample(3, vx, vy)
+                    val s = baseC(vx, vy) + baseM(vx, vy) + baseY(vx, vy) + baseK(vx, vy)
                     if (s > 700) hiVotes++ else if (s < 300) loVotes++
                     vx += 8
                 }
                 vy += 8
             }
         }
-        val invert = hiVotes >= loVotes
+        val invert = if (isYcck) true else hiVotes >= loVotes
 
         val width = frame.width
         val height = frame.height
@@ -324,35 +397,14 @@ internal object JpegDecoder {
         var idx = 0
         for (y in 0 until height) {
             for (x in 0 until width) {
-                val realC: Int
-                val realM: Int
-                val realY: Int
-                val realK: Int
-                if (isYcck) {
-                    // 见类 KDoc"YCCK 支持"一节：这套符号是拿真机数据反推出来的，
-                    // 不是教科书 libjpeg 公式（那个公式是 C=255-R、K 不变，两处
-                    // 符号都跟这里相反）——3 个真机采样点用 Pillow 的 CMYK 模式
-                    // 直接读出的 (C,M,Y,K) 真值核对过，整数级精确匹配，不是"接近"。
-                    // 标准 JFIF YCbCr→RGB 公式算出的 r1/g1/b1 直接就是 C/M/Y
-                    // （不需要再 255-r1 那一步），K 则要 255-K 才是真值。
-                    val yy = sample(0, x, y)
-                    val cb = sample(1, x, y) - 128
-                    val cr = sample(2, x, y) - 128
-                    realC = (yy + 1.402 * cr).roundToInt().coerceIn(0, 255)
-                    realM = (yy - 0.344136 * cb - 0.714136 * cr).roundToInt().coerceIn(0, 255)
-                    realY = (yy + 1.772 * cb).roundToInt().coerceIn(0, 255)
-                    realK = 255 - sample(3, x, y)
-                } else {
-                    // 反色约定：存的值先 255-值 还原真实 CMYK；不反色约定：存的值即真实值。
-                    val s0 = sample(0, x, y)
-                    val s1 = sample(1, x, y)
-                    val s2 = sample(2, x, y)
-                    val s3 = sample(3, x, y)
-                    realC = if (invert) 255 - s0 else s0
-                    realM = if (invert) 255 - s1 else s1
-                    realY = if (invert) 255 - s2 else s2
-                    realK = if (invert) 255 - s3 else s3
-                }
+                // 反色约定：默认朝向的值先 255-值 还原真实 C/M/Y/K；不反色约定：
+                // 默认朝向的值即真实值。transform=0 和 transform=2 共用同一套
+                // 判断，见上面"核心机制"投票一节——不管走哪条 baseX 计算路径，
+                // 反色决策统一在这里做，两种 transform 不再分叉处理。
+                val realC = if (invert) 255 - baseC(x, y) else baseC(x, y)
+                val realM = if (invert) 255 - baseM(x, y) else baseM(x, y)
+                val realY = if (invert) 255 - baseY(x, y) else baseY(x, y)
+                val realK = if (invert) 255 - baseK(x, y) else baseK(x, y)
                 // 2026-08-24 真机数据核实：Pillow（libjpeg-turbo）CMYK→RGB 用的是
                 // 乘法公式 (255-C)×(255-K)/255，不是原来这里用的加法公式
                 // 255-min(255,C+K)——两者在 K 值低时接近，K 值高时差异明显（真机
