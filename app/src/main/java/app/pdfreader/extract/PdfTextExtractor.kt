@@ -1552,20 +1552,29 @@ object PdfTextExtractor {
         val pageWidth: Float = 0f,
     )
 
-    private class LineCollectingStripper : PDFTextStripper() {
+    /**
+     * [needsPosition]（2026-08-25 新增）：默认 `true`，2026-08-19 真机修复——
+     * PDFTextStripper 默认按 content stream 里的绘制顺序输出文字，不是按视觉上
+     * 的从上到下、从左到右顺序——这对单栏正文通常没区别（大部分 PDF 生成器本来
+     * 就是按视觉顺序画的），但"表单/表格模板"这类常见生成方式（先整体画一批
+     * 标签、再单独一批填值，或者分栏绘制）会导致行内乃至跨行的文字顺序错乱。
+     * 真机复现：一份体检报告 PDF 里"年龄: 43岁"被拆成"43 岁年龄:"，一份技术
+     * 规格表里同一行的好几个数值被打乱顺序拼在一起——两份文档开这个开关后都
+     * 恢复了正常的"标签在前、值在后"顺序，验证有效。见 NOTES.md 相关条目：
+     * 一开始以为要专门造一套"无边框表格检测"的复杂逻辑，结果真正的根因只是
+     * 这一行没打开，比想象的简单得多。
+     *
+     * [learnFooterTitlesInBackground] 传 `false`——见那里的调用点注释，页脚
+     * 学习只关心"这段文字出现过"（[RunningFooterFilter.learnTitleLikeNoiseTexts]
+     * 只用 `text`/`page`，不看视觉顺序），position-sortedness 对它完全没用，
+     * 只白付出计算代价（PDFBox 官方文档标注这个开关有性能代价，NOTES #16 也
+     * 记过"没有排除法拿到直接对比数据，不确定具体多少成本"这个待办）。
+     */
+    private class LineCollectingStripper(needsPosition: Boolean = true) : PDFTextStripper() {
         val lines = mutableListOf<Line>()
 
         init {
-            // 2026-08-19 真机修复：PDFTextStripper 默认按 content stream 里的绘制顺序
-            // 输出文字，不是按视觉上的从上到下、从左到右顺序——这对单栏正文通常没区别
-            // （大部分 PDF 生成器本来就是按视觉顺序画的），但"表单/表格模板"这类常见
-            // 生成方式（先整体画一批标签、再单独一批填值，或者分栏绘制）会导致行内
-            // 乃至跨行的文字顺序错乱。真机复现：一份体检报告 PDF 里"年龄: 43岁"被拆成
-            // "43 岁年龄:"，一份技术规格表里同一行的好几个数值被打乱顺序拼在一起——
-            // 两份文档开这个开关后都恢复了正常的"标签在前、值在后"顺序，验证有效。
-            // 见 NOTES.md 相关条目：一开始以为要专门造一套"无边框表格检测"的复杂逻辑，
-            // 结果真正的根因只是这一行没打开，比想象的简单得多。
-            sortByPosition = true
+            sortByPosition = needsPosition
         }
 
         override fun writeString(text: String, textPositions: MutableList<TextPosition>) {
@@ -2066,13 +2075,24 @@ object PdfTextExtractor {
                 footerLearnedTitles = runCatching {
                     val sampleEndPage = minOf(FOOTER_SAMPLE_PAGE_COUNT, pageCount)
                     if (sampleEndPage < 1) return@runCatching emptySet()
-                    val stripper = LineCollectingStripper()
+                    // needsPosition=false——见 LineCollectingStripper KDoc。
+                    val stripper = LineCollectingStripper(needsPosition = false)
                     // 见 documentLock KDoc——故意按页逐次加锁/放锁，不是一次性锁住整个
                     // 150 页样本区间：后者会让 loadPage（尤其是 open() 后紧接着调用的
                     // 第一页）最坏情况等这整批后台学习跑完才能拿到锁，等于把 NOTES.md
                     // #23 特意做的"后台学习不阻塞打开"这个优化又变相锁死了。按页拆开后
-                    // loadPage 最多等一页的学习耗时（通常几十毫秒量级），不会等整批
-                    // ——公平锁保证这个"最多等一页"的上限真的成立，不会被饿死。
+                    // loadPage 最多等一页的学习耗时，不会等整批——公平锁保证这个"最多
+                    // 等一页"的上限真的成立，不会被饿死。
+                    //
+                    // 2026-08-25 真机复测发现"一页的学习耗时"这个假设本身站不住——原来
+                    // 断言是"通常几十毫秒量级"，真机复现过单页 loadPage 因为排在页脚
+                    // 学习后面等锁等了 4874ms，跟"几十毫秒"差两个数量级。根因是页脚学习
+                    // 之前无条件复用了跟正式阅读同一个 needsPosition=true 的 stripper，
+                    // 而 [RunningFooterFilter.learnTitleLikeNoiseTexts] 只按 text/page
+                    // 分组统计重复率，从不看视觉顺序，`sortByPosition` 这个已知有性能
+                    // 代价（NOTES #16）的开关对页脚学习是纯浪费。这次关掉后单页学习
+                    // 耗时应该显著下降，"最多等一页"这个设计上限对真实文档也要成立，
+                    // 而不只是对当年验证用的简单 fixture 成立。
                     for (p in 1..sampleEndPage) {
                         documentLock.withLock {
                             stripper.startPage = p
