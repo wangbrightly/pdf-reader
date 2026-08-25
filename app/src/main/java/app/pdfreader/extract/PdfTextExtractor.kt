@@ -2157,7 +2157,17 @@ object PdfTextExtractor {
             }.getOrDefault(emptyList<LineSegment>() to false)
             val tAfterScan = System.currentTimeMillis()
             val onPageSegments = scanResult.first.filter { isSegmentOnPage(it, page.mediaBox.width, pageHeight) }
-            val tableRegion = TableGridDetector.tableRegionOrNull(onPageSegments)
+            // NOTES.md #39：整页图片优先于表格检测，不再对 scanHasFullPageImage=true
+            // 的页面跑 TableGridDetector——真机年报封面页（设计感很强、装饰线条多）
+            // 撞过真实误判：6508 条矢量段里凑巧有 ≥3 横+≥3 竖、边界框还重叠，命中了
+            // 表格判定，结果整页图片被当表格裁掉一部分（220 DPI 整页栅格化再裁剪），
+            // 而不是按"图片占满全页"这条已经验证过的规则（见下面 hasFullPageImage
+            // 分支的 KDoc）直接展示原图。没有改 TableGridDetector 本身的判定条件
+            // （NOTES #17 记过这是来回调过好几次的敏感区域，这次刻意不碰），只是让
+            // "整页图片"这个信号来源完全不同、更具体的判断，优先于"矢量线段凑巧像
+            // 网格"这个更弱的启发式——两者本来就是互斥的页面类型，同一页不该两条
+            // 规则都命中却选了错误的那条。
+            val tableRegion = if (scanHasFullPageImage) null else TableGridDetector.tableRegionOrNull(onPageSegments)
             val hasImages = scanResult.second
             val tAfterTableDetect = System.currentTimeMillis()
 

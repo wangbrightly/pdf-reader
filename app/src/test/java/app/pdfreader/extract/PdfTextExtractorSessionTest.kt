@@ -238,6 +238,78 @@ class PdfTextExtractorSessionTest {
     }
 
     /**
+     * NOTES.md #38/#39：真机年报封面页被 [TableGridDetector.tableRegionOrNull]
+     * 误判成表格——封面是设计感很强的一页，色块/装饰线条凑巧命中"≥3 横线+≥3
+     * 竖线、边界框重叠"这条本来是为真表格设计的判定条件，结果整页图片被裁剪成
+     * 表格分支那种"220 DPI 整页栅格化再裁剪"的局部图，而不是按"图片占满全页"
+     * 的既有规则（见上面`图片占满全页时不显示旁边的文字`）直接展示原图。
+     *
+     * 这条测试同时构造"占满全页的图片"+"凑巧组成网格的矢量线段"，验证修复后
+     * `scanHasFullPageImage=true` 时不再跑表格分支——用图片的原始像素尺寸
+     * （120×80，`tiny.png` 的真实尺寸）区分两条分支：表格分支会产出一张按
+     * 页面尺寸（200×300pt）以 220 DPI 栅格化再裁剪的图，尺寸不可能是 120×80；
+     * 只有直接抽取内嵌图片（`decodeImages=true` 那条路径，不经过栅格化）才会
+     * 保留原始像素尺寸。没有改动 [TableGridDetector] 本身的判定逻辑（NOTES #17
+     * 记录过那是来回调过好几次的敏感区域），只是让"整页图片"这个更具体的信号
+     * 优先于"矢量线段凑巧像网格"这个更弱的启发式信号——跟"图片占满全页时不
+     * 显示旁边文字"是同一条已经验证过的产品规则的自然延伸，不是新的判断。
+     */
+    @Test
+    fun `整页图片和巧合的表格状矢量线段同时出现时 按整页图片处理不裁成表格图`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val image = document.tinyImage()
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("garbage ocr text")
+        stream.endText()
+        // 图片铺满整个页面，跟`图片占满全页时不显示旁边的文字`那条测试同一个构造方式。
+        stream.drawImage(image, 0f, 0f, pageWidth, pageHeight)
+        // 凑巧组成"网格"的装饰性矢量线（3 横 + 3 竖，边界框重叠）——照抄
+        // TableGridDetectorTest 里"3列4行的规整网格线判定为像表格"那条用例的
+        // 构造思路，改用 Chromium 风格的填充细矩形（addRect+fill），因为
+        // TableGridDetector 的信号就是填充矩形的长边，不是描边直线（见该类 KDoc）。
+        val verticalXs = listOf(20f, 100f, 180f)
+        val horizontalYs = listOf(50f, 150f, 250f)
+        for (y in horizontalYs) {
+            stream.addRect(verticalXs.first(), y, verticalXs.last() - verticalXs.first(), 1f)
+            stream.fill()
+        }
+        for (x in verticalXs) {
+            stream.addRect(x, horizontalYs.first(), 1f, horizontalYs.last() - horizontalYs.first())
+            stream.fill()
+        }
+        stream.close()
+
+        val file = File.createTempFile("full-page-image-with-fake-table-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            val images = blocks.filterIsInstance<DisplayBlock.Image>()
+            assertTrue("应该保留图片，实际 blocks=$blocks", images.isNotEmpty())
+            assertEquals("不该走表格分支裁出额外的图片块", 1, images.size)
+            assertEquals("应该是直接抽取的原图（120×80），不是整页栅格化裁剪出来的图", 120, images.single().bitmap.width)
+            assertEquals("应该是直接抽取的原图（120×80），不是整页栅格化裁剪出来的图", 80, images.single().bitmap.height)
+            assertTrue(
+                "图片占满全页时不该显示旁边的文字，实际 blocks=$blocks",
+                blocks.none { it is DisplayBlock.Text },
+            )
+        }
+    }
+
+    /**
      * 反例：图片只占页面一角（不是占满全页），旁边的文字应该正常保留——防止
      * `hasFullPageImage` 判断误伤"图文混排、图片本来就不大"这种正常场景。
      */
