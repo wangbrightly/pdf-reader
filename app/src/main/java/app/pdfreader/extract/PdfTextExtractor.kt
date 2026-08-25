@@ -494,6 +494,20 @@ object PdfTextExtractor {
      * 拒绝（范围外数据，见 [JpegDecoder] 类 KDoc"范围"一节），退回诚实占位图。
      */
     private fun decodeCmykJpegOrNull(pdImage: PDImage): CmykJpegOutcome? {
+        val extraction = extractCmykJpegOrNull(pdImage) ?: return null
+        return decodeCmykJpegExtraction(extraction)
+    }
+
+    /**
+     * NOTES.md #43：[decodeCmykJpegOrNull] 拆成两半——这一半只碰 [PDImage]（读字节、
+     * 查真实分量数、算是否超像素上限），是"必须留在 documentLock 里"的部分；另一半
+     * [decodeCmykJpegExtraction] 只碰这里返回的 [CmykJpegExtraction]（一份已经复制
+     * 出来的 [ByteArray] 和几个 Int/Boolean），不再碰任何 `PDDocument`/`COSStream`，
+     * 是"可以放心挪到锁外面、多页并发跑"的部分。拆开之后 [decodeCmykJpegOrNull]
+     * 原样保留（两半连起来调，行为不变），供 `deferCmykDecode=false` 那条老路径用；
+     * [PageContentStreamEngine.drawImage] 的 `deferCmykDecode=true` 分支只调用这一半。
+     */
+    private fun extractCmykJpegOrNull(pdImage: PDImage): CmykJpegExtraction? {
         if (pdImage.suffix != "jpg") return null
         val bytes = runCatching {
             pdImage.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
@@ -503,16 +517,21 @@ object PdfTextExtractor {
         // 文案更准确（"太大"和"格式不认识"是两件事），真正拦住解码、避免 OOM 的判断
         // 在 JpegDecoder.decodeInternal 内部，这里重复算一遍不影响安全性。
         val tooLarge = pdImage.width.toLong() * pdImage.height.toLong() > JpegDecoder.MAX_CMYK_JPEG_PIXELS
-        val decoded = runCatching { JpegDecoder.decode(bytes) }.getOrNull()
+        return CmykJpegExtraction(bytes, pdImage.width, pdImage.height, tooLarge)
+    }
+
+    /** 见 [extractCmykJpegOrNull] KDoc——纯函数，不碰 `PDDocument`，可以在锁外面、多个线程同时对不同图片调用。 */
+    private fun decodeCmykJpegExtraction(extraction: CmykJpegExtraction): CmykJpegOutcome {
+        val decoded = runCatching { JpegDecoder.decode(extraction.bytes) }.getOrNull()
         return if (decoded != null) {
             CmykJpegOutcome(
                 Bitmap.createBitmap(decoded.argb, decoded.width, decoded.height, Bitmap.Config.ARGB_8888),
                 decoded = true,
             )
         } else {
-            val reason = if (tooLarge) "图片过大，暂不支持解码（CMYK JPEG）" else "图片格式不支持（CMYK JPEG）"
+            val reason = if (extraction.tooLarge) "图片过大，暂不支持解码（CMYK JPEG）" else "图片格式不支持（CMYK JPEG）"
             CmykJpegOutcome(
-                createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, reason),
+                createUnsupportedImagePlaceholder(extraction.width, extraction.height, reason),
                 decoded = false,
             )
         }
@@ -520,6 +539,18 @@ object PdfTextExtractor {
 
     /** [decodeCmykJpegOrNull] 的返回值：真正解码成功还是退回占位图，调用方要区别对待（朝向修正只适用于真实像素内容）。 */
     private data class CmykJpegOutcome(val bitmap: Bitmap, val decoded: Boolean)
+
+    /** [extractCmykJpegOrNull] 的返回值——已经从 [PDImage] 里复制出来的原始 JPEG 字节+基本信息，不再持有任何 PDFBox 对象引用。 */
+    private data class CmykJpegExtraction(val bytes: ByteArray, val width: Int, val height: Int, val tooLarge: Boolean)
+
+    /** 见 [PageContentStreamEngine.imageResults] KDoc。 */
+    private sealed class PageImageResult {
+        data class Ready(val bitmap: Bitmap) : PageImageResult()
+        data class Pending(val job: PendingCmykJob) : PageImageResult()
+    }
+
+    /** [PageImageResult.Pending] 携带的"锁外面解码需要的全部原料"——[CmykJpegExtraction] 之外，还要有 CTM/页面旋转才能在解码成功后正确摆朝向。 */
+    private data class PendingCmykJob(val extraction: CmykJpegExtraction, val ctm: PdfMatrix, val pageRotation: Int)
 
     /**
      * "解不出来的图片"用一块诚实的占位图代替，不静默消失——真机反馈"有的图片干脆
@@ -1642,12 +1673,61 @@ object PdfTextExtractor {
      * [hasImages]，图片矢量线段（表格检测用）不受影响，两者是内容流里两种不同的
      * 操作符，互不干扰。
      */
-    private class PageContentStreamEngine(page: PDPage, private val decodeImages: Boolean) :
-        PDFGraphicsStreamEngine(page) {
+    private class PageContentStreamEngine(
+        page: PDPage,
+        private val decodeImages: Boolean,
+        /**
+         * NOTES.md #43：真机反馈"多页排队时好几个圈圈同时转，解码本身还是慢"——
+         * 追到根子是 [Session.documentLock] 把整页处理（含图片解码）全锁住，
+         * `PdfPageAdapter` 的线程池形同虚设，多页没法真正并发解码。[JpegDecoder
+         * .decode] 是纯函数（只读一份已经复制出来的 [ByteArray]，不碰任何
+         * `PDDocument`/`COSStream`），2026-08-25 受控实验证实不安全的是"并发碰
+         * `PDDocument`"，不是"并发跑纯计算"——`deferCmykDecode=true` 时，CMYK/
+         * YCCK 图片在这次遍历里只做"读字节+基本信息"这一步（仍然要碰
+         * `PDImage`，必须留在锁内），把 [JpegDecoder.decode] 本身推迟到调用方
+         * 拿到 [imageResults] 之后、锁已经释放时再做——见 [Session.loadPage]
+         * 完整设计。`decodeImages=true` 但 `deferCmykDecode=false`（[extractContent]
+         * /[scanPages] 用的默认值）行为完全不变，这个参数不影响那条路径。
+         */
+        private val deferCmykDecode: Boolean = false,
+    ) : PDFGraphicsStreamEngine(page) {
         val segments = mutableListOf<LineSegment>()
-        val images = mutableListOf<Bitmap>()
+
+        /**
+         * 见 [deferCmykDecode] KDoc——`Ready` 是已经解出来的真实内容（JBIG2/手动
+         * 位深解码/原生解码这几条路径，没证据显示是瓶颈，继续保持"扫描时直接
+         * 解码"不变），`Pending` 只在 `deferCmykDecode=true` 时出现，携带的是
+         * "解码这一步需要的全部原料"（字节+CTM+页面旋转），真正调用
+         * [JpegDecoder.decode] 推迟到调用方决定的时机。
+         */
+        val imageResults = mutableListOf<PageImageResult>()
+
+        /**
+         * 只给 `deferCmykDecode=false`（[extractContent]/[scanPages]）用的老接口，
+         * 保持这条路径的行为/类型完全不变。`deferCmykDecode=true` 时
+         * [imageResults] 不会出现 `Pending` 以外真正需要在这里解码的情况——
+         * 调用方（[Session.loadPageLocked]）不应该读这个属性，应该直接读
+         * [imageResults] 自己在锁外面处理，读到 `Pending` 就地报错是故意的，
+         * 提前暴露"忘了用对应模式"这类用法错误，不要静默硬解码。
+         */
+        val images: List<Bitmap>
+            get() = imageResults.map {
+                when (it) {
+                    is PageImageResult.Ready -> it.bitmap
+                    is PageImageResult.Pending -> error(
+                        "PageContentStreamEngine.images 不支持 deferCmykDecode=true，用 imageResults 代替",
+                    )
+                }
+            }
+
         var hasImages = false
             private set
+
+        /** 目前只有 JBIG2/手动位深解码/原生解码这几条"没证据显示是瓶颈"的路径在用，直接进 [PageImageResult.Ready]。 */
+        private fun addImage(bitmap: Bitmap) {
+            imageResults.add(PageImageResult.Ready(bitmap))
+        }
+
         private val pendingSegments = mutableListOf<LineSegment>()
         private val pageWidth = page.mediaBox.width
         private val pageHeight = page.mediaBox.height
@@ -1823,7 +1903,7 @@ object PdfTextExtractor {
                 val jbig2Bitmap = decoded.getOrNull()
                 if (jbig2Bitmap != null) {
                     val ctm = graphicsState.currentTransformationMatrix
-                    images.add(orientImage(jbig2Bitmap, ctm))
+                    addImage(orientImage(jbig2Bitmap, ctm))
                 } else {
                     // **不调用 orientImage**（2026-08-22 真机反馈修复）：占位图是
                     // 我们自己现画的提示文字，不是原图片的像素内容——CTM 朝向
@@ -1831,7 +1911,7 @@ object PdfTextExtractor {
                     // 工具翻转过的原始画面转回正确方向"，占位图从头到尾没有
                     // "原始方向"这个概念，硬套这两层修正只会把提示文字转得倒
                     // 过来、镜像过去，反而更不可读——真机截图实测过这个 bug。
-                    images.add(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"))
+                    addImage(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JBIG2）"))
                 }
                 return
             }
@@ -1843,7 +1923,7 @@ object PdfTextExtractor {
                 val manuallyDecoded = manualResult.getOrNull()
                 if (manuallyDecoded != null) {
                     val ctm = graphicsState.currentTransformationMatrix
-                    images.add(orientImage(manuallyDecoded, ctm))
+                    addImage(orientImage(manuallyDecoded, ctm))
                 } else {
                     // 临时诊断："有的图片干脆不出现"——先确认是不是命中了这条手动解码
                     // 失败、没有任何回退的分支，顺带记下实际字节数，方便跟
@@ -1867,18 +1947,35 @@ object PdfTextExtractor {
             // 也会跳过非 3 分量的 JPEG（避免带降采样参数那条路径的对角线花屏），但
             // 跳过之后仍然会走到下面的 `pdImage.image`，那条路径同样会产出纯黑图片，
             // 不提前拦截的话用户还是会看到纯黑块。
-            val cmykResult = decodeCmykJpegOrNull(pdImage)
-            if (cmykResult != null) {
-                if (cmykResult.decoded) {
-                    // 真正解出来的原始像素内容，跟其它正常图片一样走两层朝向修正。
-                    val ctm = graphicsState.currentTransformationMatrix
-                    images.add(orientImage(cmykResult.bitmap, ctm))
-                } else {
-                    // 解码器明确拒绝（范围外数据）：占位图不走朝向修正，理由跟
-                    // JBIG2 占位图一样（见下面 JBIG2 分支的注释）。
-                    images.add(cmykResult.bitmap)
+            //
+            // 见 [deferCmykDecode] KDoc——这是唯一被真机数据证实过的解码瓶颈
+            // （手写纯 Kotlin 解码器，几百万像素的图要几秒），deferCmykDecode=true
+            // 时只在这里做"读字节+基本信息"（仍然要碰 PDImage，留在锁内），真正的
+            // JpegDecoder.decode 推迟到 imageResults 交回调用方、锁已经释放之后。
+            if (deferCmykDecode) {
+                val extraction = extractCmykJpegOrNull(pdImage)
+                if (extraction != null) {
+                    val ctm = graphicsState.currentTransformationMatrix.clone()
+                    imageResults.add(PageImageResult.Pending(PendingCmykJob(extraction, ctm, pageRotation)))
+                    return
                 }
-                return
+                // extraction == null：不是 4 分量 CMYK/YCCK JPEG，走下面的通用路径，
+                // 跟 deferCmykDecode=false 时 decodeCmykJpegOrNull 返回 null 是同一个
+                // "不归我管，交给下一条路径"的语义。
+            } else {
+                val cmykResult = decodeCmykJpegOrNull(pdImage)
+                if (cmykResult != null) {
+                    if (cmykResult.decoded) {
+                        // 真正解出来的原始像素内容，跟其它正常图片一样走两层朝向修正。
+                        val ctm = graphicsState.currentTransformationMatrix
+                        addImage(orientImage(cmykResult.bitmap, ctm))
+                    } else {
+                        // 解码器明确拒绝（范围外数据）：占位图不走朝向修正，理由跟
+                        // JBIG2 占位图一样（见下面 JBIG2 分支的注释）。
+                        addImage(cmykResult.bitmap)
+                    }
+                    return
+                }
             }
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
             // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
@@ -1887,7 +1984,7 @@ object PdfTextExtractor {
                 ?: runCatching { pdImage.image }.getOrNull()
                 ?: return
             val ctm = graphicsState.currentTransformationMatrix
-            images.add(orientImage(bitmap, ctm))
+            addImage(orientImage(bitmap, ctm))
         }
 
         // 表格网格检测不关心裁剪区域、阴影填充，当无操作处理。
@@ -2133,14 +2230,67 @@ object PdfTextExtractor {
          * 每一页只应该被调用一次，调用方（[app.pdfreader.ui.PdfPageAdapter]）负责
          * 这件事，这里不做缓存/去重，重复调用会重复做一遍耗时工作。
          */
-        // 见 documentLock KDoc——2026-08-25 起 loadPage 之间也互斥（受控实验实锤
-        // 过并发不安全，PDDocument 不是"多读者安全"的资源）。整个函数体一起拿锁，
-        // 不做更细粒度的拆分：函数体内部有好几处独立 touch document/page 的调用
-        // （矢量扫描、文字抽取、表格整页渲染、图片解码各一次），拆开加锁需要对
-        // 每一处都判断"这段中间夹着的纯内存计算安不安全被打断"，出错代价高。
-        fun loadPage(pageNo: Int): PageContent = documentLock.withLock { loadPageLocked(pageNo) }
+        // 见 documentLock KDoc——所有碰 PDDocument/PDImage 的工作都留在锁内，不做
+        // 更细粒度的拆分：函数体内部有好几处独立 touch document/page 的调用（矢量
+        // 扫描、文字抽取、表格整页渲染各一次），拆开加锁需要对每一处都判断"这段
+        // 中间夹着的纯内存计算安不安全被打断"，出错代价高。
+        //
+        // **2026-08-25/26 NOTES #43：CMYK/YCCK 图片的真正解码（[JpegDecoder.decode]）
+        // 是唯一的例外，被挪到锁外面了**——真机反馈"多页排队时好几个圈圈同时转，
+        // 解码本身还是慢"追出来的：documentLock 从 #36 起就是完全互斥的普通锁，
+        // `PdfPageAdapter` 的线程池（当时 3 个线程）早就没有真正的并发收益，只剩
+        // "3 个线程抢同一把锁、完成顺序由操作系统调度决定"这个副作用。[JpegDecoder
+        // .decode] 只读一份已经从 [PDImage] 复制出来的 [ByteArray]，不触碰任何
+        // `PDDocument`/`COSStream`，是纯函数，多个线程同时对不同页的不同图片调用
+        // 完全安全——这跟 #36 证伪的"loadPage 之间并发不安全"不矛盾，#36 的受控
+        // 实验测的是"并发碰同一个 PDDocument"，不是"并发跑纯计算"，两者是完全
+        // 不同的安全性质。
+        //
+        // 拆成两阶段：锁内的 [loadPageLockedPhaseA] 只做"碰 PDDocument"的部分——
+        // 矢量扫描、文字抽取、表格检测/渲染，图片方面只到"读出字节、判断是不是
+        // 4 分量 CMYK/YCCK"这一步（见 [PageContentStreamEngine.deferCmykDecode]），
+        // 不调用 [JpegDecoder.decode]；锁外的这个函数体拿到 [PageLoadPhaseA] 之后
+        // 才真正解码图片，多个 [loadPage] 调用（不同线程）在这一步才有真正的并行。
+        // [onImageReady] 是可选的"边解码边预览"回调，2026-08-26 起在锁外调用，
+        // 调用方（[app.pdfreader.ui.PdfPageAdapter]）仍然只应该在回调里做非阻塞
+        // 的 `View.post{}` 调度——虽然现在不再拖长锁的持有时间，但回调本身跑在
+        // 加载线程上，做耗时的事仍然会拖慢这一页自己的整体返回。
+        fun loadPage(pageNo: Int, onImageReady: ((Bitmap) -> Unit)? = null): PageContent {
+            val phaseA = documentLock.withLock { loadPageLockedPhaseA(pageNo) }
+            return when (phaseA) {
+                is PageLoadPhaseA.Complete -> phaseA.content
+                is PageLoadPhaseA.PendingImages -> {
+                    val images = phaseA.imageResults.map { result ->
+                        val bitmap = when (result) {
+                            is PageImageResult.Ready -> result.bitmap
+                            is PageImageResult.Pending -> {
+                                val outcome = decodeCmykJpegExtraction(result.job.extraction)
+                                if (outcome.decoded) {
+                                    applyPageRotation(applyCtmOrientation(outcome.bitmap, result.job.ctm), result.job.pageRotation)
+                                } else {
+                                    outcome.bitmap
+                                }
+                            }
+                        }
+                        onImageReady?.invoke(bitmap)
+                        bitmap
+                    }
+                    val stitched = ImageStripStitcher.stitchIfTiled(images)
+                    PageContent(phaseA.textBlocks + stitched.map { DisplayBlock.Image(it) })
+                }
+            }
+        }
 
-        private fun loadPageLocked(pageNo: Int): PageContent {
+        /** 见 [loadPage] KDoc"两阶段"一节。 */
+        private sealed class PageLoadPhaseA {
+            /** 表格分支（裁剪图靠 [PDFRenderer]，不经过 [JpegDecoder]）已经在锁内处理完，没有锁外工作要做。 */
+            data class Complete(val content: PageContent) : PageLoadPhaseA()
+
+            /** 非表格分支：[textBlocks] 已经是最终结果，[imageResults] 里的 [PageImageResult.Pending] 要在锁外解码。 */
+            data class PendingImages(val textBlocks: List<DisplayBlock>, val imageResults: List<PageImageResult>) : PageLoadPhaseA()
+        }
+
+        private fun loadPageLockedPhaseA(pageNo: Int): PageLoadPhaseA {
             // 2026-08-20 临时诊断日志：追查真机反馈"这本书打开后翻某些页要好几秒"——
             // 拆开量每一步耗时，看是矢量扫描/表格检测慢，还是文字抽取本身慢，定位完
             // 会删掉。阈值 300ms 只是不想让正常页也刷屏。
@@ -2148,11 +2298,45 @@ object PdfTextExtractor {
             val page = document.getPage(pageNo - 1)
             val pageHeight = page.mediaBox.height
 
+            // NOTES.md #41：文字抽取放在图片扫描/解码前面——2026-08-25 装机实测过
+            // 反过来（先扫描+解码图片，再抽文字）会让 stripper.getText 本身也跟着
+            // 变慢一截（大图页真机复现过 3.6s→5.1s，涨了 1.4 秒），文字抽取这段
+            // 代码完全没有改动过，唯一变了的是"这一步之前有没有刚分配过几张大
+            // Bitmap"——推断是内存压力（GC）在两段本来互相独立的工作之间传导。
+            // stripper.getText 不依赖 tableRegion/图片扫描结果（下面 nonTableLines
+            // 只是拿 tableRegion 去过滤 stripper.lines，谁先算出来不影响正确性），
+            // 调整顺序不改变任何行为，只是让"分配大内存"尽量晚发生。
+            val stripper = LineCollectingStripper()
+            stripper.startPage = pageNo
+            stripper.endPage = pageNo
+            runCatching { stripper.getText(document) }
+            val tAfterStripper = System.currentTimeMillis()
+
+            // 跟表格检测合并成一次遍历，decodeImages 固定传 true、deferCmykDecode
+            // 固定传 true——原来这里传 decodeImages=false（只扫结构不解码图片），
+            // 有图片的页会在下面 `if (hasImages)` 里再对同一个 page 重新起一个
+            // PageContentStreamEngine 完整重新扫一遍，content stream 被 PDFBox
+            // 的内容流解释器解析了两遍——真机诊断实测过这一遍解析本身（不含图片
+            // 解码）在复杂页上要 4+ 秒，两遍等于白白多付一次。decodeImages=true
+            // 时 [PageContentStreamEngine.drawImage] 对结构性扫描（segments/
+            // hasImages/hasFullPageImage）做的事跟 false 完全一样，只是多做了
+            // "遇到图片就读字节"这一步——deferCmykDecode=true 让这一步停在"读出
+            // 字节"，不真正调用 [JpegDecoder.decode]（见 [loadPage] KDoc"两阶段"
+            // 一节，真正解码在锁外面做）。下面 `if (hasImages)` 分支复用这次已经
+            // 扫出来的 [scanImageResults]，不再重新起一遍引擎。代价：表格分支
+            // （[tableRegion] != null）不用这批扫出来的图片（改用 PDFRenderer
+            // 整页栅格化），[PageImageResult.Pending] 里已经读出来的字节就白读
+            // 了（但没有真正解码，比合并遍历那次的"白做一次真正解码"代价小很多）
+            // ——真机年报封面页误判成表格那次（NOTES #39）修好之后，表格分支已经
+            // 变得少见，且真正的表格页（财务数字网格）通常不会同页夹带大幅 CMYK
+            // 照片，这份代价换"每个有图片的页都省一次完整重新解析"，权衡起来划算。
             var scanHasFullPageImage = false
+            var scanImageResults: List<PageImageResult> = emptyList()
             val scanResult = runCatching {
-                val engine = PageContentStreamEngine(page, decodeImages = false)
+                val engine = PageContentStreamEngine(page, decodeImages = true, deferCmykDecode = true)
                 engine.processPage(page)
                 scanHasFullPageImage = engine.hasFullPageImage
+                scanImageResults = engine.imageResults
                 engine.segments to engine.hasImages
             }.getOrDefault(emptyList<LineSegment>() to false)
             val tAfterScan = System.currentTimeMillis()
@@ -2170,13 +2354,7 @@ object PdfTextExtractor {
             val tableRegion = if (scanHasFullPageImage) null else TableGridDetector.tableRegionOrNull(onPageSegments)
             val hasImages = scanResult.second
             val tAfterTableDetect = System.currentTimeMillis()
-
-            val stripper = LineCollectingStripper()
-            stripper.startPage = pageNo
-            stripper.endPage = pageNo
-            runCatching { stripper.getText(document) }
-            val tAfterStripper = System.currentTimeMillis()
-            if (tAfterStripper - tPageStart > 300) {
+            if (tAfterTableDetect - tPageStart > 300) {
                 // 2026-08-21 追加诊断：真机复现过"矢量段数=4、原始行数=1 这种几乎没
                 // 内容的页，矢量扫描却要 1.6-1.8 秒"——段数/行数完全解释不了这个耗时，
                 // 怀疑是内容流本身解压后体积很大（比如大量空白/重复指令），扫描引擎
@@ -2188,10 +2366,13 @@ object PdfTextExtractor {
                     val size = page.contents?.use { it.readBytes().size } ?: -1
                     size to (System.currentTimeMillis() - tContentStart)
                 }.getOrDefault(-1 to -1L)
+                // 2026-08-25 NOTES #41：文字抽取挪到了扫描/解码前面（见上面 stripper
+                // 那段 KDoc），这里的耗时拆分跟着调整——文字抽取=tAfterStripper-
+                // tPageStart，矢量扫描(含图片解码)=tAfterScan-tAfterStripper。
                 android.util.Log.d(
                     "PdfReaderDebug",
-                    "loadPage(page=$pageNo) 慢页拆分 矢量扫描=${tAfterScan - tPageStart}ms " +
-                        "表格检测=${tAfterTableDetect - tAfterScan}ms 文字抽取=${tAfterStripper - tAfterTableDetect}ms " +
+                    "loadPage(page=$pageNo) 慢页拆分 文字抽取=${tAfterStripper - tPageStart}ms " +
+                        "矢量扫描=${tAfterScan - tAfterStripper}ms 表格检测=${tAfterTableDetect - tAfterScan}ms " +
                         "矢量段数=${scanResult.first.size} 原始行数=${stripper.lines.size} " +
                         "内容流解压后字节数=${contentBytes.first} 读取内容流耗时=${contentBytes.second}ms " +
                         "占满全页图片=$scanHasFullPageImage",
@@ -2214,8 +2395,10 @@ object PdfTextExtractor {
             val filtered = rawParagraphs.filterIndexed { index, _ -> index !in noiseIndices }
             val filteredHeadingFlags = headingFlags.filterIndexed { index, _ -> index !in noiseIndices }
 
-            val blocks = mutableListOf<DisplayBlock>()
             if (tableRegion != null) {
+                // 表格分支的裁剪图靠 PDFRenderer 整页栅格化，不经过 JpegDecoder，
+                // 没有锁外可做的慢工作——直接在锁内算完，返回 Complete。
+                val blocks = mutableListOf<DisplayBlock>()
                 val cropped = runCatching {
                     val renderer = PDFRenderer(document)
                     val fullPage = renderer.renderImageWithDPI(pageNo - 1, TABLE_PAGE_RENDER_DPI)
@@ -2234,31 +2417,29 @@ object PdfTextExtractor {
                     blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
                     if (index == afterIndex) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
                 }
-            } else {
-                // 见 PageContentStreamEngine.hasFullPageImage KDoc——图片占满全页时，
-                // 用户明确要求不显示旁边的文字（大概率是扫描工具自动加的隐藏 OCR
-                // 噪音文字，真机复现过"、飞、飞、总"这类反复出现几个常见字的乱码，
-                // 跟图片内容毫无关系）。只跳过整页文字，不影响表格分支（表格区域
-                // 本来就是裁剪成图，跟这里是两回事）。
-                if (!scanHasFullPageImage) {
-                    filtered.forEachIndexed { index, paragraph ->
-                        blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
-                    }
-                }
-                if (hasImages) {
-                    // 图片插在这一页最后一个段落之后——跟 extractContent/旧 Session 的
-                    // "同页图片统一插在该页最后一个段落之后（按页归类）"是同一条约定，
-                    // 单页范围内 ImagePlacement.afterParagraphIndex 天然只会算出
-                    // "最后一个段落之后"这一个结果，不需要真的调用它。
-                    val images = runCatching {
-                        val engine = PageContentStreamEngine(page, decodeImages = true)
-                        engine.processPage(page)
-                        ImageStripStitcher.stitchIfTiled(engine.images)
-                    }.getOrDefault(emptyList())
-                    images.forEach { blocks.add(DisplayBlock.Image(it)) }
+                return PageLoadPhaseA.Complete(PageContent(blocks))
+            }
+            // 见 PageContentStreamEngine.hasFullPageImage KDoc——图片占满全页时，
+            // 用户明确要求不显示旁边的文字（大概率是扫描工具自动加的隐藏 OCR
+            // 噪音文字，真机复现过"、飞、飞、总"这类反复出现几个常见字的乱码，
+            // 跟图片内容毫无关系）。只跳过整页文字，不影响表格分支（表格区域
+            // 本来就是裁剪成图，跟这里是两回事）。
+            val textBlocks = mutableListOf<DisplayBlock>()
+            if (!scanHasFullPageImage) {
+                filtered.forEachIndexed { index, paragraph ->
+                    textBlocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
                 }
             }
-            return PageContent(blocks)
+            // 图片插在这一页最后一个段落之后——跟 extractContent/旧 Session 的
+            // "同页图片统一插在该页最后一个段落之后（按页归类）"是同一条约定，
+            // 单页范围内 ImagePlacement.afterParagraphIndex 天然只会算出"最后一个
+            // 段落之后"这一个结果，不需要真的调用它。真正解码/拼接图片是锁外面
+            // [loadPage] 的事，这里只把 [scanImageResults] 原样交出去。
+            return if (hasImages) {
+                PageLoadPhaseA.PendingImages(textBlocks, scanImageResults)
+            } else {
+                PageLoadPhaseA.Complete(PageContent(textBlocks))
+            }
         }
 
         override fun close() {

@@ -83,6 +83,23 @@ class PdfPageAdapter(
      * 开始跑之前，先检查这个 ViewHolder 是不是还绑定着当初提交任务时的那个
      * position"这道新增的前置检查——快速翻页时排在队列里、等到真正轮到执行时早已
      * 经不是当前可见页的任务，直接跳过，不浪费 CPU 去解析一个用户已经划走的页。
+     *
+     * **2026-08-25 [LOAD_POOL_SIZE] 先从 3 改成 1，隔天（2026-08-26）又改回 3**：
+     * 中间这一圈教训值得记录。用户真机反馈"翻页时好几个圈圈同时转，看着乱"——
+     * 当时追到的根因是 `documentLock`（见 [PdfTextExtractor.Session.documentLock]
+     * KDoc）从 #36 起就是完全互斥的普通锁，3 个线程唯一还剩的效果是"同时抢同一把
+     * 锁，谁先抢到由操作系统调度决定"，完成顺序因此跟提交顺序（≈阅读顺序）对不
+     * 上；改成 1 确实让顺序变得可预测了，但用户紧接着指出"排队本身还是太长，
+     * 多页等待时还是好几个圈圈在转"——根子是documentLock 把图片解码（真机测出
+     * 来的大头，一张几百万像素的 CMYK/YCCK 图要几秒）也锁住了，1 个线程池只是让
+     * "排很长的队"变得有序，没有让队变短。真正的解法是 NOTES.md #43：
+     * [PdfTextExtractor.Session.loadPage] 把 `JpegDecoder.decode`（纯函数，不碰
+     * `PDDocument`）挪到锁外面，`loadPage` 之间在解码这一步重新有了真正的并行——
+     * 这次改回 3 就是要真正吃到这份并行收益，不会重新引入"抢锁导致完成顺序不
+     * 确定"那个问题，因为锁内的部分（Phase A）现在很快，3 个线程抢的是一段
+     * 很短的临界区，抢到快慢的差异远小于抢到之后各自解码要花的时间——真机翻页
+     * 顺序应该重新接近提交顺序，即使不是 [loadExecutor] 内部队列那种数学上严格
+     * 的 FIFO 保证。
      */
     private val loadExecutor = Executors.newFixedThreadPool(LOAD_POOL_SIZE)
 
@@ -141,17 +158,57 @@ class PdfPageAdapter(
             // 的 PDFBox 解析工作。
             if (holder.bindingAdapterPosition != position) return@submit
             val tStart = System.currentTimeMillis()
-            val content = runCatching { session.loadPage(pageNo) }
-                .getOrDefault(PdfTextExtractor.PageContent(emptyList()))
+            // 见 PdfTextExtractor.Session.loadPage KDoc"onImageReady"一节：整页
+            // 图片的页（尤其不显示文字的 hasFullPageImage 页）之前要等这一页全部
+            // 图片解完才看到任何内容，真机复现过转圈十几秒——这个回调让每张图片
+            // 刚解出来就先画到屏幕上，不用等整页处理完。2026-08-26 起回调在锁外
+            // （图片解码本身已经不再持有 documentLock，见 NOTES #43）调用，这里
+            // 仍然只做 `post{}` 调度、不做耗时的事——虽然不再拖长锁的持有时间，
+            // 回调本身还是跑在这一页自己的加载线程上，做耗时的事会拖慢这一页
+            // 自己的整体返回。
+            var previewShown = false
+            val content = runCatching {
+                session.loadPage(pageNo) { bitmap ->
+                    holder.itemView.post {
+                        if (holder.bindingAdapterPosition == position) {
+                            renderProgressiveImage(holder, bitmap, isFirst = !previewShown)
+                        }
+                    }
+                    previewShown = true
+                }
+            }.getOrDefault(PdfTextExtractor.PageContent(emptyList()))
             android.util.Log.d(
                 "PdfReaderDebug",
                 "PdfPageAdapter.loadPage(page=$pageNo)=${System.currentTimeMillis() - tStart}ms",
             )
             cache[pageNo] = content
             holder.itemView.post {
+                // 这一步是权威的最终结果——见 onImageReady KDoc，可能跟渐进预览
+                // 展示过的内容不完全一样（图片拼接、表格裁剪替换掉预览等），整页
+                // 重新渲染一次，不依赖/信任渐进阶段已经画出来的东西。
                 if (holder.bindingAdapterPosition == position) renderPage(holder, content)
             }
         }
+    }
+
+    /**
+     * 见 [onBindViewHolder] 里 `onImageReady` 回调——每解出一张图片就调一次，只在
+     * 主线程调用（调用方已经 `post{}` 过）。[isFirst] 时先清空占位符（转圈），
+     * 后续图片依次往下摆，跟 [renderPage] 的段间距逻辑一致。这里画出来的东西是
+     * "边解码边预览"，不是最终结果——[renderPage] 最终会整体替换掉这里画的内容。
+     */
+    private fun renderProgressiveImage(holder: PageViewHolder, bitmap: Bitmap, isFirst: Boolean) {
+        val container = holder.itemView as LinearLayout
+        if (isFirst) {
+            container.removeAllViews()
+        }
+        val view = createImageView(bitmap)
+        if (container.childCount > 0) {
+            val params = view.layoutParams as LinearLayout.LayoutParams
+            params.topMargin = dpToPx(view, blockSpacingDpProvider())
+            view.layoutParams = params
+        }
+        container.addView(view)
     }
 
     private fun renderLoadingPlaceholder(holder: PageViewHolder) {
@@ -201,11 +258,10 @@ class PdfPageAdapter(
         const val PLACEHOLDER_HEIGHT_PX = 300
 
         /**
-         * 见 [loadExecutor] KDoc——同时最多几个页面并发解析。固定给 3，不用
-         * `Runtime.availableProcessors()`：解析本身要吃 CPU，留几个核心给 UI
-         * 线程渲染/手势响应，不是核心数越多并发度就该越高；真机快速翻页复现过的
-         * 那次 131 秒离谱耗时，本质是"并发数完全不设上限"，只要有上限（哪怕不是
-         * 精确调过的最优值）就已经能避免那种量级的资源互相拖累。
+         * 见 [loadExecutor] KDoc"2026-08-25 先改 1 隔天又改回 3"一节完整教训——
+         * 3 这个数字本身没有精调过（跟真机 131 秒那次教训一样，"要给上限"比
+         * "上限具体是几"更重要），2026-08-26 起图片解码已经挪到 documentLock
+         * 外面，3 个线程重新有了真实的并发解码收益，不再只是"抢锁排队"。
          */
         const val LOAD_POOL_SIZE = 3
     }

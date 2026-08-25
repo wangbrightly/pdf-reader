@@ -1,5 +1,6 @@
 package app.pdfreader.extract
 
+import android.graphics.Bitmap
 import app.pdfreader.ui.DisplayBlock
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -306,6 +307,53 @@ class PdfTextExtractorSessionTest {
                 "图片占满全页时不该显示旁边的文字，实际 blocks=$blocks",
                 blocks.none { it is DisplayBlock.Text },
             )
+        }
+    }
+
+    /**
+     * NOTES.md #42：真机反馈整页图片的页要等图片全解完才看到任何东西（尤其是
+     * 不显示文字的 hasFullPageImage 页），加了 `onImageReady` 回调让每张图片
+     * 刚解出来就能先展示，不用等整页处理完。这条测试验证回调本身的契约：
+     * 一页两张图片，回调应该正好触发两次，且在 `loadPage` 整体返回之前就已经
+     * 触发完——调用方（[app.pdfreader.ui.PdfPageAdapter]）就是靠"回调先到、
+     * 最终返回值后到"这个时序做"先预览、后用权威结果整体刷新"的。
+     */
+    @Test
+    fun `loadPage 图片边解码边回调 每张图片触发一次且在整体返回前完成`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        // 两张图各占一角，都不到"占满全页"的比例，不触发 hasFullPageImage/表格
+        // 那两条跟这条测试无关的分支，只测回调本身的次数和时序。
+        stream.drawImage(document.tinyImage(), 10f, 200f, 40f, 30f)
+        stream.drawImage(document.tinyImage(), 10f, 50f, 40f, 30f)
+        stream.close()
+
+        val file = File.createTempFile("two-images-progressive-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val previewed = mutableListOf<Bitmap>()
+            val content = session.loadPage(1) { bitmap -> previewed.add(bitmap) }
+            // 回调是同步调用的（见 Session.loadPage KDoc），走到这里时应该已经
+            // 全部触发完——不是靠回调"最终会不会来"，是靠"loadPage 返回时必然
+            // 已经来过"。
+            assertEquals("两张图片应该各触发一次回调", 2, previewed.size)
+            previewed.forEach {
+                assertEquals(120, it.width)
+                assertEquals(80, it.height)
+            }
+            val finalImages = content.blocks.filterIsInstance<DisplayBlock.Image>()
+            assertEquals("最终结果的图片数量应该跟回调触发次数一致", previewed.size, finalImages.size)
         }
     }
 
