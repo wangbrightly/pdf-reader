@@ -108,6 +108,46 @@ data class TableRegion(val minX: Float, val minY: Float, val maxX: Float, val ma
  * 这个风险，换回"更多真表格能被正确识别"——两个方向的误判都会发生，选哪个方向
  * 犯错是产品判断，不是纯技术判断，这次的选择记在这里供以后参考，不代表以后遇到
  * 同类问题都该照这个方向选。
+ *
+ * ## 横竖跨度比例检查（2026-08-26 加上）：真机第三次误判，这次真的引入了"新信息"
+ *
+ * 真机反馈一份年报"Board of Directors"页——3 位董事的简介卡片，每张卡片有照片
+ * 边框+姓名标签（竖向排列，X 跨度只有约 150pt）、职位标题栏+右侧斜线装饰纹理
+ * （横向排列，X 跨度约 511pt）。这些线段各自都是"装饰元素"，但坐标巧合分布满足
+ * "≥3 条独立横线 + ≥3 条独立竖线，且横竖的包围盒有重叠"——跟上面两次误判
+ * （页边距装饰边框、封面设计页）是同一个检测器的第三种触发场景，但这次连
+ * "整页图片"这种干净信号都没有（照片不是占满整页，见 [PdfTextExtractor]
+ * NOTES.md #39 的 `scanHasFullPageImage` 判断，那次修复对这次不适用）。
+ *
+ * 上一节明确写过"要分清楚必须引入新的信息（比如线段长度、离页面边缘的距离）"，
+ * 这次真的用上了线段长度：**真表格的横线跨度和竖线跨度应该大致吻合**——横线
+ * 是从最左边的竖线（第一列）画到最右边的竖线（最后一列），竖线是从最上面的
+ * 横线（表头）画到最下面的横线（表尾），两者围的是同一个矩形，理论上 `hMaxX-
+ * hMinX`（横线们的整体 X 跨度）应该约等于 `vMaxX-vMinX`（竖线们的整体 X 跨度），
+ * Y 方向同理。这次的误判恰恰在这里露了馅：照片边框+姓名标签的竖线 X 跨度只有
+ * 约 150pt（都挤在 x=42~192 之间），但职位标题栏+装饰纹理的横线 X 跨度却有
+ * 约 511pt（延伸到 x=553）——3.4 倍的落差，因为这些"横线"和"竖线"根本不属于
+ * 同一个视觉整体，只是恰好经过同一片区域。
+ *
+ * 用现有测试套件反过来验证过这条新检查不会伤到任何已有场景：3 列 4 行的真实
+ * 网格（[TableGridDetectorTest] 里"3列4行的规整网格线..."那条）横竖跨度完全
+ * 相等，比例 1.0；表头行略高的正常表格同样是 1.0；连上一节"用户明确接受的
+ * 回归"那条测试（页边距装饰边框+零散分隔线）的横竖跨度比例也只有约 1.1-1.4
+ * 倍，仍然在阈值内，这条已经被用户拍板接受的取舍不受这次改动影响——这次的
+ * 检查瞄准的是"两批线段视觉上根本不是一回事、只是碰巧同区域"这个新的、
+ * 更极端的误判模式，跟"同一批真的分隔线，只是间距不均匀"（上一节撤回的那条
+ * 规则想解决但办不到的问题）是不同性质的问题，恰好能用不同的几何信号分开。
+ *
+ * 阈值选 [MAX_EXTENT_RATIO] = 2 倍——真表格/已接受的装饰线场景比例都在 1.4 倍
+ * 以内，这次的真实误判是 3.4 倍，中间留了很宽的空档，不是贴着任何一个样本的
+ * 边界值凑出来的。
+ *
+ * **已知局限（如实记录，不是没想到）**：一个真实表格如果标题栏明显宽于表格本身
+ * （比如表格上方有一条通栏的说明文字下划线，宽度远超表格实际列宽），这条新
+ * 检查可能会误伤——这跟上一节"行列间距均匀性检查"被"一条不相关的线"破坏是
+ * 同一类风险，只是这次触发条件更具体（要求那条不相关的线本身很长、且被误认成
+ * 表格的一部分），真机目前还没有实际撞见过这种反例，如果以后出现，需要重新
+ * 评估这条检查要不要继续留着。
  */
 object TableGridDetector {
     /** 判定"这条线段是水平/竖直"的容差：允许因为矩形厚度导致的 1pt 左右偏差。 */
@@ -121,6 +161,9 @@ object TableGridDetector {
 
     /** 至少要有这么多条互相独立的横线 + 竖线，才判定为"网格"而不是"边框"。 */
     private const val MIN_GRID_LINES = 3
+
+    /** 见类 KDoc"横竖跨度比例检查"一节——横线整体跨度和竖线整体跨度的比值超过这个倍数就不像同一个表格。 */
+    private const val MAX_EXTENT_RATIO = 2f
 
     fun looksLikeTable(segments: List<LineSegment>): Boolean = tableRegionOrNull(segments) != null
 
@@ -148,6 +191,19 @@ object TableGridDetector {
         val xOverlaps = hMinX <= vMaxX && vMinX <= hMaxX
         val yOverlaps = vMinY <= hMaxY && hMinY <= vMaxY
         if (!xOverlaps || !yOverlaps) return null
+
+        // 见类 KDoc"横竖跨度比例检查"一节——真表格的横线跨度（hMaxX-hMinX）和
+        // 竖线跨度（vMaxX-vMinX）围的是同一个矩形，应该大致相等；Y 方向同理。
+        // `coerceAtLeast(1f)` 避免除以接近 0 的宽度（理论上 MIN_LINE_LENGTH_PT
+        // 已经保证线段本身不会退化成一个点，这里只是防御性写法）。
+        val hWidth = hMaxX - hMinX
+        val vWidth = vMaxX - vMinX
+        val widthRatio = maxOf(hWidth, vWidth) / minOf(hWidth, vWidth).coerceAtLeast(1f)
+        if (widthRatio > MAX_EXTENT_RATIO) return null
+        val hHeight = hMaxY - hMinY
+        val vHeight = vMaxY - vMinY
+        val heightRatio = maxOf(hHeight, vHeight) / minOf(hHeight, vHeight).coerceAtLeast(1f)
+        if (heightRatio > MAX_EXTENT_RATIO) return null
 
         return TableRegion(
             minX = minOf(hMinX, vMinX),

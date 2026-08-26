@@ -31,6 +31,17 @@ import android.graphics.Canvas
  *    是页面上互不相关的图片。
  * 3. 除最后一张外，宽度也完全相同——"等宽切片+最后一条余数"是切片工具的典型
  *    产出模式；最后一张宽度不能超过前面的统一宽度（超过说明不是"余数"，模式不对）。
+ * 4. 高宽比够"窄"（见 [MIN_STRIP_ASPECT_RATIO]）——2026-08-26 真机反馈修复：
+ *    一份年报"Board of Directors"页真机复现过反例，10 张董事头像（每张
+ *    318×353，高宽比约 1.1，接近正方形）凑巧同时满足上面 1-3 三条（都是同一
+ *    批次导出、尺寸统一的证件照），被误判成"切片"，10 个人的照片被强行横向
+ *    拼接成一张 3180×353 的宽图再整体压缩显示，效果是好几个人的脸糊在一起、
+ *    整体发暗发黑——用户反馈"颜色不对"最初以为是 CMYK 解码问题，装机排查
+ *    到这条 KDoc"根因"一节描述的真实切片样本（125×1078，高宽比约 8.6）
+ *    时才意识到：真正的切片在设计上高宽比必然悬殊（宽度是页面宽度切出来的
+ *    1/6~1/8，高度是整页高度），不会是这种接近正方形的证件照比例——这个
+ *    形状差异是切片这个生成机制本身决定的，不是巧合凑出来的两个数据点，
+ *    加一道高宽比门槛能同时保住原始场景、排除这次的假阳性。
  *
  * 拼接顺序沿用 PDFBox 抽取出来的原始顺序（[PageContentStreamEngine] 遇到 `Do`
  * 操作符的顺序）——没有记录每张图片在页面上的精确坐标（CTM 平移分量），假设切片
@@ -40,6 +51,14 @@ import android.graphics.Canvas
  */
 object ImageStripStitcher {
     private const val MIN_STRIPS = 3
+
+    /**
+     * 见类 KDoc"判断标准"第 4 条——`height / width` 至少要到这个倍数才当"窄条"处理。
+     * 真实切片样本是约 8.6（125×1078），真实反例（证件照）是约 1.1（318×353），
+     * 两者之间有巨大空档，3 倍这个门槛离两头都留了很宽的安全余量，不是贴着任何
+     * 一个样本的边界值凑出来的。
+     */
+    private const val MIN_STRIP_ASPECT_RATIO = 3f
 
     /**
      * 传入一页原始抽取出的图片列表，识别出"等宽切片"模式就返回拼接后的单张图片
@@ -55,6 +74,7 @@ object ImageStripStitcher {
         if (body.any { it.width != bodyWidth }) return images
         val last = images.last()
         if (last.width > bodyWidth) return images
+        if (height < bodyWidth * MIN_STRIP_ASPECT_RATIO) return images
 
         val totalWidth = bodyWidth * body.size + last.width
         val combined = Bitmap.createBitmap(totalWidth, height, Bitmap.Config.ARGB_8888)

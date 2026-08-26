@@ -192,6 +192,52 @@ class TableGridDetectorTest {
         )
     }
 
+    // ---- 横竖跨度比例检查：2026-08-26 加上，见类 KDoc 对应小节 ----
+
+    @Test
+    fun `董事简介卡片的照片边框+姓名标签+职位标题栏 不构成表格（真机第三次误判反例）`() {
+        // 真机反馈的"Board of Directors"页真实坐标简化版：3 张董事简介卡片，
+        // 每张卡片有照片边框+姓名标签（竖向排列，X 跨度窄，约 150pt）、职位标题栏
+        // （横向排列，X 跨度宽，约 511pt）——两批线段的 Y 范围有重叠（都在同一页
+        // 从上到下排布），横竖线数都够，但视觉上根本不是同一个表格，只是巧合
+        // 落在同一块区域。
+        val segments = mutableListOf<LineSegment>()
+        // 3 张卡片的照片边框+姓名标签：X 跨度固定在 42~192（窄）。
+        for (blockTop in listOf(89f, 301f, 513f)) {
+            val nameTagBottom = blockTop + 30f
+            val frameBottom = blockTop + 183f
+            segments.add(LineSegment(42f, blockTop, 192f, blockTop)) // 姓名标签上边
+            segments.add(LineSegment(192f, blockTop, 192f, nameTagBottom)) // 姓名标签右边
+            segments.add(LineSegment(192f, nameTagBottom, 42f, nameTagBottom)) // 姓名标签下边
+            segments.add(LineSegment(42f, nameTagBottom, 42f, blockTop)) // 姓名标签左边
+            segments.add(LineSegment(42f, blockTop + 16f, 192f, blockTop + 16f)) // 照片边框上边
+            segments.add(LineSegment(192f, blockTop + 16f, 192f, frameBottom)) // 照片边框右边
+            segments.add(LineSegment(192f, frameBottom, 42f, frameBottom)) // 照片边框下边
+            segments.add(LineSegment(42f, frameBottom, 42f, blockTop + 16f)) // 照片边框左边
+            // 职位标题栏：X 跨度延伸到 553（宽，远超上面竖线的 42~192 范围）。
+            segments.add(LineSegment(68f, blockTop + 159f, 553f, blockTop + 159f))
+            segments.add(LineSegment(68f, blockTop + 159f, 68f, blockTop + 183f))
+            segments.add(LineSegment(68f, blockTop + 183f, 553f, blockTop + 183f))
+        }
+
+        assertFalse(TableGridDetector.looksLikeTable(segments))
+    }
+
+    @Test
+    fun `横竖跨度比例超过2倍时不构成表格 略低于2倍时仍判定为表格`() {
+        // 竖线 X 跨度 100（0~100），横线 X 跨度 201（0~201）——刚好超过 2 倍。
+        val overRatio = mutableListOf<LineSegment>()
+        for (y in listOf(0f, 50f, 100f)) overRatio.add(LineSegment(0f, y, 201f, y))
+        for (x in listOf(0f, 50f, 100f)) overRatio.add(LineSegment(x, 0f, x, 100f))
+        assertFalse(TableGridDetector.looksLikeTable(overRatio))
+
+        // 横线 X 跨度 199——刚好不到 2 倍，应该仍判定为表格。
+        val underRatio = mutableListOf<LineSegment>()
+        for (y in listOf(0f, 50f, 100f)) underRatio.add(LineSegment(0f, y, 199f, y))
+        for (x in listOf(0f, 50f, 100f)) underRatio.add(LineSegment(x, 0f, x, 100f))
+        assertTrue(TableGridDetector.looksLikeTable(underRatio))
+    }
+
     @Test
     fun `looksLikeTable 和 tableRegionOrNull 的判断结果永远一致`() {
         // 两者共享同一套判断逻辑，不应该出现"looksLikeTable 说是表格，

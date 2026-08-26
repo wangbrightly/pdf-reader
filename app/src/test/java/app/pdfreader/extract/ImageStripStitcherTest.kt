@@ -72,4 +72,26 @@ class ImageStripStitcherTest {
         assertEquals(400, result.single().width)
         assertEquals(600, result.single().height)
     }
+
+    /**
+     * 见类 KDoc"判断标准"第 4 条完整背景：真机反馈"Board of Directors"页误判——
+     * 10 张董事头像（真机确认过的真实尺寸 318×353，高宽比约 1.1）同时满足前 3 条
+     * 判断标准（≥3 张、等高、等宽），在加高宽比门槛之前会被误判成"切片"，10 个人
+     * 的照片被强行拼接成一张 3180×353 的宽图。这条测试直接照抄真机尺寸，不能拼接。
+     */
+    @Test
+    fun `多张同尺寸但接近正方形的证件照不拼接，原样返回（Board of Directors 真机反例）`() {
+        val images = (0 until 10).map { bitmap(318, 353) }
+        assertSame(images, ImageStripStitcher.stitchIfTiled(images))
+    }
+
+    @Test
+    fun `高宽比刚好等于门槛时仍然拼接，略低于门槛时不拼接`() {
+        val atThreshold = (0 until 3).map { bitmap(100, 300) } // 300/100 = 3，等于 MIN_STRIP_ASPECT_RATIO。
+        val atResult = ImageStripStitcher.stitchIfTiled(atThreshold)
+        assertEquals(1, atResult.size)
+
+        val belowThreshold = (0 until 3).map { bitmap(100, 299) } // 299/100 < 3。
+        assertSame(belowThreshold, ImageStripStitcher.stitchIfTiled(belowThreshold))
+    }
 }
