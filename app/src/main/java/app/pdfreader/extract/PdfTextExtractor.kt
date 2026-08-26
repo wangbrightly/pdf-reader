@@ -499,7 +499,7 @@ object PdfTextExtractor {
     }
 
     /**
-     * NOTES.md #43：[decodeCmykJpegOrNull] 拆成两半——这一半只碰 [PDImage]（读字节、
+     * NOTES.md #41：[decodeCmykJpegOrNull] 拆成两半——这一半只碰 [PDImage]（读字节、
      * 查真实分量数、算是否超像素上限），是"必须留在 documentLock 里"的部分；另一半
      * [decodeCmykJpegExtraction] 只碰这里返回的 [CmykJpegExtraction]（一份已经复制
      * 出来的 [ByteArray] 和几个 Int/Boolean），不再碰任何 `PDDocument`/`COSStream`，
@@ -1677,7 +1677,7 @@ object PdfTextExtractor {
         page: PDPage,
         private val decodeImages: Boolean,
         /**
-         * NOTES.md #43：真机反馈"多页排队时好几个圈圈同时转，解码本身还是慢"——
+         * NOTES.md #41：真机反馈"多页排队时好几个圈圈同时转，解码本身还是慢"——
          * 追到根子是 [Session.documentLock] 把整页处理（含图片解码）全锁住，
          * `PdfPageAdapter` 的线程池形同虚设，多页没法真正并发解码。[JpegDecoder
          * .decode] 是纯函数（只读一份已经复制出来的 [ByteArray]，不碰任何
@@ -1767,6 +1767,50 @@ object PdfTextExtractor {
          */
         var hasFullPageImage = false
             private set
+
+        /**
+         * 2026-08-26 真机反馈修复：一份 Internet Archive 扫描书（LuraDocument 产出，
+         * 每页是一张 JPEG2000/JPX 编码的扫描背景图 + 真实可读的文字层，不是上面
+         * [hasFullPageImage] KDoc 描述的"OCR 乱码"那种情况）真机复现"翻开一页，
+         * 什么都没有"——追出根因：这台设备解不了 JPX（PDFBox-Android 需要额外的
+         * 可选组件 `com.gemalto.jp2:jp2-android`，抛
+         * `MissingImageReaderException: JP2Android is not installed`；这个组件
+         * 2026-08-26 核实过已经不可用——原发布仓库 JCenter 早已关停，Maven Central
+         * 没有这个坐标，JitPack 对这个库全部版本构建都失败，不是"没引入"，是目前
+         * 找不到可靠来源引入，添加 JPX 解码支持这件事本身单独评估，这次没有做），
+         * 图片解码失败、真正的文字又被 [hasFullPageImage] 那条规则错误隐藏——两个
+         * "各自合理"的处理叠在一起，变成用户完全看不到任何内容。
+         *
+         * 根因是 [hasFullPageImage] 判断"要不要隐藏文字"只看**几何**（这张图有没有
+         * 摆成占满全页的样子），不看**这张图到底有没有解码成功**——对真机原本那次
+         * 反馈（图片能正常解码，文字是解码失败的 OCR 乱码）这个判断是对的；但对
+         * 这次的新场景（图片解码失败，文字是真实可读内容）这个判断反而是错的，
+         * 会把整页仅剩的真实内容也一起清空。改成看"这次遍历有没有真的成功解码出
+         * 一张满足占满全页条件的图片"（[PageContentStreamEngine.addRealImage] 里
+         * 维护，只有真正解出像素内容才算，占位图/解码失败不算）——图片解码成功
+         * 时维持原有行为（隐藏文字，展示图片），图片解码失败时改成展示文字（总比
+         * 什么都没有强，即使这份文字偶尔真的是低质量 OCR 乱码，也比空白页有用）。
+         *
+         * 注意跟 [hasFullPageImage] 是两个不同用途的字段，不要合并：[hasFullPageImage]
+         * 是纯几何信号，给 NOTES #39 的"整页图片优先于表格检测"那条判断用，改成
+         * 依赖解码成功与否会让判断结果依赖解码耗时/成败这种运行时细节，没必要also
+         * 让表格检测分支承担这个复杂度；这里新增的字段只影响"要不要隐藏文字"这一
+         * 个更窄的决定。
+         */
+        var fullPageImageDecoded = false
+            private set
+
+        /**
+         * 见 [fullPageImageDecoded] KDoc——真正解出像素内容（不是占位图）时统一走
+         * 这里，替代直接调 `addImage(orientImage(...))`：多一步顺便判断这张图是否
+         * 满足"占满全页"，满足就标记 [fullPageImageDecoded]。占位图（JBIG2/CMYK
+         * 解码器明确拒绝的情况）不应该调用这个函数——占位图不代表真的展示了原图
+         * 内容，不该让文字被隐藏。
+         */
+        private fun addRealImage(bitmap: Bitmap, ctm: PdfMatrix, isFullPageCoverage: Boolean) {
+            addImage(orientImage(bitmap, ctm))
+            if (isFullPageCoverage) fullPageImageDecoded = true
+        }
 
         /**
          * 2026-08-20 真机反馈修复：一份矢量图形极端密集的文档（地图/图表类扫描件）
@@ -1863,16 +1907,21 @@ object PdfTextExtractor {
             // "占满全页"。放在 decodeImages=false 的扫描阶段也要算（不依赖后面
             // decodeImages=true 那趟才做的真正解码），这样表格检测那趟扫描就能拿到
             // 结果，不用等到真正解码图片才知道。
-            if (pageWidth > 0f && pageHeight > 0f) {
+            //
+            // 2026-08-26 真机反馈修复：这个几何判断（`isFullPageCoverage`）只回答
+            // "这张图有没有摆成占满全页的样子"，不代表这张图真的解码成功了——
+            // 见 [fullPageImageDecoded] KDoc，`hasFullPageImage` 这个字段的语义
+            // 保持不变（纯几何，供表格检测优先级判断用，见 NOTES #39），只是这里
+            // 把这次判断结果存进局部变量，供本函数后面判断"要不要计入
+            // fullPageImageDecoded"复用，不用重新算一遍 CTM。
+            val isFullPageCoverage = pageWidth > 0f && pageHeight > 0f && run {
                 val ctm = graphicsState.currentTransformationMatrix
                 val renderedWidth = abs(ctm.scaleX)
                 val renderedHeight = abs(ctm.scaleY)
-                if (renderedWidth / pageWidth >= FULL_PAGE_IMAGE_COVERAGE_RATIO &&
+                renderedWidth / pageWidth >= FULL_PAGE_IMAGE_COVERAGE_RATIO &&
                     renderedHeight / pageHeight >= FULL_PAGE_IMAGE_COVERAGE_RATIO
-                ) {
-                    hasFullPageImage = true
-                }
             }
+            if (isFullPageCoverage) hasFullPageImage = true
             if (!decodeImages) return
             // 2026-08-20 修复 NOTES.md #19（花屏），2026-08-21 改成真正解码而不是
             // 跳过：PdfBox-Android 的 SampledImageReader.getRGBImage 只有
@@ -1903,7 +1952,7 @@ object PdfTextExtractor {
                 val jbig2Bitmap = decoded.getOrNull()
                 if (jbig2Bitmap != null) {
                     val ctm = graphicsState.currentTransformationMatrix
-                    addImage(orientImage(jbig2Bitmap, ctm))
+                    addRealImage(jbig2Bitmap, ctm, isFullPageCoverage)
                 } else {
                     // **不调用 orientImage**（2026-08-22 真机反馈修复）：占位图是
                     // 我们自己现画的提示文字，不是原图片的像素内容——CTM 朝向
@@ -1923,7 +1972,7 @@ object PdfTextExtractor {
                 val manuallyDecoded = manualResult.getOrNull()
                 if (manuallyDecoded != null) {
                     val ctm = graphicsState.currentTransformationMatrix
-                    addImage(orientImage(manuallyDecoded, ctm))
+                    addRealImage(manuallyDecoded, ctm, isFullPageCoverage)
                 } else {
                     // 临时诊断："有的图片干脆不出现"——先确认是不是命中了这条手动解码
                     // 失败、没有任何回退的分支，顺带记下实际字节数，方便跟
@@ -1957,6 +2006,12 @@ object PdfTextExtractor {
                 if (extraction != null) {
                     val ctm = graphicsState.currentTransformationMatrix.clone()
                     imageResults.add(PageImageResult.Pending(PendingCmykJob(extraction, ctm, pageRotation)))
+                    // 见 [fullPageImageDecoded] KDoc——这里是乐观假设：CMYK/YCCK 解码
+                    // 绝大多数情况会成功（范围外数据才会被拒绝，真机数据里是少数），
+                    // 锁外真正解码失败的极端情况这次不做更精细的事后撤销处理，維持
+                    // "先假设会成功"这个简单实现，跟 deferCmykDecode 本身"乐观推迟"
+                    // 的设计精神一致。
+                    if (isFullPageCoverage) fullPageImageDecoded = true
                     return
                 }
                 // extraction == null：不是 4 分量 CMYK/YCCK JPEG，走下面的通用路径，
@@ -1968,10 +2023,11 @@ object PdfTextExtractor {
                     if (cmykResult.decoded) {
                         // 真正解出来的原始像素内容，跟其它正常图片一样走两层朝向修正。
                         val ctm = graphicsState.currentTransformationMatrix
-                        addImage(orientImage(cmykResult.bitmap, ctm))
+                        addRealImage(cmykResult.bitmap, ctm, isFullPageCoverage)
                     } else {
                         // 解码器明确拒绝（范围外数据）：占位图不走朝向修正，理由跟
-                        // JBIG2 占位图一样（见下面 JBIG2 分支的注释）。
+                        // JBIG2 占位图一样（见下面 JBIG2 分支的注释），也不算
+                        // fullPageImageDecoded（占位图不是真的内容）。
                         addImage(cmykResult.bitmap)
                     }
                     return
@@ -1980,11 +2036,32 @@ object PdfTextExtractor {
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
             // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
             // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。
+            //
+            // 2026-08-26 真机反馈修复：原来 `pdImage.image` 失败时直接 `return`，
+            // 图片静默消失——真机撞到过 JPX（JPEG2000）编码的图片，PdfBox-Android
+            // 解不了会抛 `MissingImageReaderException`（需要额外的可选组件
+            // `com.gemalto.jp2:jp2-android`，2026-08-26 核实过这个组件已经找不到
+            // 可靠来源引入，见 [fullPageImageDecoded] KDoc），`runCatching` 吞掉这个
+            // 异常之后图片凭空消失，跟本类其它格式"解不出来就用诚实占位图"的一贯
+            // 处理不一致。改成失败时也展示占位图，不再静默消失——这个分支覆盖的
+            // 不只是 JPX，任何走到这里、`pdImage.image` 本身抛异常或返回不可用结果
+            // 的情况都会展示占位图，而不是只针对 JPX 特殊处理。
+            val nativeResult = runCatching { pdImage.image }
             val bitmap = decodeJpegWithNativeSubsampling(pdImage)
-                ?: runCatching { pdImage.image }.getOrNull()
-                ?: return
-            val ctm = graphicsState.currentTransformationMatrix
-            addImage(orientImage(bitmap, ctm))
+                ?: nativeResult.getOrNull()
+            if (bitmap != null) {
+                val ctm = graphicsState.currentTransformationMatrix
+                addRealImage(bitmap, ctm, isFullPageCoverage)
+            } else {
+                val reason = if (pdImage.suffix == "jpx") {
+                    "图片格式不支持（JPEG2000）"
+                } else {
+                    "图片格式不支持"
+                }
+                // 不调用 orientImage——占位图没有"原始方向"这个概念，理由跟上面
+                // JBIG2 占位图分支一致。
+                addImage(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, reason))
+            }
         }
 
         // 表格网格检测不关心裁剪区域、阴影填充，当无操作处理。
@@ -2235,7 +2312,7 @@ object PdfTextExtractor {
         // 扫描、文字抽取、表格整页渲染各一次），拆开加锁需要对每一处都判断"这段
         // 中间夹着的纯内存计算安不安全被打断"，出错代价高。
         //
-        // **2026-08-25/26 NOTES #43：CMYK/YCCK 图片的真正解码（[JpegDecoder.decode]）
+        // **2026-08-25/26 NOTES #41：CMYK/YCCK 图片的真正解码（[JpegDecoder.decode]）
         // 是唯一的例外，被挪到锁外面了**——真机反馈"多页排队时好几个圈圈同时转，
         // 解码本身还是慢"追出来的：documentLock 从 #36 起就是完全互斥的普通锁，
         // `PdfPageAdapter` 的线程池（当时 3 个线程）早就没有真正的并发收益，只剩
@@ -2331,11 +2408,17 @@ object PdfTextExtractor {
             // 变得少见，且真正的表格页（财务数字网格）通常不会同页夹带大幅 CMYK
             // 照片，这份代价换"每个有图片的页都省一次完整重新解析"，权衡起来划算。
             var scanHasFullPageImage = false
+            // 见 PageContentStreamEngine.fullPageImageDecoded KDoc——JBIG2/手动位深
+            // 解码这几条同步路径的成败已经在这次扫描里知道，deferCmykDecode=true
+            // 时 CMYK 是乐观假设"稍后会成功"（同一份 KDoc 说明过），不是精确值，
+            // 但这份精确度对"要不要隐藏文字"这个决定够用。
+            var scanFullPageImageDecoded = false
             var scanImageResults: List<PageImageResult> = emptyList()
             val scanResult = runCatching {
                 val engine = PageContentStreamEngine(page, decodeImages = true, deferCmykDecode = true)
                 engine.processPage(page)
                 scanHasFullPageImage = engine.hasFullPageImage
+                scanFullPageImageDecoded = engine.fullPageImageDecoded
                 scanImageResults = engine.imageResults
                 engine.segments to engine.hasImages
             }.getOrDefault(emptyList<LineSegment>() to false)
@@ -2419,13 +2502,19 @@ object PdfTextExtractor {
                 }
                 return PageLoadPhaseA.Complete(PageContent(blocks))
             }
-            // 见 PageContentStreamEngine.hasFullPageImage KDoc——图片占满全页时，
-            // 用户明确要求不显示旁边的文字（大概率是扫描工具自动加的隐藏 OCR
-            // 噪音文字，真机复现过"、飞、飞、总"这类反复出现几个常见字的乱码，
-            // 跟图片内容毫无关系）。只跳过整页文字，不影响表格分支（表格区域
-            // 本来就是裁剪成图，跟这里是两回事）。
+            // 见 PageContentStreamEngine.fullPageImageDecoded KDoc——图片占满全页
+            // **且真的解码成功**时，用户明确要求不显示旁边的文字（大概率是扫描
+            // 工具自动加的隐藏 OCR 噪音文字，真机复现过"、飞、飞、总"这类反复出现
+            // 几个常见字的乱码，跟图片内容毫无关系）。只跳过整页文字，不影响表格
+            // 分支（表格区域本来就是裁剪成图，跟这里是两回事）。
+            //
+            // 2026-08-26 改用 scanFullPageImageDecoded（不是 scanHasFullPageImage）：
+            // 真机反馈一份 JPX（JPEG2000）扫描书图片解码失败（这台设备解不了 JPX，
+            // 见该 KDoc），原来只看"有没有占满全页的图片"（纯几何，不管解码成不
+            // 成功）会把图解码失败、文字又被隐藏，变成整页空白——只有图片真的
+            // 解码成功时才隐藏文字，解码失败时展示文字，好歹不是空白页。
             val textBlocks = mutableListOf<DisplayBlock>()
-            if (!scanHasFullPageImage) {
+            if (!scanFullPageImageDecoded) {
                 filtered.forEachIndexed { index, paragraph ->
                     textBlocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
                 }

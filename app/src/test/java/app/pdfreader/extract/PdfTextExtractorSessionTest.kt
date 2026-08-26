@@ -239,6 +239,70 @@ class PdfTextExtractorSessionTest {
     }
 
     /**
+     * NOTES.md #43：真机反馈一份 Internet Archive 扫描书（LuraDocument 产出，
+     * 每页是 JPEG2000/JPX 编码的扫描背景图 + 真实可读的文字层）真机复现"翻开
+     * 一页，什么都没有"——追出根因：这台设备解不了 JPX（需要额外的可选组件
+     * `com.gemalto.jp2:jp2-android`，2026-08-26 核实过原发布仓库 JCenter 已关停、
+     * Maven Central 没有这个坐标、JitPack 全部版本构建失败，添加 JPX 支持单独
+     * 评估，这次没做），图片解码失败、文字又被"图片占满全页时不显示文字"那条
+     * 规则错误隐藏——两个"各自合理"的处理叠在一起变成空白页。
+     *
+     * 这条测试用上面"占满全页时不显示旁边的文字"同样的构造方式，但把图片换成
+     * 解码会失败的损坏图片（借用 [PdfTextExtractorImageTest] 里验证过的手法：
+     * `COSStream` 一个字节都不写，`PDImageXObject.isEmpty()` 命中，`getImage()`
+     * 直接抛 `IOException`）——验证图片解码失败时改成展示文字（不是隐藏），
+     * 同时展示一张诚实的占位图（不是让图片凭空消失）。
+     */
+    @Test
+    fun `占满全页的图片解码失败时展示文字而不是空白页（真机JPX反例）`() {
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+        val document = PDDocument()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight))
+        document.addPage(page)
+
+        val cosStream = document.document.createCOSStream()
+        cosStream.createOutputStream().close()
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.TYPE, com.tom_roush.pdfbox.cos.COSName.XOBJECT)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.SUBTYPE, com.tom_roush.pdfbox.cos.COSName.IMAGE)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.WIDTH, 931)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.HEIGHT, 1250)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.BITS_PER_COMPONENT, 8)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.COLORSPACE, com.tom_roush.pdfbox.cos.COSName.DEVICERGB)
+        val corruptImage = com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject(
+            com.tom_roush.pdfbox.pdmodel.common.PDStream(cosStream),
+            com.tom_roush.pdfbox.pdmodel.PDResources(),
+        )
+
+        val stream = PDPageContentStream(document, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("real book text")
+        stream.endText()
+        // 图片铺满整个页面，跟"占满全页时不显示旁边的文字"那条测试同一个构造方式，
+        // 只是这张图解码会失败。
+        stream.drawImage(corruptImage, 0f, 0f, pageWidth, pageHeight)
+        stream.close()
+
+        val file = File.createTempFile("full-page-broken-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.save(file)
+        document.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue(
+                "图片解码失败时应该展示文字，不是空白页，实际 blocks=$blocks",
+                blocks.any { it is DisplayBlock.Text },
+            )
+            assertTrue("应该展示一张占位图，不是让图片凭空消失", blocks.any { it is DisplayBlock.Image })
+        }
+    }
+
+    /**
      * NOTES.md #38/#39：真机年报封面页被 [TableGridDetector.tableRegionOrNull]
      * 误判成表格——封面是设计感很强的一页，色块/装饰线条凑巧命中"≥3 横线+≥3
      * 竖线、边界框重叠"这条本来是为真表格设计的判定条件，结果整页图片被裁剪成

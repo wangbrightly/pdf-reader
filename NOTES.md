@@ -1682,3 +1682,85 @@ bug"——第一次以为 YCCK 反色的锅还没背完，装机验证发现最�
 是排版阶段把多张正确的图错误合成/裁剪了。逐层拆开验证（先信字节，
 再信单张解码结果，再信最终显示效果）比一开始就假设"还是那个 bug"
 更快找到真正的两个独立根因。
+
+**勘误**：#41 提交时代码注释里多处错写成"NOTES #43"（当时 NOTES.md 还
+没有 #43 这个条目），这次写 #43 之前顺手改成了正确的 #41——纯文档准确性
+修正，不影响任何行为，代码本身没有改动。
+
+## 43. 已修：另一份文件"打开了但没有内容"——JPX（JPEG2000）图片解码失败+"图片占满全页时隐藏文字"这条规则叠加，变成整页空白
+
+**背景**：用户反馈另一份文件打不开，追问后确认是"打开了，但没有内容"——
+跟 Board of Directors 那次表面症状（发黑）不同，这次是彻底空白。
+
+### 定位：字节层面完全正常，PDFBox 自己的 stripper 也能抽出真实文字
+
+真机拉回文件分析：`pdfinfo` 显示这是 Internet Archive 扫描的老书
+（《Quality Function Deployment》，`Producer: Recoded by LuraDocument
+PDF v2.68`），`pdftotext` 能抽出 50 万字符的真实正文，不是没有文字层。
+写了一个临时 JVM 测试直接调用 `Session.loadPage`，确认 `blocks=0`——
+逐层加诊断日志网格排查：`LineCollectingStripper.writeString` 确认真的
+收集到 29 行真实文字（"Originally published as..."这类版权页正文），
+`linesToParagraphs` 也确认正常产出 19 个段落，`RunningFooterFilter`
+也没有过滤掉任何东西——问题出在更下游：`scanHasFullPageImage=true`，
+命中了 NOTES #21 那条"图片占满全页时不显示旁边文字"的规则，把这 19 个
+真实段落全部清空了。
+
+### 真正的根因：这台设备解不了 JPX（JPEG2000），但错误规则把仅剩的真内容也清空了
+
+`pdfimages -list` 确认这一页嵌了 JPX（JPEG2000）编码的扫描背景图。
+装机诊断确认 `pdImage.image` 抛出 `com.tom_roush.pdfbox.filter
+.MissingImageReaderException: Cannot read JPX image: JP2Android is
+not installed`——PDFBox-Android 官方就有一个专门配套的可选组件
+（`com.gemalto.jp2:jp2-android`）支持 JPX，不是需要从零手写解码器
+（跟 CMYK/JBIG2 完全不是一个量级）。核实这个组件的可用性（`WebSearch`+
+`WebFetch` 查官方 issue/Maven 仓库，`curl` 直接探测 Maven Central）：
+原发布仓库 JCenter 早已关停（2021-2022），`repo1.maven.org` 上确认
+没有这个坐标（404），JitPack 对 `ThalesGroup/JP2ForAndroid` 全部
+版本/commit 的构建请求都返回 `Error`——添加 JPX 支持这件事本身目前
+找不到可靠的引入渠道，单独作为一个投入决策评估，这次没有做。
+
+真正的 bug 是两个"各自合理"的处理叠加产生的空白：
+1. JPX 解码失败，`pdImage.image` 抛异常，原来的代码在这里直接
+   `return`，图片静默消失（不展示占位图，也不留任何痕迹）。
+2. `hasFullPageImage` 判断"要不要隐藏文字"只看**几何**（这张图有没有
+   摆成占满全页的样子），不看**这张图有没有解码成功**——对 NOTES #21
+   原本那次真机反馈（图片能正常解码，文字是解码失败的 OCR 乱码）这个
+   判断是对的，但对这次的新场景（图片解码失败，文字反而是唯一的真实
+   可读内容）这个判断是错的，把整页仅剩的真实内容也一起清空了。
+
+### 修法：区分"这张图有没有摆成全页"和"这张图有没有真的解码成功"
+
+`PageContentStreamEngine` 新增 `fullPageImageDecoded` 字段，跟原有的
+`hasFullPageImage` 分开：`hasFullPageImage` 保持纯几何语义不变（继续
+给 NOTES #39"整页图片优先于表格检测"那条判断用，改动它的语义没必要，
+也会让表格分支承担额外的复杂度）；`fullPageImageDecoded` 只在真的成功
+解码出像素内容（不是占位图）时才置真，新增的 `addRealImage` 辅助函数
+统一处理"解码成功、走两层朝向修正、顺带判断是否计入 fullPageImageDecoded"
+这几件事。"要不要隐藏文字"这个决定改成看 `fullPageImageDecoded`（不是
+`hasFullPageImage`）——图片解码成功时维持原有行为（隐藏文字，展示图片），
+解码失败时改成展示文字，好歹不是空白页。
+
+顺带把"图片解码失败就静默消失"这条路径也改成跟 JBIG2/CMYK 解码失败
+一致的"展示诚实占位图"（`图片格式不支持（JPEG2000）`，对 JPX 之外的
+其它生成路径失败也统一给通用占位图文案）——这个改动让
+`PdfTextExtractorImageTest` 里一条断言"损坏图片被静默跳过"的旧测试
+需要更新（`content.images.size` 从 1 改成 2，多出来的是占位图），这是
+刻意的行为变化，不是回归，旧断言本来就是在验证一个不符合本类一贯方针
+（"不静默消失"）的旧行为。
+
+补了两条真机复现场景的回归测试：`占满全页的图片解码失败时展示文字而
+不是空白页`（用 `PdfTextExtractorImageTest` 里验证过的"空 COSStream 触发
+`IOException`"手法模拟 JPX 解码失败）、`PdfTextExtractorImageTest` 更新
+后的断言。
+
+**装机验证**：这份 Internet Archive 扫描书重新打开，之前空白的页面
+现在正常展示真实正文文字（"Using and Promoting Quality Charts..."）+
+一张"图片格式不支持（JPEG2000）"的诚实占位图，不再是空白页。全量单元
+测试 227 条零失败。
+
+**方法论**：这次教训是排查方法本身——遇到"某个变量的值不对"，不能只
+停在"这个变量确实是 true/false"就下结论，要往前一步问"这个变量的值
+本身是不是被正确定义的"。`hasFullPageImage=true` 这个诊断结果一开始
+看起来像是在确认"规则生效了"，实际上是在暴露"规则的判断依据本身不够
+精确"——几何摆放和解码成功是两件独立的事，这次是第一次在真机数据上
+撞见两者分歧的场景。

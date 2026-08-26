@@ -101,7 +101,7 @@ class SessionConcurrentLoadPageTest {
 
             val iterationsPerThread = 60
             // 2026-08-25/26：PdfPageAdapter.LOAD_POOL_SIZE 中间短暂改成过 1（见该
-            // 常量 KDoc"先改1隔天又改回3"一节），最终定在 3——NOTES #43 把图片
+            // 常量 KDoc"先改1隔天又改回3"一节），最终定在 3——NOTES #41 把图片
             // 解码挪到 documentLock 外面之后，3 个线程重新有了真实的并发收益。
             // 这里的 3 现在又对应真实池子大小了；即使以后又不对应，也应该继续
             // 保留至少这个量级的并发压力测试——真机数据损坏就是当年 3 线程并发

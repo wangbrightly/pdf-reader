@@ -97,11 +97,23 @@ class PdfTextExtractorImageTest {
         val brokenFile = buildDocumentWithOneValidAndOneCorruptImage()
 
         // 关键断言：即使页面资源里有一个解码会抛异常的损坏图片对象，extractContent
-        // 本身不能抛出去——必须整体返回，跳过坏的那张，留下好的那张。
+        // 本身不能抛出去——必须整体返回，好的那张正常解码，坏的那张展示占位图。
+        //
+        // **2026-08-26 断言更新**：这条测试原来断言 `content.images.size == 1`
+        // （损坏的那张被静默跳过、完全不出现）——真机反馈修复 JPX（JPEG2000）
+        // 图片解码失败"整页凭空消失"那次（见 NOTES 对应条目、
+        // [PdfTextExtractor.PageContentStreamEngine.fullPageImageDecoded] KDoc）
+        // 顺带把这条路径的"解码失败就静默丢弃"改成了跟 JBIG2/CMYK 解码失败一致的
+        // "展示诚实占位图"，这是刻意的行为变化，不是这次改动引入的回归——占位图
+        // 让用户至少知道"这里本该有一张图，只是解不出来"，比图片凭空消失更符合
+        // 本类一贯"不静默消失"的方针。断言相应从 1 张改成 2 张（正常图+占位图）。
         val content = PdfTextExtractor.extractContent(context, brokenFile)
 
-        assertEquals(1, content.images.size)
-        assertTrue(content.images.single().bitmap.width > 0)
+        assertEquals(2, content.images.size)
+        assertTrue(
+            "两张图片里应该有一张是正常解码的（宽度>0 且非占位图常见的极小尺寸）",
+            content.images.any { it.bitmap.width > 0 },
+        )
         assertEquals(listOf("normal paragraph"), content.paragraphs)
     }
 
