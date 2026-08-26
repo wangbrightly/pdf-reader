@@ -6,7 +6,9 @@ import android.graphics.Matrix
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.TypedValue
+import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -190,6 +192,8 @@ import kotlin.math.roundToInt
  */
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var fileNameLabel: TextView
+    private lateinit var topButtonRow: View
     private lateinit var openButton: Button
     private lateinit var tocButton: Button
     private lateinit var toggleSettingsButton: Button
@@ -213,6 +217,26 @@ class MainActivity : AppCompatActivity() {
 
     /** 见 [setupPageScrubber] KDoc"避免拖拽和自动同步互相打架"一节。 */
     private var isDraggingPageScrubber = false
+
+    /**
+     * 见 [setupCenterTapToggleScrubber] KDoc——用户点没点过屏幕中央来切换"沉浸模式
+     * 工具栏"（[topButtonRow]/[fileNameLabel]/[pageScrubberThumb]）的显隐，每次
+     * [render] 重置成 false（新一轮加载/新文档默认从隐藏开始）。
+     *
+     * 2026-08-26 用户反馈"文件名、三个菜单也设置成同右侧滑杆一样是隐藏的"——原来
+     * 这个字段只管翻页手柄，现在扩大到统一管这三样，语义从"手柄有没有被点开"变成
+     * "沉浸模式工具栏有没有被点开"，字段名跟着从 `scrubberRevealedByTap` 改成
+     * `chromeRevealedByTap`（`chrome` 是"内容之外的界面框架"这个意思的通用叫法）。
+     */
+    private var chromeRevealedByTap = false
+
+    /**
+     * 用户展没展开过设置面板（跟 [chromeRevealedByTap] 是两个独立的意图状态，
+     * 一起决定 [settingsPanel] 最终显不显示，见 [updateChromeVisibility] KDoc
+     * "settingsPanel"一节）。默认 `false`，跟 `activity_main.xml` 里
+     * `settingsPanel` 的 `android:visibility="gone"` 初始态保持一致。
+     */
+    private var settingsPanelExpanded = false
 
     /** 当前生效的阅读设置，onCreate 时从 [ReaderSettingsPreferences] 读，改动即时写回。 */
     private var currentSettings: ReaderSettings = ReaderSettings()
@@ -284,6 +308,11 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         applySystemBarInsetsAsPadding()
 
+        fileNameLabel = findViewById(R.id.fileNameLabel)
+        // marquee 跑马灯只在"选中态"才滚动，纯靠 XML 的 ellipsize="marquee" 不会
+        // 自己动，见 activity_main.xml fileNameLabel 节点 KDoc。
+        fileNameLabel.isSelected = true
+        topButtonRow = findViewById(R.id.topButtonRow)
         openButton = findViewById(R.id.openButton)
         tocButton = findViewById(R.id.tocButton)
         toggleSettingsButton = findViewById(R.id.toggleSettingsButton)
@@ -309,6 +338,7 @@ class MainActivity : AppCompatActivity() {
         syncSeekBars(currentSettings)
         setupSeekBarListeners()
         setupPageScrubber()
+        setupCenterTapToggleScrubber()
 
         openButton.setOnClickListener {
             openDocumentLauncher.launch(arrayOf("application/pdf"))
@@ -374,6 +404,12 @@ class MainActivity : AppCompatActivity() {
      */
     private fun loadPdf(uri: Uri, rememberAsLastOpened: Boolean = true) {
         currentUri = uri
+        // 用户反馈"三个菜单上面增加文件名"——一拿到 Uri 就立刻设置文本，不等文档
+        // 真正解析成功（哪怕最后打开失败，也让用户知道刚才点的是哪个文件）。
+        // 只设文本，不在这里直接改 visibility——马上要调的 render(Loading) 末尾会
+        // 调 updateChromeVisibility 统一算最终显不显示（要跟"沉浸模式有没有被
+        // 点开"配合判断），这里重复调一次没有意义。
+        fileNameLabel.text = queryDisplayName(uri)
         // 打开新文件前，先把当前正在显示的文件（如果有）的阅读进度存一次——"打开
         // 另一份 PDF"对上一份文件来说也是"离开"，不用等到 onPause 才存。必须在
         // render(Loading) 清空内容区之前算，不然当前页码已经没法读了。
@@ -484,6 +520,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 从 Uri 里取"给人看的文件名"——`content://` scheme（系统选择器/别的 App
+     * 分享过来的都是这种）本身不含文件名，要用 [ContentResolver] 查
+     * [OpenableColumns.DISPLAY_NAME]；查不到（理论上不该发生，防御性兜底）就退回
+     * Uri 最后一段路径。
+     *
+     * **`query()` 本身必须包一层 `runCatching`**——真机崩溃复现过：冷启动自动
+     * 恢复"上次打开的文件"时，如果那份文件是从系统相册选的（Uri 来自
+     * `MediaDocumentsProvider`），即使 [rememberLastOpenedUriPermission] 早就
+     * 持久化过读权限、[copyToCacheFile] 的 `openInputStream` 能正常读到内容，
+     * 单独对同一个 Uri 调 `query()` 仍然可能被拒（`SecurityException:
+     * requires that you obtain access using ACTION_OPEN_DOCUMENT`）——这是
+     * 部分 Provider（尤其 MediaProvider 包了一层 DocumentsProvider）对
+     * "持久授权覆盖 openFile 但不覆盖 query" 的已知不一致行为，不是这份代码
+     * 哪里没做对。查不到就跟"列名找不到"走同一条兜底路径，不能让整个 App
+     * 崩在这一行。
+     */
+    private fun queryDisplayName(uri: Uri): String {
+        if (uri.scheme == "content") {
+            runCatching {
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            }.getOrNull()?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0 && cursor.moveToFirst()) {
+                    return cursor.getString(nameIndex) ?: uri.lastPathSegment.orEmpty()
+                }
+            }
+        }
+        return uri.lastPathSegment.orEmpty()
+    }
+
     /** SAF 返回的 content:// Uri 不一定能直接当 File 打开，先拷贝到本 App 的缓存目录。 */
     private fun copyToCacheFile(uri: Uri): File {
         val input = contentResolver.openInputStream(uri)
@@ -532,20 +599,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 用户点"收起设置"/"展开设置"按钮：切换 [settingsPanel] 可见性，同步按钮文案。 */
+    /**
+     * 用户点"收起设置"/"展开设置"按钮：切换 [settingsPanelExpanded]，同步按钮
+     * 文案，实际显不显示交给 [updateChromeVisibility] 统一算（要跟"沉浸模式有
+     * 没有被收起"配合判断，见该函数 KDoc "settingsPanel" 一节）。
+     */
     private fun toggleSettingsPanel() {
-        if (settingsPanel.visibility == View.VISIBLE) collapseSettingsPanel() else expandSettingsPanel()
+        if (settingsPanelExpanded) collapseSettingsPanel() else expandSettingsPanel()
     }
 
     private fun collapseSettingsPanel() {
-        if (settingsPanel.visibility == View.GONE) return
-        settingsPanel.visibility = View.GONE
+        if (!settingsPanelExpanded) return
+        settingsPanelExpanded = false
         toggleSettingsButton.text = getString(R.string.settings_toggle_show)
+        updateChromeVisibility()
     }
 
     private fun expandSettingsPanel() {
-        settingsPanel.visibility = View.VISIBLE
+        settingsPanelExpanded = true
         toggleSettingsButton.text = getString(R.string.settings_toggle_hide)
+        updateChromeVisibility()
     }
 
     private fun setupSeekBarListeners() {
@@ -690,6 +763,10 @@ class MainActivity : AppCompatActivity() {
     private fun setupPageScrubber() {
         var lastScrubberTargetPage = -1
         pageScrubberTrack.setOnTouchListener { view, event ->
+            // 见 updateChromeVisibility KDoc——手柄隐藏时这条触摸靶区也跟着禁用
+            // （android:enabled="false"），一个普通 View 光靠 XML 的 enabled 属性
+            // 不会自动挡住已经注册的 setOnTouchListener 回调，要自己在回调里判断。
+            if (!view.isEnabled) return@setOnTouchListener false
             val pageCount = currentSession?.pageCount ?: return@setOnTouchListener false
             if (pageCount <= 1) return@setOnTouchListener false
             when (event.actionMasked) {
@@ -726,6 +803,92 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    /**
+     * 用户反馈"右侧滑杆改为隐藏式，点击中央才显示"——原来 [pageScrubberThumb]
+     * 只要是多页文档就一直显示，改成默认隐藏（[chromeRevealedByTap] 初始
+     * `false`），点击屏幕中央区域（[CENTER_TAP_ZONE_START]~[CENTER_TAP_ZONE_END]
+     * 那个矩形，不是"点哪都算"）切换显隐。
+     *
+     * 2026-08-26 再改：用户反馈"文件名、三个菜单设置成同右侧滑杆一样是隐藏的"——
+     * 同一个点击手势现在统一控制 [topButtonRow]/[fileNameLabel]/
+     * [pageScrubberThumb] 三样东西的显隐（"沉浸模式"，参照大多数阅读器 App
+     * "点屏幕中间呼出/收起工具栏"的常见交互），不再只管翻页手柄一个，具体的
+     * 显隐判断都收在 [updateChromeVisibility] 里。
+     *
+     * 用 [RecyclerView.addOnItemTouchListener] 而不是直接在 [recyclerView] 上设
+     * `setOnClickListener`——`RecyclerView` 本身的点击事件模型是"点在某个子
+     * item 上"（正文段落/图片各自是独立子 View），没有"点在空白区域"这种天然
+     * 语义。`OnItemTouchListener.onInterceptTouchEvent` 能在事件真正分发给任何
+     * 子 View 之前先"旁听"一遍原始坐标，配合 [GestureDetector] 识别"这是一次
+     * 单击、不是拖动/滚动/双指缩放"——`onInterceptTouchEvent` 全程返回 `false`
+     * （不拦截），正常的滚动手势、图片双指缩放（[ImageView.enablePinchZoom]）
+     * 都不受影响，`GestureDetector` 只是观察这些事件，不会消费掉它们。
+     */
+    private fun setupCenterTapToggleScrubber() {
+        val gestureDetector = GestureDetector(
+            this,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                    val centerXRange = recyclerView.width * CENTER_TAP_ZONE_START..recyclerView.width * CENTER_TAP_ZONE_END
+                    val centerYRange = recyclerView.height * CENTER_TAP_ZONE_START..recyclerView.height * CENTER_TAP_ZONE_END
+                    if (e.x in centerXRange && e.y in centerYRange) {
+                        chromeRevealedByTap = !chromeRevealedByTap
+                        updateChromeVisibility()
+                    }
+                    return false
+                }
+            },
+        )
+        recyclerView.addOnItemTouchListener(object : RecyclerView.SimpleOnItemTouchListener() {
+            override fun onInterceptTouchEvent(rv: RecyclerView, e: MotionEvent): Boolean {
+                gestureDetector.onTouchEvent(e)
+                return false
+            }
+        })
+    }
+
+    /**
+     * 统一算一次"沉浸模式的工具栏该不该显示"：[topButtonRow]（目录/打开 PDF/
+     * 设置三个按钮）、[fileNameLabel]、[settingsPanel]、[pageScrubberThumb] 四样
+     * 东西的显隐都在这里一次算完，[render] 每次状态变化都会调用（包括重置
+     * [chromeRevealedByTap] 为 `false`，新一轮加载/新文档默认从隐藏开始，不沿用
+     * 上一份文档"用户点开过工具栏"这个状态）。
+     *
+     * **[topButtonRow] 有一条例外**：还没有正在展示的文档时（`currentSession ==
+     * null`，冷启动/文档加载失败），无条件常驻显示，不受 [chromeRevealedByTap]
+     * 支配——不然用户连"打开 PDF"这个入口都点不到，没有办法开始使用这个 App。
+     * 只有确实有文档在看时，才真正进入"点击呼出"的沉浸模式。
+     *
+     * [fileNameLabel] 除了看 [chromeRevealedByTap]，还要看"这份文本是不是真的
+     * 有内容"（[TextView.getText] 非空）——[loadPdf] 里只设置文本，不直接改
+     * `visibility`（避免"设置面板收起但文件名还没查到"这种中间态被误显示出来）。
+     *
+     * **[settingsPanel]**：2026-08-26 用户反馈"点击屏幕中央，四个设置滑杆没有
+     * 隐藏"——原来 [collapseSettingsPanel]/[expandSettingsPanel] 直接读写
+     * `settingsPanel.visibility` 当"用户展没展开过设置面板"的唯一状态，这次改成
+     * 引入独立字段 [settingsPanelExpanded] 记这个意图，`settingsPanel` 最终显
+     * 不显示是"用户展开过"和"沉浸模式没收起"两个条件的交集——用户点屏幕中央
+     * 收起沉浸模式时，设置面板（即使当时是展开的）也跟着一起隐藏；再点一次
+     * 呼出时，如果 `settingsPanelExpanded` 还是 `true`，设置面板会跟着一起
+     * 恢复展开，不需要用户重新点一次"设置"按钮——这跟顶栏/文件名"呼出时原样
+     * 恢复"是同一个逻辑。
+     *
+     * [pageScrubberThumb] 隐藏时 [pageScrubberTrack] 的拖拽触摸靶区跟着一起禁用
+     * （`isEnabled=false`），不留"看不见但摸得到"的死角。
+     */
+    private fun updateChromeVisibility() {
+        val session = currentSession
+        val showChrome = chromeRevealedByTap || session == null
+        topButtonRow.visibility = if (showChrome) View.VISIBLE else View.GONE
+        fileNameLabel.visibility = if (showChrome && fileNameLabel.text.isNotEmpty()) View.VISIBLE else View.GONE
+        settingsPanel.visibility = if (showChrome && settingsPanelExpanded) View.VISIBLE else View.GONE
+
+        val pageCount = session?.pageCount ?: 0
+        val showScrubberThumb = chromeRevealedByTap && pageCount > 1
+        pageScrubberThumb.visibility = if (showScrubberThumb) View.VISIBLE else View.GONE
+        pageScrubberTrack.isEnabled = showScrubberThumb
+    }
+
     /** 把 [pageScrubberThumb] 挪到轨道纵向 [fraction]（0f-1f）对应的位置。 */
     private fun moveScrubberThumbTo(fraction: Float) {
         val trackHeight = pageScrubberTrack.height
@@ -745,16 +908,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun render(state: PdfLoadState) {
+        // 见 updateChromeVisibility KDoc——每次状态变化都重置成"没点过"，新一轮
+        // 加载/新文档默认从隐藏开始，不沿用上一份文档"用户点开过工具栏"这个状态。
+        chromeRevealedByTap = false
         when (state) {
             PdfLoadState.Idle -> {
                 progressBar.visibility = View.GONE
-                pageScrubberThumb.visibility = View.GONE
             }
 
             PdfLoadState.Loading -> {
                 progressBar.visibility = View.VISIBLE
                 recyclerView.adapter = null
-                pageScrubberThumb.visibility = View.GONE
             }
 
             is PdfLoadState.Success -> {
@@ -767,18 +931,16 @@ class MainActivity : AppCompatActivity() {
                         ::createImageView,
                     ) { currentSettings.blockSpacingDp }
                     restoreScrollPositionIfNeeded()
-                    // 只有一页的文档拖了也没意义，见 setupPageScrubber KDoc。
-                    pageScrubberThumb.visibility = if (session.pageCount > 1) View.VISIBLE else View.GONE
                     pageScrubberThumb.post { syncPageScrubberThumb() }
                 }
             }
 
             is PdfLoadState.Error -> {
                 progressBar.visibility = View.GONE
-                pageScrubberThumb.visibility = View.GONE
                 Toast.makeText(this, state.message, Toast.LENGTH_LONG).show()
             }
         }
+        updateChromeVisibility()
         syncTocButtonEnabled()
     }
 
@@ -1016,5 +1178,9 @@ class MainActivity : AppCompatActivity() {
 
         /** 见类注释"配置变化重建后恢复文档"一节。 */
         const val KEY_CURRENT_URI = "currentUri"
+
+        /** 见 [setupCenterTapToggleScrubber] KDoc——点击屏幕中央这块矩形区域（宽高各自 25%~75%）才切换翻页手柄显隐，不是点哪都算。 */
+        const val CENTER_TAP_ZONE_START = 0.25f
+        const val CENTER_TAP_ZONE_END = 0.75f
     }
 }

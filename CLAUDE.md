@@ -38,7 +38,15 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 
 ## `Session` 并发安全
 
-`PdfTextExtractor.Session` 内部有个 `documentLock`（`ReentrantLock(true)`，公平模式），`loadPage`/后台页脚学习线程/后台目录抽取线程全部互斥访问同一个 `PDDocument`——**改这块代码前一定要读 NOTES #33/#34/#36/#43**：`PDDocument` 不是"多读者安全"的资源，`loadPage` 之间并发访问会导致真实的数据损坏（不是理论风险，受控实验实锤过），读写锁的"多读者"模型在这里从设计上就是错的；公平性同样重要，非公平锁在后台线程高频重新加锁时会把 `loadPage` 饿死很久（真机复现过 18 秒卡顿）。**例外**：CMYK/YCCK 图片的真正解码（`JpegDecoder.decode`）从 NOTES #43 起被拆出锁外——它只读一份已经从 `PDImage` 复制出来的 `ByteArray`，不碰 `PDDocument`，多个 `loadPage` 调用可以真正并发解码；`PageContentStreamEngine` 的 `deferCmykDecode=true` 模式负责这个拆分（锁内只读字节，不调 `JpegDecoder.decode`），`PdfPageAdapter.LOAD_POOL_SIZE=3` 就是靠这个例外才有真实并发收益，不是单纯"抢锁"。
+`PdfTextExtractor.Session` 内部有个 `documentLock`（`ReentrantLock(true)`，公平模式），`loadPage`/后台页脚学习线程/后台目录抽取线程全部互斥访问同一个 `PDDocument`——**改这块代码前一定要读 NOTES #33/#34/#36/#43**：`PDDocument` 不是"多读者安全"的资源，`loadPage` 之间并发访问会导致真实的数据损坏（不是理论风险，受控实验实锤过），读写锁的"多读者"模型在这里从设计上就是错的；公平性同样重要，非公平锁在后台线程高频重新加锁时会把 `loadPage` 饿死很久（真机复现过 18 秒卡顿）。**例外**：CMYK/YCCK 图片的真正解码（`JpegDecoder.decode`）从 NOTES #43 起被拆出锁外——它只读一份已经从 `PDImage` 复制出来的 `ByteArray`，不碰 `PDDocument`，多个 `loadPage` 调用可以真正并发解码；`PageContentStreamEngine` 的 `deferCmykDecode=true` 模式负责这个拆分（锁内只读字节，不调 `JpegDecoder.decode`），`PdfPageAdapter.LOAD_POOL_SIZE=3` 就是靠这个例外才有真实并发收益，不是单纯"抢锁"。`loadPage` 另外多了个 `onTextReady` 回调（文字抽完立刻回调展示，不用等同页图片解码完），`PdfPageAdapter` 的加载队列从普通 FIFO 换成 `PriorityBlockingQueue`（当前可见页优先于预加载页），见 NOTES #44——这两处装机上验证过能正常工作，但"确实更快"这个体感结论没有拿真机 logcat 时间戳逐条量化过。
+
+## UI 视觉规范
+
+配色统一在 `colors.xml`（藏青蓝 `button_primary_bg` 是"字号"滑杆/主操作按钮的强调色；"行距"/"边距"/"段距"三个滑杆另有独立强调色 `accent_line_spacing`/`accent_padding`/`accent_block_spacing`，参照游戏音量滑杆截图"每条滑杆自己一个颜色"的设计，见 NOTES #46）。滑杆/翻页手柄的"旋钮"造型（实心圆+白色描边+抓握纹理）用 `VectorDrawable` 写死 `pathData`，不要用 `layer-list` 叠 `<shape>`——后者的 `<item>` 定位是"到边界的内边距"语义，摆不出"几条等间距线居中排列"这种效果；`VectorDrawable` 也不支持运行时传参染色（`tint` 会把多色 vector 里的白色描边一起染掉），4 种强调色对应 4 份独立的 thumb/track drawable 文件（`_purple`/`_coral`/`_teal` 后缀），见 NOTES #45/#46。
+
+**沉浸模式**（`MainActivity.updateChromeVisibility`）：点击屏幕中央区域（`CENTER_TAP_ZONE_START`~`END`）统一控制 `topButtonRow`（目录/打开 PDF/设置）、`fileNameLabel`、`settingsPanel`（4 个滑杆）、`pageScrubberThumb` 四样东西的显隐，`chromeRevealedByTap` + `settingsPanelExpanded` 两个独立状态的交集决定 `settingsPanel` 最终是否可见——**改这块前先读该函数 KDoc**，`topButtonRow` 在没有文档时（`currentSession == null`）有强制常驻显示的例外，不然用户点不到"打开 PDF"入口。
+
+**深色模式**：只在 `values-night/colors.xml` 覆盖 `label_text_emphasis`（文件名/滑杆标签的深色文字，唯一一处"写死颜色+可能坐在会变黑的背景上"的地方）——正文文字不设颜色、继承主题属性自动跟随；按钮/滑杆强调色画在自己的纯色块上、半透明灰背景本来就会随底色自动深浅，都不需要额外的 night 变体。遇到"深色模式下看不清"，不要先反应"关掉 forceDark"或"锁死 Light 主题"绕过去——先盘点 `colors.xml` 到底哪个颜色是真正需要变的，通常比想象中少，见 NOTES #47 完整教训（这条踩了两次弯路才找到正解）。
 
 ## 已知局限（如实告知过用户）
 

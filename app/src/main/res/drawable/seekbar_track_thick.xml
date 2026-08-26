@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    2026-08-26：用户参照游戏音量滑杆截图要求"横线加粗"——系统默认 SeekBar 的
+    轨道线很细（几 dp），配合已经放大过的旋钮（seekbar_thumb_knob.xml，36dp）
+    显得不协调，跟参考图里那种粗轨道差距明显。
+
+    进度（已过）部分用主题强调色 @color/button_primary_bg，剩余部分用半透明
+    中性灰（跟 bg_settings_panel.xml 同一个灰色语言），两端圆角——只用
+    android:progressDrawable 这一个属性接管轨道视觉，不影响 android:thumb
+    （旋钮）和触摸热区（SeekBar 本身的触摸判定跟 progressDrawable 的视觉粗细
+    无关）。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background">
+        <shape android:shape="rectangle">
+            <solid android:color="#33888888" />
+            <corners android:radius="4dp" />
+            <size android:height="8dp" />
+        </shape>
+    </item>
+    <item android:id="@android:id/progress">
+        <clip>
+            <shape android:shape="rectangle">
+                <solid android:color="@color/button_primary_bg" />
+                <corners android:radius="4dp" />
+                <size android:height="8dp" />
+            </shape>
+        </clip>
+    </item>
+</layer-list>

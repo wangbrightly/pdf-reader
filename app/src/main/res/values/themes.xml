@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools">
     <!--
         MainActivity 继承 AppCompatActivity，AppCompat 的 setContentView 硬性要求
         应用主题是 Theme.AppCompat（或其子类），否则 AppCompatDelegateImpl.createSubDecor
@@ -8,6 +8,24 @@
         真正走过 onCreate() 里 setContentView 这条路径，assembleDebug 编译成功不等于
         运行不崩，见 NOTES.md）。用 NoActionBar 变体是因为布局里没有设计 Toolbar，用带
         ActionBar 的变体会多一条没用的系统标题栏。
+
+        2026-08-26 用户反馈"文件名和拉杆标签在夜间模式自动变为反色"——先加了
+        `forceDarkAllowed=false`（关掉安卓系统"智能深色"对渲染结果做启发式反色的
+        猜测，只对它认为是"文字"的部分动手、不动写死颜色的背景 Drawable，容易造成
+        文字反色但背景没变的错位）。装机验证后错位确实消失了，但用户又反馈"文件名
+        和标签颜色是黑色，不易看清"——这才是更底层的第二个问题：`rootLayout` 本身
+        没有写 `android:background`，夜间模式下会露出 `Theme.AppCompat.DayNight`
+        自己的窗口背景（`android:windowBackground`，AppCompat 的 DayNight 委托
+        机制会把它切成深色/黑色，这是主题解析层面真的换了颜色，不是渲染猜测），黑色
+        窗口背景配我们写死的近黑色文字（`label_text_emphasis` `#DE000000`），就是
+        黑底黑字看不清。中途一度把父主题临时换成不跟随系统的 `Theme.AppCompat
+        .Light.NoActionBar` 让文字先能看清，但用户明确要求"设计系统深色模式，
+        干就完了"——于是改回 `DayNight`，正经建一份 `values-night/colors.xml`
+        覆盖需要跟着背景反色的颜色，而不是回避系统深色模式，完整方案见
+        `values-night/colors.xml` KDoc。`forceDarkAllowed=false` 继续保留——
+        我们自己已经手动做对了颜色，不需要系统再叠加一层猜测性质的启发式反色。
     -->
-    <style name="Theme.PdfReader" parent="Theme.AppCompat.DayNight.NoActionBar" />
+    <style name="Theme.PdfReader" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:forceDarkAllowed" tools:targetApi="q">false</item>
+    </style>
 </resources>

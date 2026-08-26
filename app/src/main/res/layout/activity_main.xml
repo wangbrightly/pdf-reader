@@ -47,22 +47,77 @@
     android:layout_height="match_parent"
     android:orientation="vertical"
     android:paddingHorizontal="16dp"
-    android:paddingTop="16dp"
+    android:paddingTop="8dp"
     android:paddingBottom="8dp">
 
+    <!--
+        2026-08-26 用户反馈"三个菜单上面增加文件名"——冷启动/没打开过文档时
+        没有文件名可显示，默认收起（gone），MainActivity.loadPdf 里一拿到 Uri
+        就设置文本并显示，不用等文档真正解析成功（哪怕最后打开失败，用户也想
+        知道刚才点的是哪个文件）。
+        单行 + 首部省略号——文件名比按钮行宽是常态，省略中间/末尾会看不出扩展名，
+        省略号放最前面能保留"最像是这份文档"的信息（通常是文件名末尾更有辨识度，
+        比如"XX年报-终稿.pdf"，开头往往是重复的项目代号）。
+
+        同日再改：用户反馈"不够醒目"+"上面空白太多"——文字从半透明浅灰
+        （#88888888）+13sp 改成 @color/label_text_emphasis（87% 不透明黑）+15sp+
+        加粗；`rootLayout` 的 `paddingTop` 从 16dp 降到 8dp（跟状态栏之间已经有
+        `applySystemBarInsetsAsPadding` 动态加的系统栏安全间距，这 16dp 是额外
+        叠加的固定留白，缩小它不会导致内容被状态栏盖住）。
+
+        同日再改：用户反馈"文件名过长只看到后半部分"——原来 `ellipsize="start"`
+        省略号放最前面只保留得了后半截，前面看不全。改成安卓标准的跑马灯滚动
+        （`ellipsize="marquee"` + `marqueeRepeatLimit="marquee_forever"`），
+        自动来回滚动展示完整文件名，不用二选一截哪一半。`focusable`+
+        `focusableInTouchMode` 是跑马灯生效的必要条件（不加的话这个 TextView
+        领不到焦点，marquee 动画不会启动）；另外还要在 Kotlin 里手动把
+        `isSelected` 设成 true——marquee 是"选中态"才滚动的效果，纯靠 XML
+        属性不会自己动，这是安卓 TextView 跑马灯最常踩的坑，见
+        MainActivity.onCreate/loadPdf。
+    -->
+    <TextView
+        android:id="@+id/fileNameLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp"
+        android:ellipsize="marquee"
+        android:marqueeRepeatLimit="marquee_forever"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
+        android:singleLine="true"
+        android:textSize="15sp"
+        android:textStyle="bold"
+        android:textColor="@color/label_text_emphasis"
+        android:visibility="gone" />
+
+    <!--
+        2026-08-26 用户反馈"文件名、三个菜单设置成同右侧滑杆一样是隐藏的"——加了
+        id 方便 MainActivity.updateChromeVisibility 控制这一整行的显隐，跟
+        fileNameLabel、pageScrubberThumb 一起纳入"点击屏幕中央呼出/收起"的沉浸
+        模式，见 MainActivity.setupCenterTapToggleScrubber KDoc。
+    -->
     <LinearLayout
+        android:id="@+id/topButtonRow"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal">
 
+        <!--
+            2026-08-26 美化：三个按钮统一去掉 AppCompat 默认的系统阴影
+            （stateListAnimator="@null"，那种默认阴影跟这个 App 其它地方"扁平、
+            半透明圆角"的视觉语言不搭），换上 bg_button_primary/secondary.xml
+            自定义背景，见 colors.xml 完整背景。
+        -->
         <Button
             android:id="@+id/tocButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:background="@drawable/bg_button_secondary"
             android:enabled="false"
             android:minHeight="52dp"
             android:minWidth="0dp"
             android:paddingHorizontal="16dp"
+            android:stateListAnimator="@null"
             android:text="@string/toc_button"
             android:textSize="14sp" />
 
@@ -72,8 +127,11 @@
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"
             android:layout_weight="1"
+            android:background="@drawable/bg_button_primary"
             android:minHeight="52dp"
+            android:stateListAnimator="@null"
             android:text="@string/open_pdf"
+            android:textColor="@color/button_primary_text"
             android:textSize="16sp" />
 
         <Button
@@ -81,14 +139,23 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"
+            android:background="@drawable/bg_button_secondary"
             android:minHeight="52dp"
             android:minWidth="0dp"
             android:paddingHorizontal="16dp"
+            android:stateListAnimator="@null"
             android:text="@string/settings_toggle_hide"
             android:textSize="14sp" />
 
     </LinearLayout>
 
+    <!--
+        2026-08-26 用户反馈"点击屏幕中央，四个设置滑杆没有隐藏"——纳入
+        MainActivity.updateChromeVisibility 统一控制的沉浸模式（跟 topButtonRow/
+        fileNameLabel/pageScrubberThumb 一起），初始态明确写 gone，跟 Kotlin 里
+        settingsPanelExpanded 默认 false 保持一致，不依赖 collapseSettingsPanel()
+        在 onCreate 里跑一次才收起（它现在只是个状态已经是收起时的空操作）。
+    -->
     <LinearLayout
         android:id="@+id/settingsPanel"
         android:layout_width="match_parent"
@@ -96,12 +163,22 @@
         android:layout_marginTop="16dp"
         android:background="@drawable/bg_settings_panel"
         android:orientation="vertical"
-        android:padding="12dp">
+        android:padding="12dp"
+        android:visibility="gone">
 
+        <!--
+            2026-08-26 用户反馈"标签不够醒目，标签和滑杆用不同颜色，参照游戏图"——
+            4 个标签统一加粗、换成 @color/label_text_emphasis（87% 不透明黑），
+            跟滑杆本身的藏青蓝强调色（seekbar_thumb_knob.xml 等）形成对比，呼应
+            参考图里"黑色加粗标签 + 鲜艳颜色滑杆"两者分明的层次。
+        -->
         <TextView
             android:id="@+id/fontSizeLabel"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content" />
+            android:layout_height="wrap_content"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/label_text_emphasis" />
 
         <SeekBar
             android:id="@+id/fontSizeSeekBar"
@@ -110,13 +187,17 @@
             android:min="12"
             android:max="32"
             android:progress="16"
-            android:thumb="@drawable/seekbar_thumb_large" />
+            android:progressDrawable="@drawable/seekbar_track_thick"
+            android:thumb="@drawable/seekbar_thumb_knob" />
 
         <TextView
             android:id="@+id/lineSpacingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="40dp" />
+            android:layout_marginTop="40dp"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/label_text_emphasis" />
 
         <SeekBar
             android:id="@+id/lineSpacingSeekBar"
@@ -125,13 +206,17 @@
             android:min="0"
             android:max="10"
             android:progress="2"
-            android:thumb="@drawable/seekbar_thumb_large" />
+            android:progressDrawable="@drawable/seekbar_track_thick_purple"
+            android:thumb="@drawable/seekbar_thumb_knob_purple" />
 
         <TextView
             android:id="@+id/paddingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="40dp" />
+            android:layout_marginTop="40dp"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/label_text_emphasis" />
 
         <SeekBar
             android:id="@+id/paddingSeekBar"
@@ -140,13 +225,17 @@
             android:min="8"
             android:max="32"
             android:progress="16"
-            android:thumb="@drawable/seekbar_thumb_large" />
+            android:progressDrawable="@drawable/seekbar_track_thick_coral"
+            android:thumb="@drawable/seekbar_thumb_knob_coral" />
 
         <TextView
             android:id="@+id/blockSpacingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="40dp" />
+            android:layout_marginTop="40dp"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textColor="@color/label_text_emphasis" />
 
         <SeekBar
             android:id="@+id/blockSpacingSeekBar"
@@ -155,7 +244,8 @@
             android:min="0"
             android:max="32"
             android:progress="12"
-            android:thumb="@drawable/seekbar_thumb_large" />
+            android:progressDrawable="@drawable/seekbar_track_thick_teal"
+            android:thumb="@drawable/seekbar_thumb_knob_teal" />
 
     </LinearLayout>
 
@@ -204,20 +294,47 @@
             手指不需要精确点在那个小圆点上，靠近右边缘任意位置按下/拖动都能触发，是
             常见阅读器快速翻页手柄的标准做法。本身透明，不画任何东西。
         -->
+        <!--
+            2026-08-26：跟 pageScrubberThumb 同一次改动——默认 enabled="false"，
+            手柄隐藏时这条触摸靶区也一起禁用，不留"看不见但摸得到"的死角，见
+            MainActivity.updateScrubberVisibility KDoc。
+        -->
         <View
             android:id="@+id/pageScrubberTrack"
             android:layout_width="40dp"
             android:layout_height="match_parent"
-            android:layout_gravity="end" />
+            android:layout_gravity="end"
+            android:enabled="false" />
 
-        <!-- 视觉上真正看到的滑条手柄，纵向位置由代码算出的 translationY 决定。 -->
+        <!--
+            视觉上真正看到的滑条手柄，纵向位置由代码算出的 translationY 决定。
+            2026-08-26 用户反馈"放到最右侧"——marginEnd 从 6dp 改成 0dp，贴着这个
+            FrameLayout 自己的右边缘。**注意**：这个 FrameLayout 外面还套着
+            rootLayout 的 android:paddingHorizontal="16dp"（整个内容列的左右
+            边距，见文件顶部类注释），所以手柄贴的是"内容列的右边缘"，不是屏幕
+            物理右边缘——真要贴到屏幕物理边缘，需要把手柄挪出这层 padding（比如
+            用负 margin 抵消，或者重新设计视图层级），这次只做了"这个容器内能做到
+            的最右"，如果不够右需要用户确认要不要动那层更大范围的 padding。
+        -->
+        <!--
+            2026-08-26 用户反馈"改为隐藏式，点击中央才显示"——默认 gone，
+            显隐完全交给 MainActivity.updateScrubberVisibility 控制（见该函数
+            KDoc），这里只是给"Kotlin 代码运行之前"这段时间定一个正确的初始态，
+            不依赖 render() 一定先跑过一次才不出现"冷启动闪现一下手柄"的问题。
+
+            同日再改：用户参照游戏音量滑杆截图要求"旋钮质感"——尺寸从 6dp×36dp
+            的窄条改成 32dp×32dp 的圆形（配合 page_scrubber_thumb_knob.xml），
+            marginEnd 仍是 0dp（贴内容列右边缘，见上面那条注释），moveScrubberThumbTo
+            用的是 view.height 实时读取，换尺寸不需要改任何拖拽定位的计算代码。
+        -->
         <View
             android:id="@+id/pageScrubberThumb"
-            android:layout_width="6dp"
-            android:layout_height="36dp"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
             android:layout_gravity="end|top"
-            android:layout_marginEnd="6dp"
-            android:background="@drawable/bg_page_scrubber_thumb" />
+            android:layout_marginEnd="0dp"
+            android:background="@drawable/page_scrubber_thumb_knob"
+            android:visibility="gone" />
 
         <!-- 拖拽过程中显示"第 X 页 / 共 Y 页"，松手后隐藏，见类注释。 -->
         <TextView

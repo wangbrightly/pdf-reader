@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    "目录"/"设置"这两个次要按钮的背景——沿用 bg_settings_panel.xml 那套半透明中性灰
+    圆角语言（浅色/深色主题通用，不用建 values-night），见 colors.xml 完整背景。
+
+    禁用态（"目录"按钮在文档没有大纲时会 enabled=false，见 MainActivity 类注释
+    "目录"一节：禁用态本身就足够说明"这份文档没有目录"，不额外弹提示）用更淡的
+    透明度，配合 Android 默认给禁用态文字调暗的行为，两者一起传达"这个按钮点不了"。
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false">
+        <shape android:shape="rectangle">
+            <solid android:color="#14888888" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#33888888" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+</selector>

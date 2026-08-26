@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        2026-08-26 用户反馈"美化顶部三个菜单"（目录/打开 PDF/设置）——原来是
+        AppCompat 默认按钮样式（纯灰色、直角、带系统默认阴影），跟设置面板里已经
+        建立的"半透明中性灰、圆角"视觉语言（见 bg_settings_panel.xml）不统一。
+
+        主色调选偏克制的藏青蓝，不用高饱和度的品牌色——这是个人工具类 App，不需要
+        品牌识别度，选一个安静、不跟阅读内容抢注意力的颜色，只用在"打开 PDF"这一个
+        主操作按钮上，跟"目录"/"设置"这两个次要按钮（继续用中性灰）拉开视觉层级。
+        深色/浅色模式共用同一个色值，不单独建 values-night——颜色本身饱和度和明度
+        都适中，两种主题背景下对比度都够，没有必要为这一个颜色单独维护一份深色版本。
+    -->
+    <color name="button_primary_bg">#3D5A80</color>
+    <color name="button_primary_text">#FFFFFF</color>
+
+    <!--
+        2026-08-26 用户参照一张游戏音量滑杆截图反馈"滑杆圆点太素，想要旋钮质感"——
+        实心圆外面加一圈白色描边、中间加抓握纹理（几条短线），见
+        seekbar_thumb_knob.xml / page_scrubber_thumb_knob.xml。
+    -->
+    <color name="button_thumb_ring">#D9FFFFFF</color>
+    <color name="button_thumb_grip">#99FFFFFF</color>
+
+    <!--
+        2026-08-26 用户反馈"文件名/4 个滑杆标签不够醒目"、"标签和滑杆用不同颜色，
+        参照游戏图"——参考图里标签是黑色加粗，滑杆本身是独立的鲜艳强调色，两者
+        明显区分。深色文字用 87% 不透明黑（Material Design 高强调正文的标准值），
+        不用纯黑（#000000 对比度过硬，跟 App 其它地方偏柔和的视觉语言不一致）。
+
+        这个值在 values-night/colors.xml 里有一份反色覆盖（87% 不透明白）——
+        这个 App 唯一需要按系统深色模式切换的颜色，完整背景见那份文件的 KDoc。
+    -->
+    <color name="label_text_emphasis">#DE000000</color>
+
+    <!--
+        2026-08-26 用户反馈"拉杆横线颜色不同"——参照游戏截图，"游戏音量"是紫色、
+        "话筒音量"是红色，每条滑杆有自己独立的强调色，不是全部统一一个颜色。
+        4 个设置滑杆各配一个：字号沿用 button_primary_bg（藏青蓝，跟"打开 PDF"
+        按钮保持一致，作为"主"滑杆的关联色），其余三个另选三个饱和度接近、
+        互相有区分度的颜色。VectorDrawable 不支持运行时传参染色（`android:tint`
+        对多色 vector 会把白色描边/抓握纹理一起染掉，破坏旋钮设计），所以每个
+        颜色对应一份单独的 track/thumb drawable 文件（seekbar_track_thick_*.xml /
+        seekbar_thumb_knob_*.xml），不是本该避免的重复——是这个具体约束下最简单
+        能用的办法。
+    -->
+    <color name="accent_line_spacing">#7C5CBF</color>
+    <color name="accent_padding">#D9607E</color>
+    <color name="accent_block_spacing">#2A9D8F</color>
+</resources>

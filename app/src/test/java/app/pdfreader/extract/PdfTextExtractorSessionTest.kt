@@ -422,6 +422,62 @@ class PdfTextExtractorSessionTest {
     }
 
     /**
+     * 用户真机反馈"想先看到当前页，不想等图片也解码完"——文字在锁内那段（Phase
+     * A）就已经算完，比图片解码（锁外那段）先就绪，`onTextReady` 让已经算好的
+     * 文字立刻交给调用方，不用等图片一起。这条测试验证：
+     * 1. `onTextReady` 只触发一次，携带的文字内容跟最终结果的文字部分一致。
+     * 2. `onTextReady` 在任何 `onImageReady` 之前触发（"文字先于图片就绪"这个
+     *    顺序保证，是这个功能存在的意义，不只是"两个回调都会触发"这么简单）。
+     */
+    @Test
+    fun `loadPage 文字算完立刻回调 且早于图片解码完成的回调`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("real paragraph text")
+        stream.endText()
+        // 图片只占一角（不到"占满全页"的比例），走 PendingImages 分支——这个
+        // 分支才会触发 onTextReady，见 Session.loadPage KDoc。
+        stream.drawImage(document.tinyImage(), 10f, 200f, 40f, 30f)
+        stream.close()
+
+        val file = File.createTempFile("text-then-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val callOrder = mutableListOf<String>()
+            var textReadyBlocks: List<DisplayBlock>? = null
+            val content = session.loadPage(
+                1,
+                onTextReady = { blocks ->
+                    callOrder.add("text")
+                    textReadyBlocks = blocks
+                },
+            ) { callOrder.add("image") }
+
+            assertEquals("onTextReady 应该只触发一次", 1, callOrder.count { it == "text" })
+            assertEquals("文字应该先于图片就绪", listOf("text", "image"), callOrder)
+            assertEquals(
+                "onTextReady 携带的文字应该跟最终结果的文字部分一致",
+                content.blocks.filterIsInstance<DisplayBlock.Text>(),
+                textReadyBlocks,
+            )
+        }
+    }
+
+    /**
      * 反例：图片只占页面一角（不是占满全页），旁边的文字应该正常保留——防止
      * `hasFullPageImage` 判断误伤"图文混排、图片本来就不大"这种正常场景。
      */

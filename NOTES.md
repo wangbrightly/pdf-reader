@@ -1764,3 +1764,260 @@ not installed`——PDFBox-Android 官方就有一个专门配套的可选组件
 看起来像是在确认"规则生效了"，实际上是在暴露"规则的判断依据本身不够
 精确"——几何摆放和解码成功是两件独立的事，这次是第一次在真机数据上
 撞见两者分歧的场景。
+
+## 44. 已改：加载体验——文字抽完立刻回调展示、当前可见页优先于预加载页
+
+**背景**：用户问了两个问题——"加载方式是一页一页还是几页同时加载？"
+以及"为什么会出现几个圆圈同时在转？"。追问目的，用户澄清真实诉求跟
+字面问题不一样："目的是减少加载时间，最起码可以先看到一个页面立马
+出现"，后面又补一条"优先加载当前页面"。
+
+### 问题一：一页的文字和图片绑在一起回调，图片没解完文字也看不到
+
+`PdfTextExtractor.Session.loadPage` 原来的 `onImageReady` 回调（NOTES
+#41 引入，图片边解码边展示）只覆盖了图片，文字块要等**这一页所有图片
+都解码完**才会一起通过返回值交给调用方。一页字多图少还好，字少图多
+（尤其是那种整页扫描图+少量真实文字混排的文档）时，用户盯着转圈的
+时间大半花在等图解码，而其实文字早就抽完了。
+
+**修法**：`loadPage` 加一个新的可选回调参数 `onTextReady`，在
+`loadPageLockedPhaseA` 跑完（拿到全部 `DisplayBlock.Text`）就立刻调用，
+不等后续图片解码——`PdfPageAdapter` 收到这个回调就先把文字渲染上屏，
+图片解码完再用已有的 `onImageReady` 追加。补了一条测试专门验证时序：
+`onTextReady` 只调一次，且严格早于 `onImageReady`。
+
+### 问题二：几个圆圈同时转，是三个并发解码任务各自的 loading 占位符
+
+`LOAD_POOL_SIZE=3`（NOTES #41 定的并发度）意味着最多同时有 3 个页面
+在解码，每个页面加载完成前都会显示自己的转圈占位符——这不是 bug，是
+预加载机制的正常表现（提前解码后面几页，翻页时能秒出），但用户观感
+上"好几个圈同时转"容易被误读成故障。解释清楚之后，用户真正的诉求是
+"当前正在看的这页应该比预加载的后面几页更快出结果"，这不是解释能
+解决的，得改调度顺序。
+
+**修法**：`ThreadPoolExecutor` 原来接的是普通 `LinkedBlockingQueue`
+（先进先出，跟可见性无关），换成 `PriorityBlockingQueue` + 自定义
+`PrioritizedLoadTask`（实现 `Comparable`）——优先级 = 这一页跟当前
+第一/最后一个可见 item 的距离（`RecyclerView.LayoutManager` 实时查，
+主线程读，因为 `onBindViewHolder` 本身就在主线程），距离越小优先级
+越高；距离相同再按提交顺序（`AtomicLong` 递增）保证同等优先级下先来
+先服务，不是随机乱序。这样即使 3 个线程都在忙着解后面几页，只要当前
+页的任务一提交，会插到队列前面尽快被下一个空出来的线程捡走，不用等
+前面几个预加载任务按提交顺序排队排到它。
+
+**未装机做严格计时验证**：改动本身编译通过、单元测试覆盖了文字/图片
+回调时序，真机上装过、能正常翻页，但"当前页确实更快出结果"这个体感
+结论没有拿 logcat 时间戳逐条对比验证过，只是代码逻辑上应该成立——
+如果日后翻页体感异常，`PrioritizedLoadTask.priority` 的计算或者
+`visibleDistance` 的调用时机是最先该复查的地方。
+
+## 45. 已改：UI 美化——按钮/滑杆换色换形，右侧翻页手柄改成点击中央才出现，加文件名
+
+**背景**：一连串用户反馈，同一个方向上分好几次加码：先是"把右侧滑杆
+放到最右侧"+"美化顶部的三个菜单"，确认满意后追加"4 个设置滑杆也
+优化一下"，然后"右侧滑杆也优化颜色，使其显眼"，然后"右侧滑杆改为
+隐藏式，点击中央才显示"，最后参照一张游戏音量滑杆的截图要求"滑杆
+圆点改成旋钮质感（外圈描边+中间抓握纹理）"，同一次追加"三个菜单上面
+增加文件名"。
+
+### 按钮/滑杆换色
+
+新建 `colors.xml`：`button_primary_bg`（藏青蓝 `#3D5A80`，只用在"打开
+PDF"这一个主操作按钮，次要按钮"目录"/"设置"继续用中性灰，拉开视觉
+层级）+ 后来加的 `button_thumb_ring`/`button_thumb_grip`（旋钮描边/
+抓握纹理用的半透明白）。三个顶部按钮去掉 AppCompat 默认系统阴影
+（`android:stateListAnimator="@null"`），换成 `bg_button_primary`/
+`bg_button_secondary.xml` 自定义圆角背景。
+
+### 右侧翻页手柄：位置、显隐、颜色三次迭代
+
+手柄贴到内容列最右侧（`layout_marginEnd` 6dp→0dp，注意这贴的是
+"内容列"右边缘，不是屏幕物理边缘——外面还套着 `rootLayout` 的
+`paddingHorizontal=16dp`，真要贴屏幕物理边缘需要额外挪出这层
+padding，这次没做）。颜色从半透明中性灰改成不透明藏青蓝（用户原话
+"太低调容易被漏看/摸不准位置"）。显隐机制从"多页文档就常驻显示"改成
+默认隐藏、点击屏幕中央区域才切换（`MainActivity.setupCenterTapToggleScrubber`，
+用 `RecyclerView.OnItemTouchListener.onInterceptTouchEvent` 里跑一个
+`GestureDetector` 单击识别，全程不拦截事件，不影响正常滚动/双指缩放）。
+
+### 滑杆/手柄旋钮化：VectorDrawable 而不是 layer-list
+
+用户参照的参考图（游戏音量滑杆截图）是"实心圆+白色描边+中间几条竖线
+抓握纹理"，layer-list 叠 `<shape>` 没法精确摆出"三条等间距竖线居中
+排列"（`<item>` 的 `left/right/top/bottom` 是到边界的内边距语义，凑
+不出这个效果），改用 `VectorDrawable`（`seekbar_thumb_knob.xml` 给
+4 个设置滑杆，`page_scrubber_thumb_knob.xml` 给右侧手柄）直接写
+`pathData` 坐标。两者纹理方向不同：设置滑杆是横向拖动配竖线纹理，
+右侧手柄是纵向拖动配横线纹理——纹理方向垂直于拖动方向这个视觉惯例
+保持一致，只是转了 90 度。右侧手柄顺带把尺寸从 6dp×36dp 的窄条改成
+32dp×32dp 的圆（`moveScrubberThumbTo` 用 `view.height` 实时读取，
+换尺寸不用改任何拖拽定位计算）。旧的 `bg_page_scrubber_thumb.xml`/
+`seekbar_thumb_large.xml` 确认没有别处引用后直接删除，不留死文件。
+
+### 加文件名
+
+`MainActivity.loadPdf` 一拿到 `Uri` 就调用新写的 `queryDisplayName`
+（`content://` scheme 查 `ContentResolver`+`OpenableColumns
+.DISPLAY_NAME`，查不到退回 `Uri.lastPathSegment`）设置到顶部新增的
+`fileNameLabel`（`android:ellipsize="start"`，文件名前面截断保留后半
+更有辨识度的部分）并显示——不等文档解析成功才显示，哪怕最后打开失败
+也让用户知道刚才点的是哪个文件。
+
+**误会插曲**：中途用户报过一次"看似的 bug"——"滑杆圆点变成方形中间
+带线，像真正的按钮"，一度以为是真的视觉回归，装机反复截图复现不出来
+（idle 态、模拟拖拽态都是干净的纯色圆点）。后来用户发来参考图才明白：
+这不是 bug 描述，是在用文字描述"想要达到的效果"（旋钮质感），只是
+表达方式让人误以为在报告一个已经发生的故障。教训：文字描述的视觉
+缺陷如果怎么复现都对不上代码改动范围，优先怀疑"这其实是在描述期望
+而不是描述现状"，直接要一张参考图/截图，比反复盲猜复现更快。
+
+**装机验证**：文件名正常显示、设置滑杆和右侧手柄的旋钮样式跟参考图
+一致、点击屏幕中央能正常切换手柄显隐。全量单元测试 228 条零失败。
+
+## 46. 已改：#45 UI 美化的延续——跑马灯文件名、崩溃修复、滑杆标签配色、沉浸模式扩大到顶栏和设置面板
+
+**背景**：#45 装机验证通过后，用户在同一方向上继续加码，一连串反馈：
+"文件名字不够醒目，优化一下；文件名字可以向上移动一些，上面空白太多"
++"4 个设置滑杆加粗，名字不够醒目，名字和滑杆可以使用不同颜色，参照
+游戏图"→"文件名字过长是需要滚动显示，避免只看到后半部分"→"滑杆的
+横线加粗，参考我上次提供的游戏图"→"拉杆横线颜色不同"→"文件名、三个
+菜单设置成同右侧滑杆一样是隐藏的"→（真机反馈）"点击屏幕中央，四个
+设置滑杆没有隐藏"。
+
+### 崩溃：`queryDisplayName` 在冷启动自动恢复文档时炸了整个 App
+
+加完文件名当天验证时，冷启动自动恢复"上次打开的文件"直接闪退，
+`adb logcat` 抓到 `SecurityException: Permission Denial: reading
+com.android.providers.media.MediaDocumentsProvider ... requires that
+you obtain access using ACTION_OPEN_DOCUMENT`——这份"上次文件"是从
+系统相册选的图，`rememberLastOpenedUriPermission` 早就持久化过读
+权限、`copyToCacheFile` 的 `openInputStream` 后来验证也能正常读到
+内容，但单独对同一个 Uri 调 `ContentResolver.query()` 仍然被拒。这是
+部分 Provider（尤其 MediaProvider 包了一层 DocumentsProvider）对
+"持久授权覆盖 openFile 但不覆盖 query"的已知不一致行为，不是这份代码
+哪里没做对，但代价是这行代码毫无防御地跑在 `onCreate` 的主线程调用链
+上，一炸就是整个 App 闪退。修法：`query()` 调用包一层 `runCatching`，
+查不到（无论是列名找不到还是异常）都走同一条退回
+`Uri.lastPathSegment` 的兜底路径。顺带验证了这一发现——修复后这份
+坏掉的"上次文件"记录会在下一次 `loadPdf` 的 Error 分支被现有的自愈
+逻辑（`LastOpenedFileStore.clear`）自动清掉，不需要额外处理。
+
+### 文件名：加粗提亮、上移、跑马灯滚动
+
+`label_text_emphasis`（87% 不透明黑，加粗，15sp）替换原来的
+半透明浅灰 13sp；`rootLayout` 的 `paddingTop` 16dp→8dp 减少顶部
+留白（跟状态栏之间已经有 `applySystemBarInsetsAsPadding` 动态加的
+安全间距，这 16dp 是额外叠加的固定值，缩小它不影响避让效果）。长
+文件名从"省略号放最前面只保留后半截"改成安卓标准跑马灯
+（`ellipsize="marquee"` + `marqueeRepeatLimit="marquee_forever"` +
+`focusable`/`focusableInTouchMode`），另外在 Kotlin 里手动设
+`isSelected = true`——marquee 是"选中态"才滚动的效果，纯 XML 属性
+不会自己动，这是安卓 TextView 跑马灯最常踩的坑。
+
+### 4 个设置滑杆：标签加粗跟滑杆本身拉开颜色层次，轨道加粗+四色区分
+
+标签统一加粗 15sp + `label_text_emphasis`，跟滑杆本身的强调色形成
+"黑色加粗标签+鲜艳颜色滑杆"的层次（参照参考图）。轨道从系统默认的
+细线改成 8dp 粗、两端圆角（`seekbar_track_thick.xml`，
+`android:progressDrawable`）。用户进一步要求"拉杆横线颜色不同"——
+参考图里"游戏音量"紫、"话筒音量"红，每条滑杆有自己独立的强调色，不
+是全部统一藏青蓝。`VectorDrawable` 不支持运行时传参染色
+（`android:tint` 对多色 vector 会把白色描边/抓握纹理一起染掉），所以
+4 种颜色对应 4 份单独的 track/thumb drawable 文件（`_purple`/
+`_coral`/`_teal` 后缀 + 原来不带后缀的藏青蓝给"字号"），不是应该
+避免的重复，是这个具体约束下最简单能用的办法。
+
+### 沉浸模式从"只管右侧手柄"扩大成"统一管顶栏+文件名+设置面板+手柄"
+
+用户要求"文件名、三个菜单也设置成同右侧滑杆一样是隐藏的"——`
+scrubberRevealedByTap` 改名 `chromeRevealedByTap`，`updateScrubberVisibility`
+改名 `updateChromeVisibility`，新增 `topButtonRow`（给顶部按钮行的
+`LinearLayout` 补一个 id）纳入统一控制。**`topButtonRow` 有一条例外**：
+`currentSession == null`（冷启动/没有文档在看）时无条件常驻显示，
+不受点击状态支配——不然用户连"打开 PDF"这个入口都点不到。
+
+装完之后用户真机反馈"点击屏幕中央，四个设置滑杆没有隐藏"——这暴露了
+一个我漏掉的死角：设置面板（`settingsPanel`）本来是靠专门的"设置"
+按钮独立展开/收起的，`toggleSettingsPanel`/`collapseSettingsPanel`/
+`expandSettingsPanel` 原来直接读写 `settingsPanel.visibility` 当
+唯一的状态来源，完全没有接入这次的沉浸模式机制。修法：新增独立字段
+`settingsPanelExpanded` 记"用户展没展开过"这个意图，`settingsPanel`
+最终显不显示是"用户展开过"和"沉浸模式没被收起"两个条件的交集，
+`collapseSettingsPanel`/`expandSettingsPanel` 只改状态+按钮文案，
+不再直接摸 `visibility`，统一交给 `updateChromeVisibility` 算——这样
+用户点屏幕中央收起时设置面板跟着一起隐藏，再点一次呼出时如果之前
+展开过也会跟着一起恢复，不需要重新点一次"设置"按钮。`settingsPanel`
+在 XML 里的初始 `android:visibility` 也补成 `gone`，跟 Kotlin 里
+`settingsPanelExpanded` 默认 `false` 保持一致，不再依赖
+`collapseSettingsPanel()` 在 `onCreate` 里跑一次才收起（那一行现在
+命中早退分支，是个空操作）。
+
+**装机验证**：崩溃修复后冷启动自动恢复文档不再闪退（真机确认 Toast
+优雅报错，下次冷启动自愈）；文件名跑马灯、4 色滑杆轨道、点击屏幕中央
+统一隐藏/呼出顶栏+文件名+设置面板+手柄，均装机确认符合预期。全量
+单元测试 228 条零失败。
+
+## 47. 已改：系统深色模式适配——两次绕开尝试后，正经建了一份 values-night
+
+**背景**：#46 的文件名/滑杆标签改成加粗深色文字后，用户反馈"文件名和
+拉杆标签在夜间模式自动变为反色"。
+
+### 第一次尝试：关掉 force dark——解决了错位，但暴露了更底层的问题
+
+真机截图确认反色确实存在，第一反应是安卓系统的"智能深色"（force
+dark，API 29+，目标 SDK ≥29 默认开启）：系统看到这个 App 的主题走
+Day 分支，会对渲染结果做启发式反色让它"看起来像深色"，但只对它认为
+是"文字"的部分动手、不动写死颜色的背景 Drawable，容易造成文字被
+反色而背景没变的错位。加了 `android:forceDarkAllowed="false"`（API
+29+ 属性，`minSdk=26` 需要 `tools:targetApi="q"` 才能过 lint）关掉
+这个猜测。装机验证错位确实消失了，但用户又反馈"文件名和标签颜色是
+黑色，不易看清"——这说明关掉 force dark 只是掩盖了一层，底下还有
+问题没解决。
+
+### 真正的根因：`rootLayout` 没写背景色，露出了 AppCompat 自己会切换的窗口背景
+
+`rootLayout` 本身没有 `android:background`，夜间模式下会露出
+`Theme.AppCompat.DayNight` 自己的窗口背景（`android:windowBackground`，
+AppCompat 的 DayNight 委托机制会把它切成深色/黑色，这是主题解析层面
+真的换了颜色，不是渲染猜测），黑色窗口背景配写死的近黑色文字
+（`label_text_emphasis` `#DE000000`），就是黑底黑字看不清。
+
+### 中途绕路：临时锁死 Light 主题，被用户否决
+
+当时判断"这个 App 从设计上就没打算支持系统深色模式，所有颜色都写死"，
+把父主题从 `Theme.AppCompat.DayNight.NoActionBar` 换成不跟随系统的
+`Theme.AppCompat.Light.NoActionBar`，图省事绕开问题而不是解决问题。
+装机验证文字确实清楚了，但那是因为窗口整体维持白天配色，用户看出来
+"清晰，但不是夜间模式，而是白日模式"，明确要求"设计系统深色模式，
+干就完了"——回绝了绕开方案，要求正面解决。
+
+### 正解：只覆盖真正需要变的那一个颜色，不是整份复制 colors.xml
+
+主题改回 `Theme.AppCompat.DayNight.NoActionBar`（`forceDarkAllowed
+=false` 继续保留，我们自己做对了颜色就不需要系统再叠加一层猜测）。
+新建 `values-night/colors.xml`，逐条盘点这个 App 用到的所有颜色，
+确认真正需要深色变体的只有 `label_text_emphasis` 一个：
+- 正文段落文字没有写死颜色（`createParagraphTextView` 不设
+  `setTextColor`），继承主题的 `?android:textColorPrimary`，
+  `DayNight` 本身就会切换，不用管。
+- 按钮/滑杆的强调色（`button_primary_bg`/`accent_*`）本来就跟页面
+  背景无关——按钮自己是纯色块，滑杆旋钮画在自己的圆面上，深浅色背景
+  下对比度都不受影响。
+- 设置面板/次要按钮的半透明中性灰背景（`#33888888` 这类）本来就是
+  半透明叠加色，会随底色自动变深/变浅，这是它最初的设计意图（见
+  `bg_settings_panel.xml` KDoc "深色/浅色主题通用"），不需要重复
+  定义。
+
+只有 `label_text_emphasis` 是唯一一处"直接把深色文字写死在可能变成
+深色的背景上"的地方，`values-night/colors.xml` 里翻成 87% 不透明白，
+跟浅色模式的 87% 不透明黑对称。
+
+**方法论**：遇到"这个 App 没做过深色适配，出问题了"，第一反应不该是
+"那就让它别参与深色模式"（治标，用户也确实当场否决了）；应该反过来
+盘点"这个 App 已经用了多少个颜色、其中哪些是真正依赖背景明暗的深色
+文字/浅色背景假设、哪些本来就是自适应的（主题属性、半透明叠加色、
+自带对比度的强调色块）"——多数情况下需要显式覆盖的颜色集合比想象
+中小得多，这次 8 个自定义颜色里只有 1 个真的需要 `values-night`。
+
+**装机验证**：夜间模式下文件名和滑杆标签清晰可读，白天模式不受影响。
+全量单元测试 228 条零失败。

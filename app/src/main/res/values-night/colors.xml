@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    2026-08-26 用户明确要求"设计系统深色模式，干就完了"——只在这里覆盖需要跟着
+    背景反色的颜色，不是把 colors.xml 整份复制一遍。盘点过这个 App 用到的所有
+    颜色（见 values/colors.xml 逐条 KDoc + 各 drawable 文件），真正需要深色变体
+    的只有 label_text_emphasis 这一个：
+
+    - 正文段落文字没有写死颜色（MainActivity.createParagraphTextView 不设
+      setTextColor，继承主题的 ?android:textColorPrimary），AppCompat.DayNight
+      本身就会在深色模式下把它切成浅色，不用我们操心。
+    - 按钮/滑杆/设置面板背景全是 colors.xml 里明确写的强调色或半透明中性灰
+      （#33888888 这类），前者本来就跟页面背景无关（按钮自己是纯色块，深浅色
+      背景下对比度不受影响），后者是半透明叠加色，本来就会随底色自动变深/变浅
+      （这是它当初的设计意图，见 bg_settings_panel.xml KDoc），不需要重复定义。
+    - button_thumb_ring/grip（滑杆旋钮的白色描边/抓握纹理）画在旋钮的纯色圆面
+      上，不是画在页面背景上，深浅色模式下都一样清楚。
+
+    只有 label_text_emphasis（文件名 + 4 个设置滑杆标签）是唯一一处"直接把深色
+    文字写死在可能变成深色的背景上"的地方——夜间模式下窗口背景（
+    android:windowBackground，AppCompat DayNight 自动切换）变黑，87% 不透明黑
+    的文字就看不清了，这里翻成 87% 不透明白，跟 values/colors.xml 里浅色模式的
+    87% 不透明黑对称。
+-->
+<resources>
+    <color name="label_text_emphasis">#DEFFFFFF</color>
+</resources>

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    2026-08-26：右侧翻页手柄同一次改动——原来 bg_page_scrubber_thumb.xml 是一根
+    6dp×36dp 的窄条，用户反馈"也改成一样的旋钮质感"，配合 MainActivity 里把
+    pageScrubberThumb 的尺寸从 6dp×36dp 改成 32dp×32dp（见 activity_main.xml），
+    形状从"细条"换成跟设置滑杆一致的"实心圆+描边+抓握纹理"。
+
+    抓握纹理方向改成横向三条线（而不是 seekbar_thumb_knob.xml 的竖线）——这个
+    手柄是纵向拖动（翻页），纹理方向跟拖动方向保持"垂直于纹理"这个视觉惯例一致，
+    跟设置滑杆（横向拖动配竖线纹理）是同一个逻辑，只是转了 90 度。
+
+    尺寸比设置滑杆的旋钮小一圈（32dp vs 36dp）——手柄贴在内容区右边缘，旁边
+    没有文字标签一起横向排布挤占空间的问题，但整个 App 里"次要交互元件比主要
+    交互元件稍小一号"这个尺寸层级习惯是一致的。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="32dp"
+    android:height="32dp"
+    android:viewportWidth="32"
+    android:viewportHeight="32">
+
+    <!-- 实心圆主体 -->
+    <path
+        android:fillColor="@color/button_primary_bg"
+        android:pathData="M2,16 A14,14 0 1,1 30,16 A14,14 0 1,1 2,16 Z" />
+
+    <!-- 外圈描边，增加立体感 -->
+    <path
+        android:strokeColor="@color/button_thumb_ring"
+        android:strokeWidth="2"
+        android:pathData="M2,16 A14,14 0 1,1 30,16 A14,14 0 1,1 2,16 Z" />
+
+    <!-- 中间三条横线抓握纹理 -->
+    <path android:fillColor="@color/button_thumb_grip" android:pathData="M9,9 H23 V11 H9 Z" />
+    <path android:fillColor="@color/button_thumb_grip" android:pathData="M9,15 H23 V17 H9 Z" />
+    <path android:fillColor="@color/button_thumb_grip" android:pathData="M9,21 H23 V23 H9 Z" />
+
+</vector>

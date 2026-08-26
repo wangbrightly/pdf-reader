@@ -5,9 +5,13 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import app.pdfreader.extract.PdfTextExtractor
-import java.util.concurrent.Executors
+import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 文字/图片真正按需加载的核心 `RecyclerView.Adapter`——见
@@ -101,11 +105,76 @@ class PdfPageAdapter(
      * 顺序应该重新接近提交顺序，即使不是 [loadExecutor] 内部队列那种数学上严格
      * 的 FIFO 保证。
      */
-    private val loadExecutor = Executors.newFixedThreadPool(LOAD_POOL_SIZE)
+    // 见 loadExecutor KDoc"优先加载当前可见页"一节——只在主线程读写（onAttached/
+    // onDetached/onBindViewHolder 都是主线程回调），不需要额外同步。
+    private var attachedRecyclerView: RecyclerView? = null
+
+    override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
+        super.onAttachedToRecyclerView(recyclerView)
+        attachedRecyclerView = recyclerView
+    }
+
+    /**
+     * 见 [visibleDistance] KDoc——只在主线程调用（[onBindViewHolder] 提交任务前算
+     * 一次优先级快照），不在后台线程碰 RecyclerView/LayoutManager 的内部状态。
+     */
+    private fun visibleDistance(position: Int): Int {
+        val layoutManager = attachedRecyclerView?.layoutManager as? LinearLayoutManager ?: return 0
+        val first = layoutManager.findFirstVisibleItemPosition()
+        val last = layoutManager.findLastVisibleItemPosition()
+        if (first == RecyclerView.NO_POSITION || last == RecyclerView.NO_POSITION) return 0
+        return when {
+            position < first -> first - position
+            position > last -> position - last
+            else -> 0
+        }
+    }
+
+    /** 单调递增的提交序号，见 [PrioritizedLoadTask] KDoc——优先级相同时按提交顺序决出胜负，避免 [PriorityBlockingQueue] 对"相等"元素的顺序不作保证导致的乱序。 */
+    private val submitSequence = AtomicLong(0)
+
+    /**
+     * 见 [visibleDistance] KDoc 完整背景——真机反馈"想先看到当前页，不想等预取的
+     * 页面"。原来 `loadExecutor` 是普通的 FIFO 线程池，屏幕外预取的页面如果先
+     * 提交，会排在刚滑入屏幕、用户正在等的页面前面。包一层按"离当前可见范围的
+     * 远近"排序的任务，配合 [PriorityBlockingQueue]：可见页（距离 0）永远排在
+     * 预取页（距离 > 0）前面处理。
+     *
+     * 优先级是**提交那一刻的快照**，不是每次出队都重新查一遍——如果要"实时"
+     * 重新排序（比如任务排队等待期间用户又划走了），需要在后台线程读
+     * RecyclerView/LayoutManager 的内部状态，这个项目已经因为并发碰 `PDDocument`
+     * 吃过真实数据损坏的亏（见 NOTES #33/#36），不确定 RecyclerView 内部状态在
+     * 主线程布局的同时被后台线程读取是否安全，没有查到官方文档明确保证，索性
+     * 选风险更小的做法：只在提交时（主线程）算一次快照。代价：如果一个预取页
+     * 的任务已经在队列里，用户之后滑到让它变成可见，它不会自动"插队"到已经在
+     * 排队的可见页前面，要等它自然被取出执行——真机翻页场景里，滑动到停下这段
+     * 时间通常够任务被处理完，这个代价接受。
+     */
+    private inner class PrioritizedLoadTask(position: Int, private val task: () -> Unit) :
+        Runnable, Comparable<PrioritizedLoadTask> {
+        private val priority = visibleDistance(position)
+        private val submitOrder = submitSequence.getAndIncrement()
+
+        override fun run() = task()
+
+        override fun compareTo(other: PrioritizedLoadTask): Int {
+            val byPriority = priority.compareTo(other.priority)
+            return if (byPriority != 0) byPriority else submitOrder.compareTo(other.submitOrder)
+        }
+    }
+
+    private val loadExecutor = ThreadPoolExecutor(
+        LOAD_POOL_SIZE,
+        LOAD_POOL_SIZE,
+        0L,
+        TimeUnit.MILLISECONDS,
+        PriorityBlockingQueue(),
+    )
 
     /** 见 [loadExecutor] KDoc——Adapter 被换掉时（比如用户又打开了另一份文档）线程池要跟着关掉，不然会一直占着线程不释放。 */
     override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
         super.onDetachedFromRecyclerView(recyclerView)
+        attachedRecyclerView = null
         loadExecutor.shutdownNow()
     }
 
@@ -152,63 +221,82 @@ class PdfPageAdapter(
             return
         }
         renderLoadingPlaceholder(holder)
-        loadExecutor.submit {
-            // 见 loadExecutor KDoc："排队等到真正执行时，这个 ViewHolder 可能早就
-            // 被 RecyclerView 挪去绑定别的位置了"——这种情况直接跳过，不做无意义
-            // 的 PDFBox 解析工作。
-            if (holder.bindingAdapterPosition != position) return@submit
-            val tStart = System.currentTimeMillis()
-            // 见 PdfTextExtractor.Session.loadPage KDoc"onImageReady"一节：整页
-            // 图片的页（尤其不显示文字的 hasFullPageImage 页）之前要等这一页全部
-            // 图片解完才看到任何内容，真机复现过转圈十几秒——这个回调让每张图片
-            // 刚解出来就先画到屏幕上，不用等整页处理完。2026-08-26 起回调在锁外
-            // （图片解码本身已经不再持有 documentLock，见 NOTES #41）调用，这里
-            // 仍然只做 `post{}` 调度、不做耗时的事——虽然不再拖长锁的持有时间，
-            // 回调本身还是跑在这一页自己的加载线程上，做耗时的事会拖慢这一页
-            // 自己的整体返回。
-            var previewShown = false
-            val content = runCatching {
-                session.loadPage(pageNo) { bitmap ->
-                    holder.itemView.post {
-                        if (holder.bindingAdapterPosition == position) {
-                            renderProgressiveImage(holder, bitmap, isFirst = !previewShown)
+        loadExecutor.execute(
+            PrioritizedLoadTask(position) {
+                // 见 loadExecutor KDoc："排队等到真正执行时，这个 ViewHolder 可能
+                // 早就被 RecyclerView 挪去绑定别的位置了"——这种情况直接跳过，不做
+                // 无意义的 PDFBox 解析工作。
+                if (holder.bindingAdapterPosition != position) return@PrioritizedLoadTask
+                val tStart = System.currentTimeMillis()
+                // 见 PdfTextExtractor.Session.loadPage KDoc"onTextReady/onImageReady"
+                // 一节：文字通常比图片先算出来（NOTES #41 把文字抽取挪到了图片扫描/
+                // 解码前面），`onTextReady` 让文字一算完就先展示，不用等图片也解码
+                // 完；`onImageReady` 让每张图片刚解出来就先画上去，两个回调都只做
+                // `post{}` 调度、不做耗时的事——虽然不再拖长锁的持有时间（图片解码
+                // 本身已经不再持有 documentLock，见 NOTES #41），回调本身还是跑在
+                // 这一页自己的加载线程上，做耗时的事会拖慢这一页自己的整体返回。
+                var previewShown = false
+                val content = runCatching {
+                    session.loadPage(
+                        pageNo,
+                        onTextReady = { textBlocks ->
+                            holder.itemView.post {
+                                if (holder.bindingAdapterPosition == position) {
+                                    renderProgressiveBlocks(holder, textBlocks, isFirst = true)
+                                }
+                            }
+                            previewShown = true
+                        },
+                    ) { bitmap ->
+                        holder.itemView.post {
+                            if (holder.bindingAdapterPosition == position) {
+                                renderProgressiveBlocks(holder, listOf(DisplayBlock.Image(bitmap)), isFirst = !previewShown)
+                            }
                         }
+                        previewShown = true
                     }
-                    previewShown = true
+                }.getOrDefault(PdfTextExtractor.PageContent(emptyList()))
+                android.util.Log.d(
+                    "PdfReaderDebug",
+                    "PdfPageAdapter.loadPage(page=$pageNo)=${System.currentTimeMillis() - tStart}ms",
+                )
+                cache[pageNo] = content
+                holder.itemView.post {
+                    // 这一步是权威的最终结果——见 onImageReady KDoc，可能跟渐进预览
+                    // 展示过的内容不完全一样（图片拼接、表格裁剪替换掉预览等），
+                    // 整页重新渲染一次，不依赖/信任渐进阶段已经画出来的东西。
+                    if (holder.bindingAdapterPosition == position) renderPage(holder, content)
                 }
-            }.getOrDefault(PdfTextExtractor.PageContent(emptyList()))
-            android.util.Log.d(
-                "PdfReaderDebug",
-                "PdfPageAdapter.loadPage(page=$pageNo)=${System.currentTimeMillis() - tStart}ms",
-            )
-            cache[pageNo] = content
-            holder.itemView.post {
-                // 这一步是权威的最终结果——见 onImageReady KDoc，可能跟渐进预览
-                // 展示过的内容不完全一样（图片拼接、表格裁剪替换掉预览等），整页
-                // 重新渲染一次，不依赖/信任渐进阶段已经画出来的东西。
-                if (holder.bindingAdapterPosition == position) renderPage(holder, content)
-            }
-        }
+            },
+        )
     }
 
     /**
-     * 见 [onBindViewHolder] 里 `onImageReady` 回调——每解出一张图片就调一次，只在
-     * 主线程调用（调用方已经 `post{}` 过）。[isFirst] 时先清空占位符（转圈），
-     * 后续图片依次往下摆，跟 [renderPage] 的段间距逻辑一致。这里画出来的东西是
-     * "边解码边预览"，不是最终结果——[renderPage] 最终会整体替换掉这里画的内容。
+     * 见 [onBindViewHolder] 里 `onTextReady`/`onImageReady` 两个回调——文字算完
+     * 调一次（[isFirst]，一次性传全部文字段落），之后每解出一张图片再各调一次
+     * （追加一个元素的列表），只在主线程调用（调用方已经 `post{}` 过）。[isFirst]
+     * 时先清空占位符（转圈），后续内容依次往下摆，跟 [renderPage] 的段间距逻辑
+     * 一致。这里画出来的东西是"边算边预览"，不是最终结果——[renderPage] 最终会
+     * 整体替换掉这里画的内容。
      */
-    private fun renderProgressiveImage(holder: PageViewHolder, bitmap: Bitmap, isFirst: Boolean) {
+    private fun renderProgressiveBlocks(holder: PageViewHolder, blocks: List<DisplayBlock>, isFirst: Boolean) {
         val container = holder.itemView as LinearLayout
         if (isFirst) {
             container.removeAllViews()
         }
-        val view = createImageView(bitmap)
-        if (container.childCount > 0) {
-            val params = view.layoutParams as LinearLayout.LayoutParams
-            params.topMargin = dpToPx(view, blockSpacingDpProvider())
-            view.layoutParams = params
+        val spacingDp = blockSpacingDpProvider()
+        blocks.forEach { block ->
+            val view = when (block) {
+                is DisplayBlock.Text -> createParagraphView(block.text, block.isHeading)
+                is DisplayBlock.Image -> createImageView(block.bitmap)
+            }
+            if (container.childCount > 0) {
+                val params = view.layoutParams as LinearLayout.LayoutParams
+                params.topMargin = dpToPx(view, spacingDp)
+                view.layoutParams = params
+            }
+            container.addView(view)
         }
-        container.addView(view)
     }
 
     private fun renderLoadingPlaceholder(holder: PageViewHolder) {

@@ -2332,11 +2332,26 @@ object PdfTextExtractor {
         // 调用方（[app.pdfreader.ui.PdfPageAdapter]）仍然只应该在回调里做非阻塞
         // 的 `View.post{}` 调度——虽然现在不再拖长锁的持有时间，但回调本身跑在
         // 加载线程上，做耗时的事仍然会拖慢这一页自己的整体返回。
-        fun loadPage(pageNo: Int, onImageReady: ((Bitmap) -> Unit)? = null): PageContent {
+        //
+        // 2026-08-26 追加 [onTextReady]：真机反馈"想先看到当前页，不想等图片
+        // 也解码完"——文字（[PageLoadPhaseA.PendingImages.textBlocks]）在锁内
+        // 那段（Phase A）就已经算完，比图片解码（锁外那段）先就绪，原来的接口
+        // 只在整页（文字+图片）全部处理完才把结果交回调用方，等于让文字也跟着
+        // 图片一起被拖慢。加一个只在有图片要解码的页（`PendingImages` 分支）才
+        // 触发一次的回调，把已经算好的文字立刻交出去——没有图片的页（`Complete`
+        // 分支）本来就是整页一起、几乎同时就绪，不需要也没必要分两步。跟
+        // [onImageReady] 同样的约束：只在持锁之外调用，调用方只应该做非阻塞的
+        // `View.post{}` 调度。
+        fun loadPage(
+            pageNo: Int,
+            onTextReady: ((List<DisplayBlock>) -> Unit)? = null,
+            onImageReady: ((Bitmap) -> Unit)? = null,
+        ): PageContent {
             val phaseA = documentLock.withLock { loadPageLockedPhaseA(pageNo) }
             return when (phaseA) {
                 is PageLoadPhaseA.Complete -> phaseA.content
                 is PageLoadPhaseA.PendingImages -> {
+                    onTextReady?.invoke(phaseA.textBlocks)
                     val images = phaseA.imageResults.map { result ->
                         val bitmap = when (result) {
                             is PageImageResult.Ready -> result.bitmap

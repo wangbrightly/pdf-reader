@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    "打开 PDF"主按钮背景——实心圆角，跟 bg_settings_panel.xml/bg_page_scrubber_thumb.xml
+    同一套"12dp 圆角"语言，颜色用 colors.xml 里的强调色，跟"目录"/"设置"这两个次要
+    按钮（bg_button_secondary.xml，中性灰）拉开视觉层级，见 colors.xml 完整背景。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/button_primary_bg" />
+    <corners android:radius="12dp" />
+</shape>
