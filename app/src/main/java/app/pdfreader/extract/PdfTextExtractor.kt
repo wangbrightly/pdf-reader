@@ -1772,14 +1772,23 @@ object PdfTextExtractor {
          * 2026-08-26 真机反馈修复：一份 Internet Archive 扫描书（LuraDocument 产出，
          * 每页是一张 JPEG2000/JPX 编码的扫描背景图 + 真实可读的文字层，不是上面
          * [hasFullPageImage] KDoc 描述的"OCR 乱码"那种情况）真机复现"翻开一页，
-         * 什么都没有"——追出根因：这台设备解不了 JPX（PDFBox-Android 需要额外的
+         * 什么都没有"——追出根因：这台设备当时解不了 JPX（PDFBox-Android 需要额外的
          * 可选组件 `com.gemalto.jp2:jp2-android`，抛
          * `MissingImageReaderException: JP2Android is not installed`；这个组件
-         * 2026-08-26 核实过已经不可用——原发布仓库 JCenter 早已关停，Maven Central
-         * 没有这个坐标，JitPack 对这个库全部版本构建都失败，不是"没引入"，是目前
-         * 找不到可靠来源引入，添加 JPX 解码支持这件事本身单独评估，这次没有做），
-         * 图片解码失败、真正的文字又被 [hasFullPageImage] 那条规则错误隐藏——两个
-         * "各自合理"的处理叠在一起，变成用户完全看不到任何内容。
+         * 首次核实时判断为不可用——原发布仓库 JCenter 已关停，Maven Central 没有
+         * 这个坐标，JitPack 对这个库全部版本构建都失败）。**这个结论已过时并已
+         * 更正**：上游项目换了新坐标 `io.github.michaldvorak-gemalto:jp2-android`
+         * 重新发布到 Maven Central，2026-08-26 同一天晚些时候 POC 装机验证通过后
+         * 正式接入（见 [Jpeg2000Decoder]），现在 JPX 能真正解码，不再只是占位图。
+         * 这里保留完整教训是因为它本身有价值：调研得出的"某组件不可用"是有时效性
+         * 的结论，几天之内可能就随上游变化过时，决策前若隔了几天要重新核实一遍，
+         * 不能凭旧结论直接复述。
+         *
+         * 下面这段描述的是接入前的历史状态（图片解码失败、真正的文字又被
+         * [hasFullPageImage] 那条规则错误隐藏——两个"各自合理"的处理叠在一起，
+         * 变成用户完全看不到任何内容），修复思路本身（区分几何摆放和解码成功）
+         * 仍然成立，只是现在 JPX 大多数情况下会真正解码成功，走不到"文字兜底
+         * 展示"这条分支了。
          *
          * 根因是 [hasFullPageImage] 判断"要不要隐藏文字"只看**几何**（这张图有没有
          * 摆成占满全页的样子），不看**这张图到底有没有解码成功**——对真机原本那次
@@ -2033,19 +2042,34 @@ object PdfTextExtractor {
                     return
                 }
             }
+            // 见 Jpeg2000Decoder KDoc 完整背景：2026-08-26 核实"jp2-android 不可
+            // 引入"这个结论已经过时，上游项目换坐标重新发布到了 Maven Central，
+            // POC 装机验证通过后正式接入——JPX 解码交给这个专门的解码器，不再
+            // 落进下面 `pdImage.image` 那条通用兜底（PdfBox-Android 自己解不了
+            // JPX，见旧版本这里的诊断记录）。
+            if (pdImage.suffix == "jpx") {
+                val jpxBytes = runCatching {
+                    pdImage.createInputStream(listOf("JPXDecode")).use { it.readBytes() }
+                }.getOrNull()
+                val jpxBitmap = jpxBytes?.let { Jpeg2000Decoder.decode(it) }
+                if (jpxBitmap != null) {
+                    val ctm = graphicsState.currentTransformationMatrix
+                    addRealImage(jpxBitmap, ctm, isFullPageCoverage)
+                } else {
+                    // 不调用 orientImage——占位图没有"原始方向"这个概念，理由跟
+                    // 上面 JBIG2 占位图分支一致。
+                    addImage(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持（JPEG2000）"))
+                }
+                return
+            }
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
             // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
             // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。
             //
             // 2026-08-26 真机反馈修复：原来 `pdImage.image` 失败时直接 `return`，
-            // 图片静默消失——真机撞到过 JPX（JPEG2000）编码的图片，PdfBox-Android
-            // 解不了会抛 `MissingImageReaderException`（需要额外的可选组件
-            // `com.gemalto.jp2:jp2-android`，2026-08-26 核实过这个组件已经找不到
-            // 可靠来源引入，见 [fullPageImageDecoded] KDoc），`runCatching` 吞掉这个
-            // 异常之后图片凭空消失，跟本类其它格式"解不出来就用诚实占位图"的一贯
-            // 处理不一致。改成失败时也展示占位图，不再静默消失——这个分支覆盖的
-            // 不只是 JPX，任何走到这里、`pdImage.image` 本身抛异常或返回不可用结果
-            // 的情况都会展示占位图，而不是只针对 JPX 特殊处理。
+            // 图片静默消失——`runCatching` 吞掉异常之后图片凭空消失，跟本类其它
+            // 格式"解不出来就用诚实占位图"的一贯处理不一致。改成失败时也展示
+            // 占位图，不再静默消失。
             val nativeResult = runCatching { pdImage.image }
             val bitmap = decodeJpegWithNativeSubsampling(pdImage)
                 ?: nativeResult.getOrNull()
@@ -2053,14 +2077,9 @@ object PdfTextExtractor {
                 val ctm = graphicsState.currentTransformationMatrix
                 addRealImage(bitmap, ctm, isFullPageCoverage)
             } else {
-                val reason = if (pdImage.suffix == "jpx") {
-                    "图片格式不支持（JPEG2000）"
-                } else {
-                    "图片格式不支持"
-                }
                 // 不调用 orientImage——占位图没有"原始方向"这个概念，理由跟上面
                 // JBIG2 占位图分支一致。
-                addImage(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, reason))
+                addImage(createUnsupportedImagePlaceholder(pdImage.width, pdImage.height, "图片格式不支持"))
             }
         }
 

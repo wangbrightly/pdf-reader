@@ -2021,3 +2021,127 @@ AppCompat 的 DayNight 委托机制会把它切成深色/黑色，这是主题�
 
 **装机验证**：夜间模式下文件名和滑杆标签清晰可读，白天模式不受影响。
 全量单元测试 228 条零失败。
+
+## 48. 已修：JPX/JPEG2000 图片真正解码——#43 那条"不可引入"的结论过时了，用户三轮核实纠正后接入 `jp2-android`
+
+**背景**：用户明确要求"投入完整实现" JPX/JPEG2000 支持，一开始按 #43 记录
+的结论理解为"只能从 ISO/IEC 15444-1 规范手写 DWT+EBCOT 解码器"——规划了
+一份完整的分阶段手写路线图（复用 JBIG2 现成的 MQ 算术解码器、marker 解析→
+Tier-1→Tier-2→逆 DWT→色彩变换，逐阶段 TDD），提交计划审批时被用户当场
+否决：**#43 记录的"`com.gemalto.jp2:jp2-android` 不可引入"这条结论已经
+过时**。
+
+### 用户三轮核实，一次比一次深
+
+第一轮：用户查到新坐标 `io.github.michaldvorak-gemalto:jp2-android:1.0.4`
+已经登陆 Maven Central，建议先做接入 POC，手写方案降级为后备。核实后确认
+属实——上游项目（`ThalesGroup/JP2ForAndroid`）解决了发布问题，换了个人
+维护者坐标重新发布，最新版本 1.1.0（2026-08-16）。
+
+第二轮：用户指出我把"1.1.0 卡在 `minCompileSdk=37`"直接等同于"整条路线
+失败"是错的——静态检查 1.0.5（同一坐标的上一个版本）发现它 `minCompileSdk
+=1`，没有这个约束，只是少了 `setDecodingArea()`（区域解码，PDF 图片解码
+用不上）。核实后确认属实，POC 矩阵改成优先测 1.0.5。
+
+第三轮：用户指出"临时单元测试或 main 函数"验证 native 解码这个思路本身
+有问题——`JP2Decoder.decode()` 依赖 Android ABI 的 native `.so`，Robolectric
+纯 JVM 单测环境加载不了，必须用 instrumentation test 或真机；还指出
+native crash 风险（`runCatching` 拦不住 `SIGSEGV`）要前置到 POC 阶段验证，
+不能拖到正式接入后的补测试阶段；还要求 POC 至少测三类输入（正常/截断/
+伪造头部数据）。全部采纳，重写了 POC 矩阵和验证方式。
+
+三轮都是用户先给出具体、可核实的技术依据（Maven Central 元数据链接、AAR
+`aar-metadata.properties` 静态检查、native 库运行环境的技术事实），不是
+凭印象反对，每次核实后确认用户是对的。
+
+### POC 阶段（真机装机验证，非纸面推测）
+
+1. `implementation("io.github.michaldvorak-gemalto:jp2-android:1.0.5")` +
+   `compileSdk=36`：`gradle assembleDebug` 直接成功，没有任何 SDK 约束，
+   第一条路径就通过，不需要测 1.1.0 或升级 `compileSdk`。
+2. 网络可达：这个新 groupId 通过项目现有的 Maven Central 仓库配置直接
+   解析下载，没有额外镜像配置需求。
+3. native 稳定性（真机装机验证，加临时诊断代码到 `MainActivity.onCreate`，
+   验证完整删除干净）：
+   - 正常 JP2 数据（`opj_compress` 生成的 16×16 灰阶无损小图）：解码成功，
+     像素值跟 macOS `sips`（Core Graphics/ImageIO，跟 OpenJPEG 完全独立的
+     另一套实现）解码结果逐像素一致。
+   - 截断的数据流（正常文件砍掉后 40%）：稳定返回 `null`，无崩溃。
+   - 伪造 magic number+随机字节冒充 JPX：稳定返回 `null`，无崩溃。
+   - 全程没有出现不可控的 native crash（进程没有被杀掉）。
+4. 真实样本：从设备上重新找到并拉取 NOTES #43 那份 Internet Archive
+   扫描文档（`content://.../document%3A1000033972` 反查 MediaStore 拿到
+   真实文件路径 `/storage/emulated/0/Books/Quality function deployment...
+   .pdf`，`adb exec-out cat` 二进制安全读取），从 PDF 里手动定位并提取
+   `/Filter/JPXDecode` 那个 image XObject 的原始字节（3590 字节，931×1250，
+   RGB）。真机解码成功，尺寸正确；导出真机解码结果为 PNG 拉回电脑，跟
+   macOS `sips` 独立解码结果做全图逐像素比对——116 万像素里约 35% 存在
+   ±1 的最小误差，最大单通道差值为 1，符合"两套独立实现在色彩空间转换
+   舍入策略上的正常差异"，不是内容错误（这份数据是有损压缩，跟前面
+   无损小 fixture 的"完全一致"不是同一个基准）。
+5. APK 体积增量约 4MB（4 个 ABI 的 `libopenjpeg.so`），真机是小米
+   mondrian（纯 ARM64），需要时可以用 `ndk.abiFilters` 只保留
+   `arm64-v8a` 瘦身，这次没做（体积增量可接受）。
+
+POC 四项判定标准全部通过，且是矩阵里风险最低的第一条路径就通过，不需要
+启动手写 DWT+EBCOT 方案。
+
+### 正式接入
+
+新增 `Jpeg2000Decoder`（`app/src/main/java/app/pdfreader/extract/
+Jpeg2000Decoder.kt`），对齐 `JpegDecoder` 的既有契约（`decode(bytes):
+Bitmap?`，`runCatching` 兜底，范围外/失败一律 `null`）。`PageContentStream
+Engine.drawImage` 新增 `pdImage.suffix == "jpx"` 专属分支（放在原来的
+`decodeJpegWithNativeSubsampling`/`pdImage.image` 通用兜底之前）：
+`createInputStream(listOf("JPXDecode"))` 取原始字节（读取时机跟 JBIG2 用
+`createInputStream(listOf("JBIG2Decode"))` 是同一个模式——在真正的解码
+过滤器之前截断，拿到还没被 PDFBox 尝试解码的原始压缩数据），交给
+`Jpeg2000Decoder.decode`，成功走 `addRealImage`（联动 `fullPageImageDecoded`，
+图片解码成功时正确隐藏 OCR 乱码文字），失败退占位图（不调用
+`orientImage`，理由跟 JBIG2/CMYK 占位图分支一致）。
+
+### 测试：两层覆盖，Robolectric 测 wiring，instrumentation test 测 native 解码本身
+
+`Jpeg2000Decoder` 依赖 native `.so`，Robolectric（纯桌面 JVM）加载不了
+Android ABI 的 ELF 二进制——这是 POC 阶段就确认过的硬约束，两类测试分开：
+
+- **Robolectric 单测**（`PdfTextExtractorImageTest`新增一条）：验证
+  wiring 对不对（suffix 判断触发、字节正确提取、解码失败时占位图长宽比
+  正确）。这条测试里 `Jpeg2000Decoder.decode()` 会因为 native 库加载
+  不了而必然返回 `null`（`UnsatisfiedLinkError`/`NoClassDefFoundError`
+  都是 `Error` 的子类，`runCatching` 能兜住），测的是失败路径下的降级
+  行为，不是真正的解码正确性。
+- **instrumentation test**（新增 `app/src/androidTest/` 整套基础设施——
+  `testInstrumentationRunner`、`androidx.test.ext:junit`/`androidx.test
+  :runner` 依赖、`Jpeg2000DecoderInstrumentedTest`）：跑在真机真实
+  Android 运行时上，覆盖 POC 阶段验证过的四类场景（正常数据像素正确、
+  截断流/伪造头部返回 `null`、NOTES #43 真实样本尺寸正确），`gradle
+  connectedDebugAndroidTest` 或 `adb shell am instrument` 触发。真机验证
+  4 条全过。
+
+**小插曲**：`gradle connectedDebugAndroidTest` 这条路径被这个项目一贯的
+USB 连接不稳定问题坑了两次（跑到一半设备掉线，UTP 测试编排对连接中断的
+容忍度比单条 `adb` 命令低很多，直接判定"设备找不到"整个失败，不会自动
+重试）。改用更抗断线的路径——`adb install` 手动装两个 APK（主 APK+
+androidTest APK），再 `adb shell am instrument -w app.pdfreader.test/
+androidx.test.runner.AndroidJUnitRunner` 直接触发，一次成功。
+
+### 文档措辞：不过度背书、不过度承诺
+
+`CLAUDE.md` 已知局限一节里"JPX/JPEG2000 完全不支持"的描述整条移除，
+改成如实反映来源和范围的措辞——不写"完整支持 JPX"（`jp2-android` 本身
+也有自己的边界，比如 1.0.5 没有区域解码、HTJ2K 支持程度没有针对性验证
+过），不写"官方库"（这是个人维护者重新发布的坐标，不是 Thales 官方
+持续担保的渠道）。
+
+**方法论**：跟 [[feedback_stale_unavailability_claims]] 记录的教训一致——
+"某组件不可引入"这类结论是有时效性的，尤其是小众/个人维护的开源库，
+换发布者、换坐标、修复完打包问题重新发布，几周之内就可能让旧结论过时。
+这次是这条教训从"记下来"到"真的被验证复现一次"——不是自己主动重新
+核实发现的，是被用户的独立核实连续纠正三轮才走到正确路线上，且每一轮
+用户给出的都是具体可复核的技术依据，不是印象或直觉。
+
+**装机验证**：NOTES #43 那份文档重新打开，`logcat` 确认 `loadPdf
+render(Success)` 无崩溃；instrumentation test 4 条全过（含对这份文档
+真实提取字节的解码验证）。全量 Robolectric 单元测试 229 条零失败（新增
+1 条 JPX wiring 测试）。

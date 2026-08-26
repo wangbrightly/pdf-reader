@@ -398,6 +398,63 @@ class PdfTextExtractorImageTest {
     }
 
     /**
+     * 2026-08-26 接入 [Jpeg2000Decoder]（`jp2-android` native 库封装，见该类
+     * KDoc 完整背景）之后的接线测试——验证 `pdImage.suffix == "jpx"` 这条分支
+     * 正确触发：从 `/Filter /JPXDecode` 的 `COSStream` 里取出原始字节、交给
+     * [Jpeg2000Decoder]、解码失败时展示占位图而不是崩溃或静默消失。
+     *
+     * **这条测试测不到"真正解码成功"这条路径**——`jp2-android` 依赖 native
+     * `.so`（真实 Android ABI 的 ELF 二进制），Robolectric 是纯桌面 JVM，
+     * `System.loadLibrary` 在这里必定失败（`UnsatisfiedLinkError`，会被
+     * [Jpeg2000Decoder.decode] 内部的 `runCatching` 吞掉变成 `null`），"真正
+     * 解码成功、显示真实图片内容"这条路径已经在真机 instrumentation test
+     * （`Jpeg2000DecoderInstrumentedTest`）里验证过，两份测试合起来才是完整
+     * 覆盖：这里测的是"wiring 对不对"（suffix 判断、字节提取、失败兜底），
+     * 那边测的是"native 解码本身对不对"。
+     */
+    @Test
+    fun `JPX图片解码失败时显示占位图，不静默消失（wiring 测试，真正解码见 instrumentation test）`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+
+        val document = PDDocument()
+        val page = PDPage()
+        document.addPage(page)
+
+        val cosStream = document.document.createCOSStream()
+        // 内容不需要是合法的 JPX 数据——这条测试验证的是 Robolectric 环境下
+        // native 库加载不了时的兜底行为，任意非空字节即可触发 [Jpeg2000Decoder
+        // .decode] 内部的 `UnsatisfiedLinkError` → `runCatching` → `null`。
+        cosStream.createOutputStream().use { it.write(byteArrayOf(0x00, 0x01, 0x02)) }
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.TYPE, com.tom_roush.pdfbox.cos.COSName.XOBJECT)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.SUBTYPE, com.tom_roush.pdfbox.cos.COSName.IMAGE)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.FILTER, com.tom_roush.pdfbox.cos.COSName.getPDFName("JPXDecode"))
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.WIDTH, 931)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.HEIGHT, 1250)
+        cosStream.setInt(com.tom_roush.pdfbox.cos.COSName.BITS_PER_COMPONENT, 8)
+        cosStream.setItem(com.tom_roush.pdfbox.cos.COSName.COLORSPACE, com.tom_roush.pdfbox.cos.COSName.DEVICERGB)
+        val jpxImage = PDImageXObject(PDStream(cosStream), com.tom_roush.pdfbox.pdmodel.PDResources())
+        assertEquals("这条测试的前提假设——PDFBox 按 /Filter 把这张图判定成 jpx，新分支才会生效", "jpx", jpxImage.suffix)
+
+        val drawStream = com.tom_roush.pdfbox.pdmodel.PDPageContentStream(document, page)
+        drawStream.drawImage(jpxImage, 0f, 0f, 200f, 300f)
+        drawStream.close()
+
+        val output = File.createTempFile("jpx-image-doc", ".pdf")
+        output.deleteOnExit()
+        document.save(output)
+        document.close()
+
+        val content = PdfTextExtractor.extractContent(context, output)
+
+        assertEquals(1, content.images.size)
+        val bitmap = content.images.single().bitmap
+        assertTrue("占位图应该有正常的正宽高", bitmap.width > 0 && bitmap.height > 0)
+        val aspectRatioDiff = kotlin.math.abs(bitmap.width.toFloat() / bitmap.height - 931f / 1250f)
+        assertTrue("占位图应该保留原图的长宽比（误差在 0.05 以内），实际长宽比=${bitmap.width.toFloat() / bitmap.height}", aspectRatioDiff < 0.05f)
+    }
+
+    /**
      * 2026-08-22 真机反馈修复：`/Rotate 180` 的页面上，JBIG2 占位图的提示文字
      * "图片格式不支持（JBIG2）"被转成上下颠倒、左右镜像，读不出来——真机截图实测
      * 确认（用户反馈"翻到了"之后截图看到的）。根因：占位图是我们自己现画的提示

@@ -34,7 +34,13 @@
 
 ## CMYK/YCCK JPEG、JBIG2：自己手写的解码器
 
-PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。**"跟 Pillow 逐像素比对通过"不等于"结果本身是对的"**——Pillow 自己对 YCCK 反色的默认处理也会错，两份早期 fixture 的参考答案因此错了很久没被测出来，靠独立于 Pillow 的 poppler 整页渲染交叉验证才发现，见 NOTES #40。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式，见 NOTES #35。CMYK（transform=0）反色约定逐图对采样值投票判断（Adobe 标准是"存的值反色"，但真实文档存在例外），见 NOTES #29/#32；YCCK（transform=2）不投票，固定整体反色（C/M/Y/K 四个分量一起翻转），见 NOTES #40。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 600 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，见 NOTES #38）；JPX/JPEG2000 完全不支持（PDFBox-Android 需要额外的可选组件 `com.gemalto.jp2:jp2-android`，2026-08-26 核实过原发布仓库 JCenter 已关停、Maven Central 没有这个坐标、JitPack 全部版本构建失败，添加支持这件事本身找不到可靠引入渠道，见 NOTES #43），遇到时展示占位图，不再静默消失。
+PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。**"跟 Pillow 逐像素比对通过"不等于"结果本身是对的"**——Pillow 自己对 YCCK 反色的默认处理也会错，两份早期 fixture 的参考答案因此错了很久没被测出来，靠独立于 Pillow 的 poppler 整页渲染交叉验证才发现，见 NOTES #40。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式，见 NOTES #35。CMYK（transform=0）反色约定逐图对采样值投票判断（Adobe 标准是"存的值反色"，但真实文档存在例外），见 NOTES #29/#32；YCCK（transform=2）不投票，固定整体反色（C/M/Y/K 四个分量一起翻转），见 NOTES #40。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 600 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，见 NOTES #38）。
+
+## JPX/JPEG2000：接的是第三方 native 库，不是手写解码器
+
+`Jpeg2000Decoder.kt` 薄封装 `io.github.michaldvorak-gemalto:jp2-android:1.0.5`（`JP2ForAndroid` 项目，OpenJPEG 2.5.4 的 JNI 封装，**个人维护者重新发布到 Maven Central 的坐标，不是 Thales 官方渠道**，不要在对外文档里写"官方库"）。**NOTES #43 曾经记录"原坐标 `com.gemalto.jp2` 不可引入"，这条结论已过时**——上游换坐标解决了发布问题，见 NOTES #48 完整核实过程（这条结论是被用户连续三轮独立核实纠正的，不是自己主动发现）。POC 装机验证过：正常数据解码正确（跟 macOS `sips` 独立实现逐像素比对一致）、截断流/伪造头部数据稳定返回 `null` 不崩溃、NOTES #43 那份真实样本能正确解码。**遇到"某开源组件不可用"这类结论时，如果决策时间点和调研时间点隔了几天以上，先重新一手核实，不能直接复述旧结论**——这类结论有时效性，尤其是个人维护的小众库。
+
+依赖 native `.so`，Robolectric（纯桌面 JVM）加载不了，测试分两层：`PdfTextExtractorImageTest` 里的 wiring 测试（Robolectric，验证 suffix 判断/占位图降级，不测真正解码）+ `app/src/androidTest/Jpeg2000DecoderInstrumentedTest`（真机 instrumentation test，测真正的 native 解码）。`gradle connectedDebugAndroidTest` 在这个项目的 USB 环境下经常因为短暂断线整体失败（UTP 测试编排对连接中断容忍度低，不会自动重试）——更抗断线的路径是 `adb install` 手动装主 APK+androidTest APK，再 `adb shell am instrument -w app.pdfreader.test/androidx.test.runner.AndroidJUnitRunner` 直接触发。
 
 ## `Session` 并发安全
 
