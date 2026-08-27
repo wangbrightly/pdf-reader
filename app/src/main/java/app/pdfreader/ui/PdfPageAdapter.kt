@@ -1,6 +1,7 @@
 package app.pdfreader.ui
 
 import android.graphics.Bitmap
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
@@ -283,6 +284,7 @@ class PdfPageAdapter(
         val container = holder.itemView as LinearLayout
         if (isFirst) {
             container.removeAllViews()
+            resetContainerFromPlaceholderState(container)
         }
         val spacingDp = blockSpacingDpProvider()
         blocks.forEach { block ->
@@ -299,14 +301,54 @@ class PdfPageAdapter(
         }
     }
 
+    /**
+     * 2026-08-27 用户反馈"加载过程中会显示多个圆圈打转，改为一页的位置中央
+     * 只有一个圆圈，这一个屏幕上只能看到一个圆圈"——根因是旧版占位符高度写死
+     * 300px，远小于真实屏幕高度，好几页还没加载完的占位条会同时挤在一屏里，
+     * 每条各自一个转圈，看起来像"好几个圆圈同时转"；而且 `ProgressBar` 没设
+     * `gravity`，在 `MATCH_PARENT` 宽度的容器里默认贴左边缘，不在视觉中心。
+     *
+     * 两处都改：① 占位符高度改成贴近 [attachedRecyclerView] 当前的可视高度
+     * （拿不到时退回旧的 [PLACEHOLDER_HEIGHT_PX] 兜底，比如尚未 attach 的
+     * 极端情况），一页在加载完成前占的空间跟"一屏"基本相当，同一时刻自然只有
+     * 一页的占位符落在可视区域内，不会好几条挤在一起；② 占位符容器加
+     * `gravity = Gravity.CENTER`，让转圈图标在这块留白正中央，不贴边。
+     */
     private fun renderLoadingPlaceholder(holder: PageViewHolder) {
         val container = holder.itemView as LinearLayout
         container.removeAllViews()
+        container.gravity = Gravity.CENTER
+        val placeholderHeight = attachedRecyclerView?.height?.takeIf { it > 0 } ?: PLACEHOLDER_HEIGHT_PX
         container.addView(
             ProgressBar(container.context).apply {
-                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, PLACEHOLDER_HEIGHT_PX)
+                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    gravity = Gravity.CENTER
+                }
             },
         )
+        val containerParams = container.layoutParams
+        containerParams.height = placeholderHeight
+        container.layoutParams = containerParams
+    }
+
+    /**
+     * 见 [renderLoadingPlaceholder] KDoc——占位符临时把容器 `height` 撑到接近
+     * 屏幕高、`gravity` 改成居中，展示真正内容前必须撤销这两处，不然：`height`
+     * 锁死在占位符那个大数值，内容不够长的页面下面会留一大截空白；`gravity
+     * =CENTER` 会让内容整体在容器里垂直居中，而不是从顶部开始往下排——两个
+     * `ViewHolder` 被 RecyclerView 回收复用是常态（占位符渲染过的容器随时可能
+     * 被绑定去展示另一页的真正内容），[renderPage]/[renderProgressiveBlocks]
+     * 展示真正内容前都要调用这个函数复位，不能假设容器还是 [onCreateViewHolder]
+     * 里那个从未被占位符碰过的初始状态。
+     */
+    private fun resetContainerFromPlaceholderState(container: LinearLayout) {
+        // `LinearLayout` 自己的默认值就是 TOP|START（见平台源码构造函数），显式
+        // 写出来而不是用 `Gravity.NO_GRAVITY`（值为 0，语义是"不设置"，不等于
+        // "顶部靠左"），避免这两者细微差异导致复位不彻底。
+        container.gravity = Gravity.TOP or Gravity.START
+        val containerParams = container.layoutParams
+        containerParams.height = RecyclerView.LayoutParams.WRAP_CONTENT
+        container.layoutParams = containerParams
     }
 
     /**
@@ -321,6 +363,7 @@ class PdfPageAdapter(
     private fun renderPage(holder: PageViewHolder, content: PdfTextExtractor.PageContent) {
         val container = holder.itemView as LinearLayout
         container.removeAllViews()
+        resetContainerFromPlaceholderState(container)
         val spacingDp = blockSpacingDpProvider()
         content.blocks.forEachIndexed { index, block ->
             val view = when (block) {

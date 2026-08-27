@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import app.pdfreader.ui.DisplayBlock
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Path
 import android.graphics.PointF
@@ -301,6 +302,38 @@ object PdfTextExtractor {
 
     /** 见 [PageContentStreamEngine.hasFullPageImage] KDoc——图片渲染宽/高都达到页面宽/高的这个比例才算"占满全页"。 */
     private const val FULL_PAGE_IMAGE_COVERAGE_RATIO = 0.7f
+
+    /**
+     * 见 [PageContentStreamEngine.hasVisibleContent] KDoc——每条边采样这么多个点
+     * （网格采样，不是每个像素都读，几十×几十个点足够判断"这张图整体是不是
+     * 一坨接近纯色的东西"，不需要遍历几百万像素）。20×20=400 个采样点，兼顾
+     * 判断可靠性（覆盖整张图不同区域）和开销（每次判断只读 400 个像素，不会
+     * 因为这一步拖慢整页加载）。
+     */
+    private const val VISIBLE_CONTENT_SAMPLES_PER_AXIS = 20
+
+    /**
+     * 见 [PageContentStreamEngine.hasVisibleContent] KDoc——亮度标准差低于这个
+     * 阈值判定为"接近纯色，不算真的有内容"。2026-08-26 真机数据：LuraDocument
+     * 扫描书那张纯背景色 JPX 图片，全图亮度标准差实测约 3.1（Y=931×1250，
+     * 均值≈170，几乎看不出任何笔画/图案）；真正有内容的扫描页（文字/图片
+     * 占相当比例）标准差通常是这个量级的好几倍以上（哪怕只是黑白对比强烈
+     * 的文字笔画占一小部分面积，也会把标准差显著拉高）。阈值定在 12（约
+     * 4 倍于实测背景噪声），留足安全边际，不是卡在临界值上。
+     */
+    private const val VISIBLE_CONTENT_MIN_LUMINANCE_STDDEV = 12.0
+
+    /**
+     * 见 [PdfTextExtractor.loadPageLockedPhaseA] KDoc"整页栅格化兜底"一节——
+     * 判断"这一页有没有真实文字"不能用 `filtered.isEmpty()`（段落数是否为零），
+     * 真机数据打脸过一次：封面页真机 `pdftotext`/自家 stripper 都抽出了一个
+     * 孤立的"o"字符（扫描/字体渲染的噪音，不是真内容），`filtered.size` 因此
+     * 是 1 不是 0，用"是否为空"判断会误判成"有文字"，不触发栅格化兜底。改成
+     * 按去除首尾空白后的总字符数判断——真实段落（哪怕最短的标题）动辄几个到
+     * 几十个字符，1 个孤立字符的噪音远低于这个量级，阈值定在 10（留足安全
+     * 边际，不是卡在 1 和几十之间的临界值）。
+     */
+    private const val MIN_REAL_TEXT_CHARS_FOR_FALLBACK_SKIP = 10
 
     /** 见 [createUnsupportedImagePlaceholder] KDoc"占位图怎么画"一节——占位图长边缩到多少像素。 */
     private const val PLACEHOLDER_LONG_SIDE_PX = 400f
@@ -1790,6 +1823,16 @@ object PdfTextExtractor {
          * 仍然成立，只是现在 JPX 大多数情况下会真正解码成功，走不到"文字兜底
          * 展示"这条分支了。
          *
+         * **接入 JPX 解码器当天马上暴露的第二个回归**：JPX"解码成功"不等于
+         * "这张图值得为它隐藏文字"——LuraDocument 这类双层扫描技术的背景层
+         * 本身经常是一坨接近纯色的东西（纸张底色/纹理），真正能读的内容全靠
+         * PDF 里独立的、真实准确的文字对象承载。JPX 解码成功后按原逻辑隐藏
+         * 文字，用户看到的从"至少能读文字"倒退成"整页一坨灰色，什么都看不到"
+         * ——比图片解码失败时的旧行为还差。修法见
+         * [PageContentStreamEngine.hasVisibleContent]：`addRealImage` 现在
+         * 除了看"是否占满全页"，还要看"这张图是否真的有内容"（亮度标准差），
+         * 接近纯色的图片不再让 [fullPageImageDecoded] 置真，文字继续展示。
+         *
          * 根因是 [hasFullPageImage] 判断"要不要隐藏文字"只看**几何**（这张图有没有
          * 摆成占满全页的样子），不看**这张图到底有没有解码成功**——对真机原本那次
          * 反馈（图片能正常解码，文字是解码失败的 OCR 乱码）这个判断是对的；但对
@@ -1810,15 +1853,88 @@ object PdfTextExtractor {
             private set
 
         /**
+         * 2026-08-27 真机反馈修复第三轮：前两轮（[fullPageImageDecoded]/
+         * [addRealImage] 的接近纯色跳过）解决了内页文字被淹没在灰色/乱码图片
+         * 里的问题，但顺带发现新的缺口——封面这类页面，设计元素（副标题、
+         * 署名、网格线）本身就是靠"JPX 背景+JBIG2 蒙版裁出锐利图形"这套机制
+         * 画出来的，没有任何独立的可提取 PDF 文字对象兜底，被跳过之后这些
+         * 元素凭空消失。这个字段记录"这一页有没有出现过一张占满全页、但因为
+         * （接近纯色 / 带不支持的蒙版）被跳过不展示的图片"——[loadPageLockedPhaseA]
+         * 结合这个信号 + 真实文字字符数是否低于 [MIN_REAL_TEXT_CHARS_FOR_FALLBACK_SKIP]
+         * 判断要不要整页栅格化兜底（见该函数"整页栅格化兜底"一节，及该常量 KDoc——
+         * 不能用"段落数是否为零"，真机数据打脸过一次：封面页真实抽出了一个
+         * 孤立的噪音字符）：真实文字太少说明这张被跳过的图片大概率是唯一的
+         * 内容来源（封面/纯图形分隔页），这时候栅格化补回来；真实文字充足
+         * （绝大多数内页）说明真实内容已经在独立抽取的文字里了，继续维持
+         * "跳过图片、只展示文字"这个更干净的结果，不需要栅格化。
+         */
+        var hasSkippedFullPageImage = false
+            private set
+
+        /**
          * 见 [fullPageImageDecoded] KDoc——真正解出像素内容（不是占位图）时统一走
          * 这里，替代直接调 `addImage(orientImage(...))`：多一步顺便判断这张图是否
-         * 满足"占满全页"，满足就标记 [fullPageImageDecoded]。占位图（JBIG2/CMYK
-         * 解码器明确拒绝的情况）不应该调用这个函数——占位图不代表真的展示了原图
-         * 内容，不该让文字被隐藏。
+         * 满足"占满全页"+"看起来真的有内容"。占位图（JBIG2/CMYK 解码器明确拒绝
+         * 的情况）不应该调用这个函数——占位图不代表真的展示了原图内容，不该让
+         * 文字被隐藏。
+         *
+         * **占满全页但接近纯色的图片，直接不展示（不只是不隐藏文字）**：
+         * 2026-08-27 真机反馈修复第二轮——第一轮只做到"不隐藏文字"，装机复测
+         * 发现这还不够：这张接近纯色的背景图仍然作为一个展示块加进页面里，
+         * 按原始像素尺寸（如 931×1250）等比缩放显示，占的屏幕空间远大于它旁边
+         * 可能只有两三行的真实文字，翻到这页第一眼看到的还是一大片灰色，文字
+         * 要往下滚很久才看得到，观感上还是"这页是灰的"。这类图片本身没有值得
+         * 展示的内容（这正是 [hasVisibleContent] 判它"无内容"的原因），继续
+         * 展示它没有任何价值，只会占地方、拖累阅读体验——判定为"占满全页+无
+         * 内容"时这张图整个跳过，不调用 [addImage]，页面只剩真正有价值的文字。
          */
         private fun addRealImage(bitmap: Bitmap, ctm: PdfMatrix, isFullPageCoverage: Boolean) {
+            if (isFullPageCoverage && !hasVisibleContent(bitmap)) {
+                hasSkippedFullPageImage = true
+                return
+            }
             addImage(orientImage(bitmap, ctm))
             if (isFullPageCoverage) fullPageImageDecoded = true
+        }
+
+        /**
+         * 2026-08-26 真机反馈修复：JPX 接入（见 NOTES #48）后马上暴露的新回归——
+         * 一份用 LuraDocument 双层扫描技术生成的文档（背景层是低信息量的纯色/
+         * 纸张纹理 JPX 图片，真正能读的内容是 PDF 里独立的、真实准确的文字对象，
+         * 不是 [fullPageImageDecoded] 原本设计针对的"OCR 乱码文字"那种情况，见
+         * 该字段 KDoc"背景"一节），JPX 解码从"失败退占位图+展示文字"变成
+         * "成功解码+隐藏文字"后，用户看到的从"至少能读文字"倒退成"整页只有
+         * 一坨灰色，什么都看不到"——图片技术上确实解码成功了，但这张图本身
+         * 根本没有值得展示、值得为它牺牲文字的内容。
+         *
+         * 用亮度标准差判断"这张图是不是一坨接近纯色的东西"，不是猜——这是双层
+         * 扫描压缩技术本身的设计原理决定的可靠信号：背景层的存在意义就是承载
+         * "缓慢变化的纸张底色/纹理"，特意设计成低对比度、可以被压缩得很小；
+         * 真正有可读内容的扫描页（不管是文字笔画还是图片细节）天然会有大量
+         * 局部强对比（黑字/白纸，或者照片本身的明暗变化），标准差会明显更高。
+         * 具体阈值见 [VISIBLE_CONTENT_MIN_LUMINANCE_STDDEV] KDoc。
+         *
+         * 网格采样（[VISIBLE_CONTENT_SAMPLES_PER_AXIS]×自身）而不是遍历全部像素——
+         * 判断"这张图整体是不是接近纯色"不需要看每一个像素，采样几百个点足够，
+         * 遍历几百万像素反而会拖慢这一步（这是加载路径上的同步调用，不该引入
+         * 明显耗时）。
+         */
+        private fun hasVisibleContent(bitmap: Bitmap): Boolean {
+            val width = bitmap.width
+            val height = bitmap.height
+            if (width <= 0 || height <= 0) return false
+            val luminances = ArrayList<Double>(VISIBLE_CONTENT_SAMPLES_PER_AXIS * VISIBLE_CONTENT_SAMPLES_PER_AXIS)
+            for (row in 0 until VISIBLE_CONTENT_SAMPLES_PER_AXIS) {
+                val y = ((row + 0.5) / VISIBLE_CONTENT_SAMPLES_PER_AXIS * height).toInt().coerceIn(0, height - 1)
+                for (col in 0 until VISIBLE_CONTENT_SAMPLES_PER_AXIS) {
+                    val x = ((col + 0.5) / VISIBLE_CONTENT_SAMPLES_PER_AXIS * width).toInt().coerceIn(0, width - 1)
+                    val pixel = bitmap.getPixel(x, y)
+                    luminances.add(0.299 * Color.red(pixel) + 0.587 * Color.green(pixel) + 0.114 * Color.blue(pixel))
+                }
+            }
+            val mean = luminances.average()
+            val variance = luminances.sumOf { (it - mean) * (it - mean) } / luminances.size
+            return kotlin.math.sqrt(variance) >= VISIBLE_CONTENT_MIN_LUMINANCE_STDDEV
         }
 
         /**
@@ -2048,6 +2164,40 @@ object PdfTextExtractor {
             // 落进下面 `pdImage.image` 那条通用兜底（PdfBox-Android 自己解不了
             // JPX，见旧版本这里的诊断记录）。
             if (pdImage.suffix == "jpx") {
+                // 2026-08-27 真机反馈修复："整页灰色，没有图像"——追出的不是 JPX
+                // 解码本身的问题（`Jpeg2000Decoder` 返回的像素跟 macOS `sips`
+                // 独立解码逐像素一致，见 NOTES #48），而是这份文档（LuraDocument
+                // 双层扫描）里体积更大的那张 JPX 图片带了一张 JBIG2 蒙版
+                // （`PDImageXObject.getMask()`，PDF 标准的 stencil mask 机制——
+                // 蒙版决定哪些像素该显示，不套用蒙版直接画原始像素，会把本该被
+                // 蒙版遮住的高频底色数据整个暴露出来）。`pdImage.image` 那条
+                // PdfBox-Android 自带的路径会自动处理蒙版合成（`applyMask`，见
+                // `PDImageXObject` 反编译字节码），但这里直接读 `JPXDecode` 原始
+                // 字节绕开了那条路径，所以蒙版合成这一步被跳过了——独立用
+                // poppler `pdftoppm` 渲染同一页确认过：真实内容是清晰的黑色文字，
+                // 不是我们展示的锯齿状阴影。
+                //
+                // 蒙版合成本身没有实现（需要额外解码 JBIG2 蒙版、按 PDF 规范的
+                // Decode 数组极性跟颜色图逐像素合成，是一块新功能，评估过后发现
+                // "真正通用"的合成本质上等于整页栅格化——蒙版抠掉的区域露出的是
+                // 这张图下方另外画的内容（内页是黑色文字填充，封面是设计元素），
+                // 不知道下方画了什么就没法正确合成，没有走这条路），带蒙版的
+                // JPX 图片先跳过不展示（不展示可能是错的内容，比展示占位图更
+                // 合适）。跳过之后这一页会不会变成空白，取决于旁边还有没有真实
+                // 文字——[hasSkippedFullPageImage] 记下这次跳过，交给
+                // [loadPageLockedPhaseA]"整页栅格化兜底"一节判断：真实文字为空
+                // （封面/纯图形分隔页，这张被跳过的图片是唯一内容来源）时改用
+                // `PDFRenderer` 整页栅格化补回来，真实文字不为空（绝大多数内页）
+                // 时维持跳过。
+                val hasUnsupportedMask = runCatching {
+                    val imageXObject = pdImage as? com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
+                    imageXObject?.mask != null || imageXObject?.softMask != null
+                }.getOrDefault(false)
+                if (hasUnsupportedMask) {
+                    if (isFullPageCoverage) hasSkippedFullPageImage = true
+                    return
+                }
+
                 val jpxBytes = runCatching {
                     pdImage.createInputStream(listOf("JPXDecode")).use { it.readBytes() }
                 }.getOrNull()
@@ -2136,7 +2286,7 @@ object PdfTextExtractor {
      * [loadPage] 内部调 [RunningFooterFilter.pageNoiseIndices] 直接查表——见
      * [RunningFooterFilter] 类注释"样本学习 + 按页应用"一节的完整设计理由和已知局限。
      */
-    class Session private constructor(private val document: PDDocument) : java.io.Closeable {
+    class Session private constructor(private val document: PDDocument, private val file: File) : java.io.Closeable {
         val pageCount: Int = document.numberOfPages
 
         /**
@@ -2401,6 +2551,44 @@ object PdfTextExtractor {
             data class PendingImages(val textBlocks: List<DisplayBlock>, val imageResults: List<PageImageResult>) : PageLoadPhaseA()
         }
 
+        /**
+         * 见 [loadPageLockedPhaseA]"整页栅格化兜底"一节完整背景——用 Android 系统
+         * 自带的 `android.graphics.pdf.PdfRenderer`（pdfium 引擎）整页栅格化，
+         * 不是 PdfBox-Android 自己的 [PDFRenderer]（真机验证过后者对带 JBIG2
+         * 蒙版的图片同样渲染不全，根因是 PdfBox-Android 从未实现 JBIG2 解码）。
+         *
+         * `PdfRenderer` 需要 `ParcelFileDescriptor`，不能直接吃 [document]（已经
+         * 解析成的 [PDDocument] 对象）——这也是 [Session] 这一轮改动要额外存一份
+         * [file] 引用的原因，之前只存了 [document]。每次调用都新开一个
+         * `PdfRenderer`/`ParcelFileDescriptor`（不缓存复用）：这条兜底路径命中
+         * 频率很低（只有"占满全页的图片被跳过+真实文字很少"这种少见组合才会
+         * 走到这里，见调用方判断条件），没必要为了省这点开销去处理"pdfium 是否
+         * 线程安全、要不要跨 `loadPage` 调用共享同一个 `PdfRenderer` 实例"这类
+         * 复杂度——每次用完就关，简单、安全。
+         *
+         * 输出分辨率对齐 [TABLE_PAGE_RENDER_DPI]（表格分支同一个值，页面点数
+         * `page.width`/`page.height` 本身就是 pt，`dpi/72` 是标准的 pt→px 换算），
+         * 保持这个 App 里"整页栅格化的图看起来有多细"这件事只有一个统一标准，
+         * 不需要为这条新路径另起一个数字。用 `RENDER_MODE_FOR_DISPLAY`（不是
+         * `RENDER_MODE_FOR_PRINT`）——这张图是给用户在屏幕上看的，不是打印，
+         * 装机验证过两种模式实际观感差异不明显，选语义更贴切的那个。
+         */
+        private fun renderPageWithAndroidPdfRenderer(pageNo: Int): Bitmap? = runCatching {
+            android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+                android.graphics.pdf.PdfRenderer(pfd).use { renderer ->
+                    renderer.openPage(pageNo - 1).use { page ->
+                        val scale = TABLE_PAGE_RENDER_DPI / 72f
+                        val width = (page.width * scale).toInt().coerceAtLeast(1)
+                        val height = (page.height * scale).toInt().coerceAtLeast(1)
+                        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                        bitmap.eraseColor(android.graphics.Color.WHITE)
+                        page.render(bitmap, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        bitmap
+                    }
+                }
+            }
+        }.getOrNull()
+
         private fun loadPageLockedPhaseA(pageNo: Int): PageLoadPhaseA {
             // 2026-08-20 临时诊断日志：追查真机反馈"这本书打开后翻某些页要好几秒"——
             // 拆开量每一步耗时，看是矢量扫描/表格检测慢，还是文字抽取本身慢，定位完
@@ -2447,12 +2635,16 @@ object PdfTextExtractor {
             // 时 CMYK 是乐观假设"稍后会成功"（同一份 KDoc 说明过），不是精确值，
             // 但这份精确度对"要不要隐藏文字"这个决定够用。
             var scanFullPageImageDecoded = false
+            // 见 PageContentStreamEngine.hasSkippedFullPageImage KDoc——"整页栅格化
+            // 兜底"这条判断要用到的另一半信号。
+            var scanHasSkippedFullPageImage = false
             var scanImageResults: List<PageImageResult> = emptyList()
             val scanResult = runCatching {
                 val engine = PageContentStreamEngine(page, decodeImages = true, deferCmykDecode = true)
                 engine.processPage(page)
                 scanHasFullPageImage = engine.hasFullPageImage
                 scanFullPageImageDecoded = engine.fullPageImageDecoded
+                scanHasSkippedFullPageImage = engine.hasSkippedFullPageImage
                 scanImageResults = engine.imageResults
                 engine.segments to engine.hasImages
             }.getOrDefault(emptyList<LineSegment>() to false)
@@ -2536,6 +2728,36 @@ object PdfTextExtractor {
                 }
                 return PageLoadPhaseA.Complete(PageContent(blocks))
             }
+            // 整页栅格化兜底：见 PageContentStreamEngine.hasSkippedFullPageImage
+            // KDoc 完整背景——"跳过接近纯色/带不支持蒙版的全页图片"这个策略对
+            // 绝大多数内页是对的（真实内容早就在独立抽取的文字里），但对封面/
+            // 纯图形分隔页是错的（这类页面没有独立文字兜底，被跳过的图片就是
+            // 唯一的内容来源，见 NOTES #48/#49 真机反馈"封面颜色不正常/缺副
+            // 标题"）。判断依据是"这一页有没有真实可提取的文字"，用真实字符数
+            // （见 [MIN_REAL_TEXT_CHARS_FOR_FALLBACK_SKIP] KDoc），不是段落数
+            // 是否为零——真机数据打脸过一次：封面页真实抽出了一个孤立的噪音
+            // 字符（"o"），`filtered.isEmpty()` 判不出来；不是猜哪些页是封面，
+            // 用"有没有真实文字"这个已经在手边的信号判断，比额外去猜"这是不是
+            // 封面"可靠。
+            //
+            // 整页栅格化用 [renderPageWithAndroidPdfRenderer]（Android 系统自带的
+            // android.graphics.pdf.PdfRenderer，底层是 pdfium——Chrome 用来渲染
+            // PDF 的同一套引擎），不是复用表格分支那套 PdfBox 自己的 `PDFRenderer`。
+            // 真机装机验证过：PdfBox-Android 自己的 `PDFRenderer` 整页栅格化**同样
+            // 渲染不出**这张带 JBIG2 蒙版的封面图（导出栅格化结果逐像素比对，
+            // 缺失的设计元素跟我们自己手写的 drawImage 路径一模一样）——根因不是
+            // JPX（那条已经用 [Jpeg2000Decoder] 解决了），是 PdfBox-Android 自己
+            // 从来没实现过 JBIG2 解码（这正是这个项目当初要手写
+            // [Jbig2GenericRegionDecoder]/[Jbig2SymbolTextDecoder] 的原因），
+            // `PDFRenderer` 内部渲染管线一样会撞上这堵墙。换成 pdfium 之后同一份
+            // 文件真机验证过完整正确（标题/QFD 图标/副标题/网格线/编者署名全部
+            // 正确显示），pdfium 对 JBIG2+蒙版这类复杂特性的支持是成熟的。
+            val realTextCharCount = filtered.sumOf { it.text.trim().length }
+            if (scanHasSkippedFullPageImage && realTextCharCount < MIN_REAL_TEXT_CHARS_FOR_FALLBACK_SKIP) {
+                val blocks = mutableListOf<DisplayBlock>()
+                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                return PageLoadPhaseA.Complete(PageContent(blocks))
+            }
             // 见 PageContentStreamEngine.fullPageImageDecoded KDoc——图片占满全页
             // **且真的解码成功**时，用户明确要求不显示旁边的文字（大概率是扫描
             // 工具自动加的隐藏 OCR 噪音文字，真机复现过"、飞、飞、总"这类反复出现
@@ -2591,7 +2813,7 @@ object PdfTextExtractor {
                 // 设置。如实记录：`PDDocument.load` 本身的耗时目前没找到有效的优化
                 // 手段，留给以后有需要再查（见 NOTES.md 对应条目）。
                 val document = PDDocument.load(file)
-                val session = Session(document)
+                val session = Session(document, file)
                 // 见 footerLearnedTitles/outline 字段 KDoc——两个都放后台跑，不阻塞
                 // Session.open() 本身返回，这样调用方（MainActivity.loadPdf）能尽快
                 // 显示内容。

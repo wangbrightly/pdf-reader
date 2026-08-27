@@ -42,6 +42,10 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 
 依赖 native `.so`，Robolectric（纯桌面 JVM）加载不了，测试分两层：`PdfTextExtractorImageTest` 里的 wiring 测试（Robolectric，验证 suffix 判断/占位图降级，不测真正解码）+ `app/src/androidTest/Jpeg2000DecoderInstrumentedTest`（真机 instrumentation test，测真正的 native 解码）。`gradle connectedDebugAndroidTest` 在这个项目的 USB 环境下经常因为短暂断线整体失败（UTP 测试编排对连接中断容忍度低，不会自动重试）——更抗断线的路径是 `adb install` 手动装主 APK+androidTest APK，再 `adb shell am instrument -w app.pdfreader.test/androidx.test.runner.AndroidJUnitRunner` 直接触发。
 
+**图片"占满全页且解码成功"≠"值得为它隐藏文字/占屏幕空间"**：`PageContentStreamEngine.hasVisibleContent`（亮度标准差采样，阈值 12）判断这张图是不是接近纯色的背景层——不是的话正常展示；是的话不仅不隐藏文字，图片本身也整个跳过不展示（`addRealImage`），避免"图解码成功了但内容毫无价值"占用比真实文字大得多的屏幕空间，见 NOTES #49 完整的三轮真机回归过程。
+
+**PDF 蒙版（`/Mask` stencil masking）目前不合成，遇到就跳过**：`PageContentStreamEngine.drawImage` 检测到 JPX 图片带 `getMask()`/`getSoftMask()` 就直接跳过不展示——真正合成需要知道蒙版抠掉的区域下方画了什么，等同于整页栅格化，不是两张位图简单叠加。`hasSkippedFullPageImage` 记录这次跳过；当页面**同时**满足"真实文字字符数低于阈值"（`MIN_REAL_TEXT_CHARS_FOR_FALLBACK_SKIP = 10`，不能用 `filtered.isEmpty()`——真机数据证实封面页会有孤立噪音字符骗过"是否为空"判断）时，改用 `Session.renderPageWithAndroidPdfRenderer` 整页栅格化兜底（**不是** PdfBox 自己的 `PDFRenderer`——真机验证过后者对同一份数据一样渲染不全，根因是 PdfBox-Android 从未实现 JBIG2 解码，`PDFRenderer` 内部渲染管线一样受限；`android.graphics.pdf.PdfRenderer` 是系统自带的 pdfium 引擎，对 JBIG2+蒙版支持成熟，真机验证过完整正确）。
+
 ## `Session` 并发安全
 
 `PdfTextExtractor.Session` 内部有个 `documentLock`（`ReentrantLock(true)`，公平模式），`loadPage`/后台页脚学习线程/后台目录抽取线程全部互斥访问同一个 `PDDocument`——**改这块代码前一定要读 NOTES #33/#34/#36/#43**：`PDDocument` 不是"多读者安全"的资源，`loadPage` 之间并发访问会导致真实的数据损坏（不是理论风险，受控实验实锤过），读写锁的"多读者"模型在这里从设计上就是错的；公平性同样重要，非公平锁在后台线程高频重新加锁时会把 `loadPage` 饿死很久（真机复现过 18 秒卡顿）。**例外**：CMYK/YCCK 图片的真正解码（`JpegDecoder.decode`）从 NOTES #43 起被拆出锁外——它只读一份已经从 `PDImage` 复制出来的 `ByteArray`，不碰 `PDDocument`，多个 `loadPage` 调用可以真正并发解码；`PageContentStreamEngine` 的 `deferCmykDecode=true` 模式负责这个拆分（锁内只读字节，不调 `JpegDecoder.decode`），`PdfPageAdapter.LOAD_POOL_SIZE=3` 就是靠这个例外才有真实并发收益，不是单纯"抢锁"。`loadPage` 另外多了个 `onTextReady` 回调（文字抽完立刻回调展示，不用等同页图片解码完），`PdfPageAdapter` 的加载队列从普通 FIFO 换成 `PriorityBlockingQueue`（当前可见页优先于预加载页），见 NOTES #44——这两处装机上验证过能正常工作，但"确实更快"这个体感结论没有拿真机 logcat 时间戳逐条量化过。

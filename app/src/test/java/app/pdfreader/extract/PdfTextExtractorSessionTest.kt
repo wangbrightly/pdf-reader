@@ -239,6 +239,215 @@ class PdfTextExtractorSessionTest {
     }
 
     /**
+     * NOTES.md #48：接入 JPX 解码器（[Jpeg2000Decoder]）当天马上暴露的回归——
+     * 真机反馈"整页灰色，没有图像"，分两轮修复。根因：LuraDocument 这类双层
+     * 扫描技术生成的文档，背景层本身经常是一坨接近纯色的东西（纸张底色/
+     * 纹理），真正能读的内容全靠 PDF 里独立的、真实准确的文字对象承载，不是
+     * 上面 `图片占满全页时不显示旁边的文字` 那条测试针对的"OCR 乱码文字"场景。
+     *
+     * **第一轮修复**（只做到"不隐藏文字"）：JPX 解码"成功"（技术上没错，像素
+     * 值是对的）之后，按原来的规则隐藏文字，用户看到的从"至少能读文字"倒退成
+     * "整页一坨灰色，什么都看不到"，比图片解码失败时的旧行为还差——改成
+     * "占满全页+看起来真的有内容"两者都满足才隐藏文字。
+     *
+     * **第二轮修复**（真机复测揪出的进一步问题）：只是"不隐藏文字"还不够——
+     * 这张接近纯色的背景图仍然被当成一个展示块加进页面里，按原始像素尺寸等比
+     * 缩放显示，占的屏幕空间远大于旁边可能只有两三行的真实文字，翻到这页第一
+     * 眼看到的还是一大片灰色，文字要往下滚很久才看得到，观感上还是"这页是灰
+     * 的"。改成：占满全页 + 没有实际内容的图片，直接不展示这个图片本身，不只是
+     * 不隐藏文字——这类图片没有任何值得展示的内容，继续展示只会占地方。
+     *
+     * 这条测试用一张真实解码成功、但内容接近纯灰色（标准差远低于
+     * [PdfTextExtractor.VISIBLE_CONTENT_MIN_LUMINANCE_STDDEV]）的图片铺满整页
+     * +一段"真实"文字，验证 [PdfTextExtractor.PageContentStreamEngine
+     * .hasVisibleContent] 生效：图片解码成功但没有实际内容时，文字继续展示，
+     * 这张没有内容的图片本身则完全不出现在结果里。
+     */
+    @Test
+    fun `图片解码成功但接近纯色时只展示文字，图片本身也不展示（真机JPX灰屏反例）`() {
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+        val document = PDDocument()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight))
+        document.addPage(page)
+
+        // 纯色 PNG（32x32，全部像素同一个灰色），标准差=0，远低于判定阈值——
+        // 用 java.awt/ImageIO（纯 JVM，不经过 Android Bitmap API）现场生成，
+        // 不需要额外的二进制 fixture 文件。
+        val solidGrayPng = run {
+            val image = java.awt.image.BufferedImage(32, 32, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val graphics = image.createGraphics()
+            graphics.color = java.awt.Color(170, 170, 158)
+            graphics.fillRect(0, 0, 32, 32)
+            graphics.dispose()
+            val output = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(image, "png", output)
+            output.toByteArray()
+        }
+        val grayImage = com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject.createFromByteArray(document, solidGrayPng, "gray")
+
+        val stream = PDPageContentStream(document, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("real book text")
+        stream.endText()
+        stream.drawImage(grayImage, 0f, 0f, pageWidth, pageHeight)
+        stream.close()
+
+        val file = File.createTempFile("full-page-solid-gray-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.save(file)
+        document.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue(
+                "接近纯色的图片不该被当成'真的有内容'，文字应该继续展示，实际 blocks=$blocks",
+                blocks.any { it is DisplayBlock.Text },
+            )
+            assertTrue(
+                "接近纯色、没有实际内容的图片不该展示，只会占地方，实际 blocks=$blocks",
+                blocks.none { it is DisplayBlock.Image },
+            )
+        }
+    }
+
+    /**
+     * NOTES.md #49：真机反馈"跳过没内容的全页图片"这条规则对封面页是错的——
+     * 真机核实过封面页 `pdftotext` 抽出来的字符数是 0，跟内页动辄几百字符的
+     * 真实段落有数量级差距：封面上的副标题/署名/网格线这些设计元素全靠
+     * "JPX 背景+蒙版裁出锐利图形"这套机制画出来，没有任何独立可提取文字对象
+     * 兜底，被跳过之后这些设计元素凭空消失（真机截图对比 poppler 独立渲染
+     * 确认过，见该 NOTES 条目）。
+     *
+     * 修法：这一页除了"接近纯色的图片被跳过"，还要满足"完全没有真实可提取
+     * 文字"（[PageContentStreamEngine.hasSkippedFullPageImage] KDoc"整页栅格化
+     * 兜底"一节），才改用 `android.graphics.pdf.PdfRenderer`（Android 系统自带、
+     * pdfium 引擎，见 [PdfTextExtractor.Session.renderPageWithAndroidPdfRenderer]
+     * KDoc——真机验证过 PdfBox 自己的 `PDFRenderer` 对这类带 JBIG2 蒙版的图片
+     * 同样渲染不全，pdfium 才是真正能用的）整页栅格化。
+     *
+     * **这条测试测不到"真的栅格化出正确图片"这一步**：`android.graphics.pdf
+     * .PdfRenderer` 依赖真实的 Android 系统 PDF 渲染服务，Robolectric（纯桌面
+     * JVM）没有这个服务的可用影子实现，`renderPageWithAndroidPdfRenderer`
+     * 内部 `runCatching` 会吞掉失败、返回 `null`——这里只验证"没有走回旧的
+     * 展示逻辑"（不该出现文字块，这一页本来就没有真实文字）；"真的栅格化出
+     * 完整封面"这条真机结论见 NOTES.md 对应条目（真机截图跟 poppler 独立渲染
+     * 逐像素比对过标题/QFD 图标/副标题/网格线/编者署名，完全一致）。
+     */
+    @Test
+    fun `占满全页的图片没内容且完全没有真实文字时，整页栅格化兜底（真机封面反例）`() {
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+        val document = PDDocument()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight))
+        document.addPage(page)
+
+        val solidGrayPng = run {
+            val image = java.awt.image.BufferedImage(32, 32, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val graphics = image.createGraphics()
+            graphics.color = java.awt.Color(30, 30, 40)
+            graphics.fillRect(0, 0, 32, 32)
+            graphics.dispose()
+            val output = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(image, "png", output)
+            output.toByteArray()
+        }
+        val grayImage = com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject.createFromByteArray(document, solidGrayPng, "gray")
+
+        // 不放任何文字——模拟封面页"设计元素全靠图片承载，没有独立文字对象"
+        // 这个真机确认过的结构特征。
+        val stream = PDPageContentStream(document, page)
+        stream.drawImage(grayImage, 0f, 0f, pageWidth, pageHeight)
+        stream.close()
+
+        val file = File.createTempFile("full-page-no-text-cover-doc", ".pdf")
+        file.deleteOnExit()
+        document.save(file)
+        document.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            // Robolectric 环境下 android.graphics.pdf.PdfRenderer 不可用，栅格化
+            // 会失败返回 null，blocks 因此是空列表——这跟真机上"渲染成功、恰好
+            // 一张图片"是同一条代码路径的两种环境结果，见上面类 KDoc 完整说明。
+            assertTrue(
+                "整页栅格化兜底最多只应该有一张图片，不该有文字块，实际 blocks=$blocks",
+                blocks.count { it is DisplayBlock.Image } <= 1 && blocks.none { it is DisplayBlock.Text },
+            )
+        }
+    }
+
+    /**
+     * NOTES.md #49：上一条测试用的是"完全没有文字"这个理想情况，真机数据打脸
+     * 过一次——真实封面页并不是真的一个字都提取不出来，`pdftotext`/自家
+     * stripper 都抽出了一个孤立的"o"（扫描/字体渲染噪音，不是真内容）。第一版
+     * 判断用 `filtered.isEmpty()`（段落数是否为零）会被这一个字符骗过去，
+     * 误判成"有文字"，不触发栅格化兜底，封面继续缺副标题/署名/网格线。
+     *
+     * 这条测试专门验证这个真机反例：页面上放一个孤立的短字符（不是空字符串），
+     * 图片仍然是接近纯色且无文字兜底价值——应该仍然触发整页栅格化兜底，不能
+     * 因为"技术上不是空的"就放过。
+     *
+     * 断言用"这个孤立字符不该出现在结果里"而不是"应该有一张图片"——见上一条
+     * 测试 KDoc，`android.graphics.pdf.PdfRenderer` 在 Robolectric 下不可用，
+     * 没法断言真的拿到栅格化图片；但"旧判断被这个字符骗过、退回正常文字展示"
+     * 这个回归（本条测试真正要防的问题）刚好能测：一旦退回正常路径，这个"o"
+     * 会被当成 [DisplayBlock.Text] 展示出来，走了正确的整页栅格化兜底则不会
+     * （兜底分支整个丢弃 `filtered`，不管栅格化成功与否都不会有这个文字块）。
+     */
+    @Test
+    fun `只有孤立噪音字符、没有真正段落时，仍然整页栅格化兜底（真机封面反例二）`() {
+        val context = RuntimeEnvironment.getApplication()
+        PDFBoxResourceLoader.init(context)
+        val document = PDDocument()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = PDPage(com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight))
+        document.addPage(page)
+
+        val solidGrayPng = run {
+            val image = java.awt.image.BufferedImage(32, 32, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val graphics = image.createGraphics()
+            graphics.color = java.awt.Color(30, 30, 40)
+            graphics.fillRect(0, 0, 32, 32)
+            graphics.dispose()
+            val output = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(image, "png", output)
+            output.toByteArray()
+        }
+        val grayImage = com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject.createFromByteArray(document, solidGrayPng, "gray")
+
+        val stream = PDPageContentStream(document, page)
+        // 真机确认过的噪音特征：孤立的单字符，不是一整段真实内容。
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("o")
+        stream.endText()
+        stream.drawImage(grayImage, 0f, 0f, pageWidth, pageHeight)
+        stream.close()
+
+        val file = File.createTempFile("full-page-noise-char-cover-doc", ".pdf")
+        file.deleteOnExit()
+        document.save(file)
+        document.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue(
+                "只有一个噪音字符不算真实文字兜底，仍应整页栅格化、不该展示这个字符，实际 blocks=$blocks",
+                blocks.none { it is DisplayBlock.Text },
+            )
+        }
+    }
+
+    /**
      * NOTES.md #43：真机反馈一份 Internet Archive 扫描书（LuraDocument 产出，
      * 每页是 JPEG2000/JPX 编码的扫描背景图 + 真实可读的文字层）真机复现"翻开
      * 一页，什么都没有"——追出根因：这台设备解不了 JPX（需要额外的可选组件
