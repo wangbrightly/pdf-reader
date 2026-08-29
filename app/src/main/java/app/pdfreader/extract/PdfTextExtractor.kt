@@ -485,6 +485,112 @@ object PdfTextExtractor {
     }.getOrNull()
 
     /**
+     * 已修：蒙版（`/SMask`）是 JPEG 编码时，`pdImage.image`（PdfBox-Android 自带的
+     * 解码+合成路径）产出纯黑图片（2026-08-29 真机反馈"这本书的页面该显示成图片却把
+     * 文字和图片分开显示了"，追出来其实不是排版问题，是这批图片本身解码成了纯黑——
+     * 用户描述的"分开显示"其实是正常的图文交错布局，只是图片内容是黑的）。
+     *
+     * ## 排查过程：第一版判断条件搞错了，靠真机日志纠正
+     *
+     * 真机截图看到两块纯黑矩形，跟独立渲染器 poppler 交叉核对确认这两块位置本该是
+     * 正常的示意图（不是设计成黑色的内容）。第一轮诊断日志（用 `pdfimages -list`
+     * 交叉核对）误判成"底图和蒙版都是 JPEG"——按这个判断写的第一版修法（`pdImage.
+     * suffix=="jpg"` 且蒙版也是 jpg 才触发）装机复测**完全没有效果**，两块黑框
+     * 原样还在。第二轮直接在真实调用路径上加无条件日志（`ALL_IMAGE_DIAG`，不带任何
+     * 前置判断，记录每张图的 `suffix`/`mask`/`softMask`/`softMaskSuffix`），这次
+     * 才看清真相：**这 8 张图的底图 `suffix` 其实是 `"png"`（PdfBox-Android 对
+     * FlateDecode 栅格数据的后缀标记，不是真的 PNG 容器格式），蒙版才是 `jpg`**——
+     * 第一版的"底图必须是 jpg"这个前提条件从一开始就把这 8 张图挡在外面，函数
+     * 从未被真正触发过。教训：`pdfimages` 这类第三方工具的输出分组和真实调用路径上
+     * `PDImage` 实例的字段值不能想当然对应，判断条件要用真机日志实测出来的字段值
+     * 逐条核对，不能靠静态分析工具的输出反推（跟 [[feedback_lazy_unverifiable_claims]]
+     * 是同一类教训：没试过就不能当结论用，这次是"试的方式不对"）。
+     *
+     * 根因还是 PdfBox-Android 自己的合成逻辑（`pdImage.image` 内部走 `applyMask`）
+     * 处理 JPEG 编码蒙版有 bug，跟底图本身是什么格式无关——同一份 JPEG 蒙版字节
+     * 单独用 `BitmapFactory` 解码是正常的灰度图（这台设备上反复验证过 JPEG 解码
+     * 本身没问题，见 [decodeJpegWithNativeSubsampling]），蒙版格式是 PNG/JPX 时
+     * `pdImage.image` 的合成完全正常（真机数据里这两种蒙版对应的图片亮度都在
+     * 正常范围）。
+     *
+     * ## 修法：绕开 PdfBox 的合成，底图交给 PdfBox 自己解码（去掉蒙版之后），蒙版自己解码，手动叠加
+     *
+     * 底图不再限定必须是 JPEG——直接复用 PdfBox-Android 自己成熟的 `PDImageXObject
+     * .getImage()`，只是调用前**临时把 `/SMask` 从底图的 `COSDictionary` 里摘掉**
+     * （`removeItem(COSName.SMASK)`），解码完再放回去（`setItem` 恢复原值，不影响
+     * 这个 `PDImageXObject` 后续任何其它用途）——这样拿到的是"没有蒙版参与合成"的
+     * 纯底图像素，不管底图原本是 JPEG/PNG/其它格式，都交给 PdfBox 自己一直可靠的
+     * 解码逻辑处理，我们不用重新造一个"识别任意底图格式再解码"的轮子。蒙版单独用
+     * `BitmapFactory.decodeByteArray` 解码原始 JPEG 字节（灰度值当 alpha 通道，
+     * `R`/`G`/`B` 三个通道对灰度 JPEG 应该相等，直接取 `R`），跟底图逐像素手动
+     * 拼成新的 `ARGB_8888` 位图。蒙版和底图的像素尺寸如果不一致（PDF 规范允许
+     * `/SMask` 跟主图分辨率不同），先用 `Bitmap.createScaledBitmap` 把蒙版缩放到
+     * 跟底图一致再取样——不追求跟 PDF 规范"用归一化坐标插值"完全等价，双线性缩放
+     * 对这种量级的分辨率差异视觉上足够。
+     *
+     * 触发条件只看蒙版：`imageXObject.softMask?.suffix=="jpg"`——不看底图格式（上面
+     * 踩过这个坑）。不处理 `PDImageXObject.getMask()` 那种 stencil mask（不同机制，
+     * 见 [PageContentStreamEngine.drawImage] JPX 分支的 KDoc"目前不合成，遇到就
+     * 跳过"一节），也不处理蒙版是 PNG/JPX 的组合（真机数据证实那两种本来就是正常的，
+     * 没有理由额外绕开 PdfBox 自己的合成逻辑，多一层自己的解码只会多一个新的出错点）。
+     * 任何一步失败（不是 JPEG 蒙版、`removeItem`/`setItem`/解码任何一步抛异常）都
+     * 返回 `null`，调用方回退到下面 `pdImage.image` 那条通用路径——对不在范围内的
+     * 图片，行为跟这次修复之前完全一样。
+     *
+     * ## 已知局限：Robolectric 验证不了"是不是真的不黑了"
+     *
+     * 跟 [decodeJpegWithNativeSubsampling] KDoc 记录的坑一样，Robolectric 环境下
+     * `BitmapFactory.decodeByteArray` 解码结果尺寸可信、像素内容不可信（影子实现
+     * 不是真的 JPEG 解码器）。单元测试（[PdfTextExtractorSoftMaskTest]）只能验证
+     * "这条新路径确实被触发"，验证"合成结果真的不是纯黑"必须靠真机——这次吃过
+     * "第一版真机复测才发现判断条件从一开始就没生效"的教训，装上新版本后必须重新
+     * 完整走一遍真机截图核对，不能只看"编译过、单测过"就当作已验证。
+     */
+    private fun decodeJpegSoftMaskCompositeOrNull(pdImage: PDImage): Bitmap? = runCatching {
+        val imageXObject = pdImage as? com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
+            ?: return null
+        val softMask = imageXObject.softMask ?: return null
+        if (softMask.suffix != "jpg") return null
+
+        // 临时摘掉 /SMask 再调用 PdfBox 自己的 getImage()——不管底图本身是什么
+        // 格式（JPEG/PNG/其它），交给 PdfBox 一直可靠的底图解码逻辑处理，只是
+        // 不让它有机会跑到内部那段处理 JPEG 蒙版会出 bug 的合成代码。解码完立刻
+        // 把 /SMask 放回去，这个 PDImageXObject 后续（比如同一份内容流里被引用
+        // 第二次）还是完整的，不留下被我们改坏的状态。
+        val smaskEntry = imageXObject.cosObject.getDictionaryObject(com.tom_roush.pdfbox.cos.COSName.SMASK)
+        val baseBitmap = try {
+            imageXObject.cosObject.removeItem(com.tom_roush.pdfbox.cos.COSName.SMASK)
+            imageXObject.image
+        } finally {
+            if (smaskEntry != null) {
+                imageXObject.cosObject.setItem(com.tom_roush.pdfbox.cos.COSName.SMASK, smaskEntry)
+            }
+        } ?: return null
+
+        val maskBytes = softMask.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
+        val maskBitmapRaw = BitmapFactory.decodeByteArray(maskBytes, 0, maskBytes.size) ?: return null
+        val maskBitmap = if (maskBitmapRaw.width != baseBitmap.width || maskBitmapRaw.height != baseBitmap.height) {
+            Bitmap.createScaledBitmap(maskBitmapRaw, baseBitmap.width, baseBitmap.height, true)
+        } else {
+            maskBitmapRaw
+        }
+
+        val width = baseBitmap.width
+        val height = baseBitmap.height
+        val basePixels = IntArray(width * height)
+        baseBitmap.getPixels(basePixels, 0, width, 0, 0, width, height)
+        val maskPixels = IntArray(width * height)
+        maskBitmap.getPixels(maskPixels, 0, width, 0, 0, width, height)
+        for (i in basePixels.indices) {
+            val alpha = maskPixels[i] and 0xFF
+            basePixels[i] = (alpha shl 24) or (basePixels[i] and 0x00FFFFFF)
+        }
+        val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        result.setPixels(basePixels, 0, width, 0, 0, width, height)
+        result
+    }.getOrNull()
+
+    /**
      * CMYK/YCCK（4 分量）JPEG——真机反馈"这本书图片显示颜色不对"→"背景变为黑色"，
      * 加诊断日志逐张记录 suffix/JPEG 真实分量数（[JpegComponentCount.of]，读 SOF
      * 标记，不受 [PDImage.colorSpace] 的"CMYK 永远误报成 DeviceRGB"这个已知缺陷
@@ -2363,6 +2469,15 @@ object PdfTextExtractor {
                 }
                 return
             }
+            // 见 decodeJpegSoftMaskCompositeOrNull KDoc 完整背景：底图和蒙版都是
+            // JPEG 编码时，PdfBox-Android 自己的合成（`pdImage.image` 内部调用）
+            // 会产出纯黑图片，必须在下面这条通用回退路径之前拦截。
+            val softMaskComposite = decodeJpegSoftMaskCompositeOrNull(pdImage)
+            if (softMaskComposite != null) {
+                val ctm = graphicsState.currentTransformationMatrix
+                addRealImage(softMaskComposite, ctm, isFullPageCoverage)
+                return
+            }
             // 见 decodeJpegWithNativeSubsampling KDoc"第三次尝试"一节——只对 JPEG
             // 编码、且长边确实超标的图片生效；不满足条件（不是 JPEG、没超标、原生
             // 解码本身失败）都回退到一直可靠的 `pdImage.image` 原始分辨率解码。
@@ -2371,9 +2486,8 @@ object PdfTextExtractor {
             // 图片静默消失——`runCatching` 吞掉异常之后图片凭空消失，跟本类其它
             // 格式"解不出来就用诚实占位图"的一贯处理不一致。改成失败时也展示
             // 占位图，不再静默消失。
-            val nativeResult = runCatching { pdImage.image }
             val bitmap = decodeJpegWithNativeSubsampling(pdImage)
-                ?: nativeResult.getOrNull()
+                ?: runCatching { pdImage.image }.getOrNull()
             if (bitmap != null) {
                 val ctm = graphicsState.currentTransformationMatrix
                 addRealImage(bitmap, ctm, isFullPageCoverage)

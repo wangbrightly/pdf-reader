@@ -4,6 +4,7 @@ local.properties
 # 构建产物
 build/
 .gradle/
+.kotlin/
 *.apk
 *.aab
 

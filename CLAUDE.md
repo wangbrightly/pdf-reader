@@ -46,6 +46,10 @@
 
 PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。**"跟 Pillow 逐像素比对通过"不等于"结果本身是对的"**——Pillow 自己对 YCCK 反色的默认处理也会错，两份早期 fixture 的参考答案因此错了很久没被测出来，靠独立于 Pillow 的 poppler 整页渲染交叉验证才发现，见 NOTES #40。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式，见 NOTES #35。CMYK（transform=0）反色约定逐图对采样值投票判断（Adobe 标准是"存的值反色"，但真实文档存在例外），见 NOTES #29/#32；YCCK（transform=2）不投票，固定整体反色（C/M/Y/K 四个分量一起翻转），见 NOTES #40。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 600 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，见 NOTES #38）。
 
+## JPEG 编码的软蒙版（/SMask）：绕开 PdfBox 自己的合成，不是绕开解码
+
+蒙版格式是 JPEG（`softMask.suffix=="jpg"`，不管底图本身是什么格式）时，`pdImage.image` 内部的蒙版合成有 bug，产出纯黑图片——蒙版单独解码是正常的，蒙版是 PNG/JPX 格式时合成也完全正常，只有"JPEG 格式蒙版"这一种组合会坏，见 NOTES #57。修法是调用 `imageXObject.image` 前临时用 `COSDictionary.removeItem(COSName.SMASK)` 摘掉蒙版（解码完 `setItem` 放回去），让 PdfBox 自己一直可靠的底图解码逻辑在"没有蒙版参与合成"的情况下跑，蒙版单独用 `BitmapFactory` 解码灰度值当 alpha 通道手动合成——**不是**判断"底图和蒙版是不是都是 JPEG"（第一版这么判断过，装机复测完全没效果，根因是这份文档的底图 `suffix` 其实是 `"png"` 不是 `"jpg"`，判断条件从一开始就没生效，靠在真实调用路径上加**无条件**日志才纠正过来）。这是本类第二次"先分析第三方工具输出（这次是 `pdfimages -list`）反推判断条件，装机才发现推错了"的教训，改判断条件前先用真机日志把 `PDImage` 实际字段值实测一遍，不要靠外部工具的分组结果反推。
+
 ## JPX/JPEG2000：接的是第三方 native 库，不是手写解码器
 
 `Jpeg2000Decoder.kt` 薄封装 `io.github.michaldvorak-gemalto:jp2-android:1.0.5`（`JP2ForAndroid` 项目，OpenJPEG 2.5.4 的 JNI 封装，**个人维护者重新发布到 Maven Central 的坐标，不是 Thales 官方渠道**，不要在对外文档里写"官方库"）。**NOTES #43 曾经记录"原坐标 `com.gemalto.jp2` 不可引入"，这条结论已过时**——上游换坐标解决了发布问题，见 NOTES #48 完整核实过程（这条结论是被用户连续三轮独立核实纠正的，不是自己主动发现）。POC 装机验证过：正常数据解码正确（跟 macOS `sips` 独立实现逐像素比对一致）、截断流/伪造头部数据稳定返回 `null` 不崩溃、NOTES #43 那份真实样本能正确解码。**遇到"某开源组件不可用"这类结论时，如果决策时间点和调研时间点隔了几天以上，先重新一手核实，不能直接复述旧结论**——这类结论有时效性，尤其是个人维护的小众库。
