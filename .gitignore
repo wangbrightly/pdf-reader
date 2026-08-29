@@ -17,3 +17,6 @@ build/
 
 # macOS
 .DS_Store
+
+# 第三方 APK 反编译产物（版权归对方，只临时用于技术调研，不留存）
+.research/

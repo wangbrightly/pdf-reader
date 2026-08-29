@@ -2560,3 +2560,67 @@ reflow 路径，不受影响，验证了预期的"漏检不掉队"这条设计�
 paddlepaddle 3.2.2 + paddlex 3.7.2 + PP-DocLayout-M 权重缓存在
 `/root/.paddlex`）——如果决定不再往这条线投入，`docker rm -f
 cv-validate` 释放空间；如果还要继续实验，环境是现成的不用重配。
+
+## 56. 已查（终审）：反编译小白 PDF 找到真实架构——四件套模型+许可证问题，正式否决 CV/Yoga 路线
+
+延续 #55 留的两条路，选了"部分反编译小白 PDF"。**先纠正一条过时的项目
+记录**：本机 `adb`（`/Users/mac/Library/Android/sdk/platform-tools/adb`）
+其实可用、设备已连接——CLAUDE.md/NOTES 里反复写的"本机没有 adb，真机
+交互全靠用户手动装机+回传"这条环境限制已经不成立，下次需要跟真机交互
+先试 `adb devices`，别再默认要求用户手动传文件。
+
+**方法**：`adb pull` 直接拉 base.apk（299MB），`unzip -l` 看包内文件
+结构 + 对模型文件跑 `strings` 找嵌入的元数据字符串——不需要反汇编
+Smali/Java 代码，看 `assets/` 目录和原生库列表就已经拿到决定性信息，
+没有进一步反编译 `libxbreader.so`/`libtt_ugen_layout.so` 这两个他们
+自己的原生库去扒具体算法实现（技术上可行，但这已经从"看他们用了什么
+公开组件"越界到"提取对方专有实现细节"，没必要也不应该做到这一步——
+下面这些信息已经足够做出决策）。
+
+**发现——四个 ONNX 模型 + 一个自研原生库，走 ONNX Runtime 推理**：
+
+| 文件 | 大小 | 识别出的真实身份 |
+|---|---|---|
+| `doc_layout_x_260625.onnx` | 236MB | **YOLOv12x**（Ultralytics，AGPL-3.0）—— 版面区块检测，YOLO 系列里最大最准的"x"档 |
+| `pc_260629.onnx` | 24MB | **YOLO12s-cls**（Ultralytics，AGPL-3.0，strings 里直接带
+"Ultralytics YOLO12s-cls model trained on..."+ 许可证声明）—— 轻量页面分类器，猜测是"这页是不是扫描版/整页图/正常排版"这类预判 |
+| `ocr_det_mobile_v4.onnx` | 4.8MB | PaddleOCR 系文字检测（strings 命中"PaddlePaddle Graph in PIR mode"，命名对应 PP-OCRv4 mobile 检测档） |
+| `ocr_v6_rec_small.onnx` | 21MB | PaddleOCR 系文字识别（同样 PIR mode 签名），配 `assets/labels/ocr_dict_v6.txt`（18708 字符字典，标准 PaddleOCR 字典格式） |
+
+`lib/arm64-v8a/libonnxruntime.so` 承载全部四个模型的推理（ONNX Runtime
+是引擎无关的，Paddle 模型经 `paddle2onnx` 转过来一起跑）；
+`libtt_ugen_layout.so`（440KB，ByteDance 内部命名风格的 `tt_` 前缀）
+大概率是他们自己写的原生重排/版面合成引擎，把检测框+识别文字组装成
+最终排版——这部分没有再深挖，判断到此为止。
+
+**这直接回答了 #55 留的问题"对方到底是不是用了更强的模型"——是，而且
+差距不是一星半点**：我们 POC 用的 PP-DocLayout-M 是 PaddleOCR/PaddleX
+生态里偏轻量的一档；对方用的是完全不同的模型家族（YOLOv12，2025 年
+的新架构，以密集小目标检测见长，跟"一页塞 6 个独立小节图表"这种场景
+天然对口），选的还是同档里最大的"x"变体，外加一个专门的页面分类器
+做前置判断、一条完整的 PaddleOCR 文字识别管线兜底扫描内容、一个自研
+原生库做最终合成——四层管线，不是我们那种"单模型一次推理出结果"的
+简化设计。
+
+**新增决定性因素：AGPL-3.0 许可证**。`pc_260629.onnx` 的字符串里
+直接嵌了"AGPL-3.0 License (https://ultralytics.com/license)"——
+Ultralytics 的 YOLO 系列模型走 AGPL-3.0，商用要么公开使用方 App 的
+完整源码，要么找 Ultralytics 买 Enterprise 商业授权。这台设备上这个
+App 怎么处理这条义务不是我们能查的，但如果我们自己想复刻同一条技术
+路线（用 YOLOv12 训练/微调一个版面检测模型），这条法律义务会直接落到
+我们自己头上——对一个业余维护、不打算开源全部代码也不打算买商业授权
+的个人项目，这条路本身就先天不通，跟"模型选轻了"完全是两个层级的
+问题。
+
+**终审结论：正式否决，不再是"搁置"**。三个理由叠加，任何一条单独都
+够放弃，三条一起没有讨论空间：① 模型体量差距（236MB 的 YOLOv12x 主
+检测模型，训练/维护这个量级的模型不是个人项目能对等投入的）；② 四层
+管线架构复杂度（检测+分类+OCR+自研合成，不是换个模型就能对齐的架构
+差距）；③ AGPL-3.0 许可证义务与个人闭源 App 天然冲突。维持现状——
+`hasColumnGap` 识别到两栏排版就整页栅格化（#54），不再评估 CV 版面
+识别这条路线。
+
+**收尾**：`docker rm -f cv-validate` 释放掉 POC 用的容器；反编译过程
+中 `adb pull` 出来的 300MB APK 和解包出的模型文件都是对方版权资产，
+只用于本地临时技术判断，看完立刻删除，没有留存也没有提交到仓库
+（`.gitignore` 补了 `.research/` 这条规则防止以后误存同类临时产物）。
