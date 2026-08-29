@@ -24,6 +24,7 @@ import com.tom_roush.pdfbox.util.Matrix as PdfMatrix
 import java.io.File
 import java.text.Normalizer
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 import kotlin.math.sign
@@ -305,6 +306,15 @@ object PdfTextExtractor {
 
     /** 见 [hasColumnGap] KDoc——缺口两侧都至少要有这么多行文字才算"两栏"，不是巧合的孤立元素（比如单独的页码）造成的缺口；真机两栏页面两侧实测各有 17/18 行，远高于这个门槛。 */
     private const val MIN_COLUMN_LINES_PER_SIDE = 5
+
+    /** 见 [hasColumnGap] KDoc"2026-08-29 修复"一节——真机"天线设计"页跨栏介绍段落实测占内容区宽度 78%，正常单栏文字行实测约 37%~46%，阈值取在两者之间。 */
+    private const val OUTLIER_LINE_WIDTH_RATIO = 0.65f
+
+    /** 见 [hasScatteredLayout] KDoc"2026-08-29 二次修正"一节——真机"天线设计"页先调 [mergeSameLineRuns] 再统计，实测只剩 4 组（3 组真实两栏标题并排 + 1 组页码/页脚品牌名巧合对齐），"产品目录"页实测 19 组；纯粹巧合（页眉/页码）的碰撞实测 1~2 组，门槛定在 4，刚好接住"天线设计"这种真实但收敛的场景，又比巧合噪音高出一截。 */
+    private const val MIN_OVERLAPPING_Y_GROUPS = 4
+
+    /** 见 [hasScatteredLayout] KDoc——真机数据里同一视觉行的 Y 坐标是精确复用同一个浮点值（同一套版式网格生成），不需要容差；但为了不被极小的浮点误差绊倒，四舍五入到整数 pt 再分组。 */
+    private const val SCATTERED_LAYOUT_Y_BUCKET_PT = 1f
 
     /** 见 [decodeRawImageByBitDepth] KDoc"尺寸安全阀"一节——超过这个像素数（宽×高）直接跳过，不手动解码。 */
     private const val MAX_MANUAL_DECODE_PIXELS = 30_000_000L
@@ -1374,23 +1384,43 @@ object PdfTextExtractor {
      * 连续区间，只要中间出现一次超过 [MIN_COLUMN_GAP_PT] 的缺口，且缺口两边
      * 各自至少有 [MIN_COLUMN_LINES_PER_SIDE] 行文字，就判定为两栏。
      *
-     * **已知局限（真机数据验证过、如实记录，不是没想到）**：这个方法要求"全页
-     * 没有任何一行文字跨过这条缝"——真机反馈的原始文档里另一页"天线设计"同样
-     * 是两栏排版，但页面顶部有一句跨越 78% 内容宽度的介绍段落"骑"在两栏分界线
-     * 上（这句话本身就该跨两栏显示，是版式设计的一部分），这一句就足够让"全页
-     * 无缺口"，这个函数因此会漏判那一页。要正确处理"页面上半是两栏、这句介绍
-     * 又跨在分界线上"这种更复杂的混合版式，需要按高度分段检测（把页面切成
-     * 好几个横条分别判断），工作量和验证难度都高出一截——用户明确选择接受这个
-     * 漏检风险，不追加那层复杂度，见开头"风险模型"一节，漏检不会让页面变得
-     * 比现在更差。
+     * ## 2026-08-29 修复：跨栏介绍段落这类"异常宽行"会堵死缺口检测，先过滤掉再合并
+     *
+     * 原本记录成"已知局限、用户明确接受"——真机反馈的原始文档里另一页"天线
+     * 设计"同样是两栏排版，但页面顶部有一句跨越 78% 内容宽度的介绍段落"骑"在
+     * 两栏分界线上（这句话本身就该跨两栏显示，是版式设计的一部分）。这一句
+     * 按 X 排序后会很早混进区间合并（它的 `startX` 跟左栏差不多小，`endX`
+     * 却接近右栏边界），把左右两栏的区间"焊"成一整条，真正的分栏缝隙从此再
+     * 也检测不出来——不是"漏检"，是这一行本身就把检测机制堵死了。用户后续
+     * 真机使用时撞上这条限制，反馈"明明是两栏文字却被硬拆开重排了，没有按
+     * 图片显示"，重新评估后确认有低成本修法，不需要回到之前评估过"工作量
+     * 太高不值得"的按高度分段检测方案。
+     *
+     * **修法**：参与区间合并前，先排除宽度明显超出正常单栏行的"异常宽行"
+     * （[OUTLIER_LINE_WIDTH_RATIO]，真机实测两栏正常行宽约占内容区 37%~46%，
+     * 跨栏介绍段落约占 78%，阈值取在两者之间）——这类行不参与"这一页有没有
+     * 分栏缝隙"的几何判断，但不影响它们本身正常显示（这个函数只做检测，不
+     * 处理显示）。单栏正文的每一行天然就跟内容区宽度接近（占满整个可用宽度），
+     * 会被这条过滤规则本身排除掉，过滤后剩下的行不够 [MIN_COLUMN_LINES_PER_SIDE]
+     * 两倍时直接判定不是两栏——单栏页面不会被误判，见
+     * [PdfTextExtractorTest] 对应测试。
+     *
+     * **仍然接受的漏检**（改动后剩下的、更极端的情况）：如果跨栏介绍段落
+     * 不止一句、导致过滤后剩下的行本身不够 [MIN_COLUMN_LINES_PER_SIDE] 两倍，
+     * 或者一页里正常单栏行的宽度碰巧也超过 [OUTLIER_LINE_WIDTH_RATIO] 这个
+     * 阈值（比如页面内容区本身很窄），仍然可能漏检——风险模型跟之前一致：
+     * 漏检的代价只是维持当前已经修好的样子，不会更差。
      *
      * @param lines 已经过 [isLineOnPage] 边界过滤、这一页的文字行（合并前后都可以，
      *   合并前的碎片一样能正确参与 X 区间合并计算，不要求调用方先调 [mergeSameLineRuns]）。
      */
     internal fun hasColumnGap(lines: List<Line>): Boolean {
         val withPosition = lines.filter { it.pageWidth > 0f }
-        if (withPosition.size < MIN_COLUMN_LINES_PER_SIDE * 2) return false
-        val sorted = withPosition.sortedBy { it.startX }
+        if (withPosition.isEmpty()) return false
+        val pageWidth = withPosition[0].pageWidth
+        val structural = withPosition.filter { (it.endX - it.startX) <= pageWidth * OUTLIER_LINE_WIDTH_RATIO }
+        if (structural.size < MIN_COLUMN_LINES_PER_SIDE * 2) return false
+        val sorted = structural.sortedBy { it.startX }
         var mergedEnd = sorted[0].endX
         var leftCount = 1
         for (i in 1 until sorted.size) {
@@ -1403,6 +1433,77 @@ object PdfTextExtractor {
             leftCount++
         }
         return false
+    }
+
+    /**
+     * 2026-08-29 新增：用户真机反馈"复杂的分栏页面直接显示为图片，不需要再分开显示"，
+     * 排查后发现比 [hasColumnGap] 覆盖的场景更宽——真机这份文档里没有一页是
+     * [hasColumnGap] 假设的"长文章两栏"形状，反馈的几页实际是"产品目录/图标网格"
+     * 这类版式：几十个短标签（"Ansys HFSS"、"Ansys Maxwell"……）散落在几十个不同的
+     * 横坐标位置，[hasColumnGap] 的"两栏"模型（只认两个 X 区间）对这种页面完全无效。
+     *
+     * ## 更通用的信号：正常单栏正文里，同一个 Y 高度不会出现第二行
+     *
+     * 文字从上到下线性排布，每个 Y（行的纵坐标）天然只对应一行内容——这个假设对
+     * 单栏正文、甚至传统两栏正文（左右两栏各自独立流动，很少精确对齐到同一行）
+     * 都基本成立。真正的"并排摆放"版式（两栏标题恰好对齐、网格排版的多个标签
+     * 挤在同一行、目录页的多列并排）会打破这个假设，制造出大量"同一个 Y、
+     * 好几条不同文字"的情况——这正是重排会把它们拼接/打乱的根本原因，比
+     * [hasColumnGap] 那种"找一条干净缝隙"的几何假设更贴近问题本质，覆盖面也更宽
+     * （两栏文章本身也会命中，见下面测试）。
+     *
+     * 先调 [mergeSameLineRuns]（排除掉同一视觉行因字体切换产生的正常碎片，那些
+     * 碎片不该算"并排"）再按 Y 坐标分组（四舍五入到 [SCATTERED_LAYOUT_Y_BUCKET_PT]
+     * 整数 pt——同一套版式网格生成的文字，同一视觉行内不同片段的 Y 坐标真机实测
+     * 是精确相同的浮点值，四舍五入只是防止极小浮点误差绊倒，不是真的需要容差）。
+     *
+     * ## 2026-08-29 二次修正：第一版按未合并的原始行数错误估算了阈值
+     *
+     * 第一版看真机原始（未经 [mergeSameLineRuns]）坐标数据，数了"天线设计"页
+     * 有 5 组同 Y 出现多条文字，据此把 [MIN_OVERLAPPING_Y_GROUPS] 定成 5——这个
+     * 数错了：原始数据里"EMIT"和紧挨着它的"采用独特的多保真度方法"之间只隔
+     * 1.16pt，本身就是同一句话被 PDFBox 拆成的碎片，套用同一份真机数据直接写
+     * 单元测试时被 [mergeSameLineRuns] 合并掉，测试断言落空才发现——静态看原始
+     * 坐标数据会把"同一句话的正常碎片"误当成"独立并排的内容"，两者的区别只有
+     * 真正跑一遍 [mergeSameLineRuns] 才分得清，光看坐标数字推不出来。
+     *
+     * 加诊断在真实调用路径上重新实测："天线设计"页合并后从 35 行降到 26 行，
+     * 只剩 4 组碰撞——其中 3 组是真实的两栏标题并排（"天线之间隐性干扰的可视化"
+     * / "考虑所有环境的天线分析"这类），1 组是页码"5"和页脚"//电子设计解决方案"
+     * 巧合对齐在同一行（不是版式意图，纯粹巧合）；"产品目录"页合并后 181→105 行，
+     * 仍有 19 组碰撞，量级差距很大。阈值改成 [MIN_OVERLAPPING_Y_GROUPS]=4——
+     * 刚好接住"天线设计"这种真实但收敛的场景（含那组巧合在内），比纯粹页眉/
+     * 页码巧合对齐（真机实测 1~2 组）的噪音水平高出一截，留了安全边际。
+     *
+     * 复用 [hasColumnGap] 同一条"整页栅格化"兜底路径（见调用点），风险模型一致：
+     * 漏检的代价是维持当前重排的样子，不会更差；误判的代价是这一页少了调字号
+     * 能力，pdfium 渲染内容本身准确。
+     *
+     * ## 跟表格检测的先后顺序：必须排除表格区域之后再检查，不能查原始行
+     *
+     * 第一版直接查全页原始 [Line]（在表格区域检测之前，跟 [hasColumnGap] 同一个
+     * 位置），装机前跑单元测试才炸出真回归：一个最普通的 3 列 4 行表格（表头+
+     * 3 行数据）天然每一行都是"同一 Y 三个单元格"，正好命中 4 组的门槛，抢在
+     * 表格检测的精确裁剪（只裁表格那一小块、前后正文保留）之前，把整页正文
+     * 全部吞掉栅格化——表格本身就是这个信号最常见的"合理但不该触发"来源，
+     * 数量稍微多几行就会跟真正的散乱版式撞到同一个门槛上。调用点因此把这个
+     * 检查挪到表格区域检测之后，只查 `nonTableLines`（排除表格区域之后剩下的
+     * 正文行）——普通表格排除掉表格区域后剩下的就是正常正文，不会再触发；
+     * 真正的散乱版式（产品目录/图标网格）本身不会被 [TableGridDetector] 判定
+     * 出表格区域（矢量网格线信号跟文字散落是两回事），`nonTableLines` 就是
+     * 原始全部文字行，不受影响。
+     *
+     * @param lines 已经过 [isLineOnPage] 边界过滤、且已经排除表格区域（见上面
+     *   "跟表格检测的先后顺序"一节）的这一页文字行，合并前后都可以（函数内部
+     *   会自己调 [mergeSameLineRuns]，不要求调用方先合并）。
+     */
+    internal fun hasScatteredLayout(lines: List<Line>): Boolean {
+        val withPosition = lines.filter { it.pageWidth > 0f }
+        if (withPosition.size < MIN_COLUMN_LINES_PER_SIDE * 2) return false
+        val merged = mergeSameLineRuns(withPosition)
+        val overlappingGroups = merged.groupBy { (it.y / SCATTERED_LAYOUT_Y_BUCKET_PT).roundToInt() }
+            .count { (_, group) -> group.size >= 2 }
+        return overlappingGroups >= MIN_OVERLAPPING_Y_GROUPS
     }
 
     /**
@@ -2943,7 +3044,11 @@ object PdfTextExtractor {
             // 见 hasColumnGap KDoc——两栏排版页不追求重排出正确阅读顺序，识别出来
             // 直接整页栅格化（复用 renderPageWithAndroidPdfRenderer，跟表格/JPX
             // 那几条整页兜底同一条路径），在这里提前返回，不进入下面任何一条
-            // 段落切分/表格检测/图片抽取分支。
+            // 段落切分/表格检测/图片抽取分支。[hasScatteredLayout] 覆盖的是另一类
+            // 更宽的形状（"同一 Y 高度出现多条文字"），但普通小表格天然也会命中
+            // 这个信号（每一行的几个单元格就是"同一 Y 多条文字"）——放在这里会
+            // 抢在下面表格检测的精确裁剪（只裁表格、正文保留）之前，见调用点
+            // "排除表格区域之后再检查散乱版式"那一段，不在这里检查。
             if (hasColumnGap(onPageLines)) {
                 val blocks = mutableListOf<DisplayBlock>()
                 renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
@@ -3070,6 +3175,18 @@ object PdfTextExtractor {
             } else {
                 onPageLines
             }
+
+            // 见 hasScatteredLayout KDoc——排除掉表格区域内的行再检查（表格自己每一
+            // 行的几个单元格天然就是"同一 Y 多条文字"，会跟这个信号的判断条件撞在
+            // 一起，见该函数 KDoc"跟表格检测的先后顺序"一节的真机回归案例），只在
+            // 排除表格之后仍然散乱的页面才整页栅格化，普通表格继续走下面精确裁剪
+            // 的路径不受影响。
+            if (hasScatteredLayout(nonTableLines)) {
+                val blocks = mutableListOf<DisplayBlock>()
+                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                return PageLoadPhaseA.Complete(PageContent(blocks))
+            }
+
             val rawParagraphs = linesToParagraphs(nonTableLines)
             val noiseIndices = RunningFooterFilter.pageNoiseIndices(
                 rawParagraphs.map { PageTextLine(it.text, it.page) },

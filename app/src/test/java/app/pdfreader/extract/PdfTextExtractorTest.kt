@@ -201,14 +201,17 @@ class PdfTextExtractorTest {
     }
 
     /**
-     * 真机"天线设计"页的已知局限反例：页面顶部有一句跨越几乎整个内容宽度的
-     * 介绍段落（真机实测宽度占内容区 78%），这句话"骑"在两栏分界线上，会让
-     * "全页无缺口"，[PdfTextExtractor.hasColumnGap] 因此判定不是两栏——如实
-     * 记录这是已知局限（见该函数 KDoc"已知局限"一节），不是这条测试要修的 bug，
-     * 这条测试确认的是当前"宁可漏检"的行为符合预期，不是意外裂开。
+     * 真机"天线设计"页的已修复案例：页面顶部有一句跨越几乎整个内容宽度的
+     * 介绍段落（真机实测宽度占内容区 78%），这句话"骑"在两栏分界线上，2026-08-29
+     * 之前会让"全页无缺口"、判定不是两栏（曾经记录成已知局限，用户真机使用
+     * 时撞上、反馈"明明是两栏文字却被硬拆开重排了"后重新评估，见
+     * [PdfTextExtractor.hasColumnGap] KDoc"2026-08-29 修复"一节）——这条介绍
+     * 段落宽度远超正常两栏行宽（78% vs 37%~46%），现在会被
+     * [PdfTextExtractor.OUTLIER_LINE_WIDTH_RATIO] 这层过滤排除在区间合并之外，
+     * 不再堵住真正的分栏缝隙。
      */
     @Test
-    fun `有一行跨越两栏分界线时不判定为两栏（真机混合版式已知局限）`() {
+    fun `有一行跨越两栏分界线时仍然判定为两栏（异常宽行不参与区间合并）`() {
         val bridgingLine = PdfTextExtractor.Line("跨两栏的介绍段落", 80f, 1, startX = 60f, endX = 560f, pageWidth = 595.276f)
         val leftLines = (0 until 6).map { i ->
             PdfTextExtractor.Line("左栏第${i}行", 120f + i * 20f, 1, startX = 50f, endX = 270f, pageWidth = 595.276f)
@@ -216,7 +219,124 @@ class PdfTextExtractorTest {
         val rightLines = (0 until 6).map { i ->
             PdfTextExtractor.Line("右栏第${i}行", 120f + i * 20f, 1, startX = 300f, endX = 575f, pageWidth = 595.276f)
         }
-        assertFalse(PdfTextExtractor.hasColumnGap(listOf(bridgingLine) + leftLines + rightLines))
+        assertTrue(PdfTextExtractor.hasColumnGap(listOf(bridgingLine) + leftLines + rightLines))
+    }
+
+    /**
+     * 跨栏介绍段落多到把两栏正文本身也挤到门槛以下时，[PdfTextExtractor
+     * .OUTLIER_LINE_WIDTH_RATIO] 这层过滤没法把"漏检"变成"零漏检"——过滤后
+     * 剩下的行数不够 [PdfTextExtractor.hasColumnGap] 判定两栏所需的最小行数
+     * 时，仍然按"不是两栏"处理，风险模型跟之前一致：漏检不会让页面变得比
+     * 现在更差，这条测试确认这种极端情况不会误判或抛异常。
+     */
+    @Test
+    fun `跨栏介绍段落过多、过滤后正文行数不够时仍然不判定为两栏`() {
+        val bridgingLines = (0 until 3).map { i ->
+            PdfTextExtractor.Line("跨两栏介绍第${i}行", 60f + i * 20f, 1, startX = 60f, endX = 560f, pageWidth = 595.276f)
+        }
+        val leftLines = (0 until 2).map { i ->
+            PdfTextExtractor.Line("左栏第${i}行", 140f + i * 20f, 1, startX = 50f, endX = 270f, pageWidth = 595.276f)
+        }
+        val rightLines = (0 until 2).map { i ->
+            PdfTextExtractor.Line("右栏第${i}行", 140f + i * 20f, 1, startX = 300f, endX = 575f, pageWidth = 595.276f)
+        }
+        assertFalse(PdfTextExtractor.hasColumnGap(bridgingLines + leftLines + rightLines))
+    }
+
+    // ---- hasScatteredLayout：2026-08-29 真机反馈"复杂的分栏页面直接显示为图片，
+    // 不需要再分开显示"，排查后发现比 hasColumnGap 覆盖的场景更宽——真机"天线设计"
+    // 页实际是"标题并排+目录网格"混合版式，不是 hasColumnGap 假设的"长文章两栏"
+    // 形状。第一版按未合并的原始坐标数据数出"5 组同 Y 碰撞"是错的（把同一句话被
+    // PDFBox 拆出的正常碎片误当成独立并排内容），加诊断在真实调用路径上（先调
+    // mergeSameLineRuns 再统计）重新实测才拿到准确数字，这里的测试数据是合并后
+    // 的真实文本+坐标，不是合并前的原始碎片 ----
+
+    /**
+     * 真机"天线设计"页合并后的真实数据（35 行原始碎片合并成 26 行后的结果，
+     * 这里只保留 4 组碰撞 + 2 条无碰撞的行凑够 [PdfTextExtractor] 内
+     * `MIN_COLUMN_LINES_PER_SIDE`×2=10 这个最小行数门槛）：y~586/599/610 是
+     * 三组真实的两栏标题并排（"天线之间隐性干扰的可视化"/"考虑所有环境的天线
+     * 分析"这类），y~792 是页码"5"和页脚"//电子设计解决方案"巧合对齐在同一行
+     * （不是版式意图，但真机数据里确实存在，阈值校准时把它算在内）——四组
+     * 加起来精确等于 [PdfTextExtractor] 内 `MIN_OVERLAPPING_Y_GROUPS`=4，应该
+     * 命中分散版式判定。
+     */
+    @Test
+    fun `真机天线设计页合并后的4组Y碰撞判定为分散版式`() {
+        fun line(y: Float, startX: Float, endX: Float, text: String) =
+            PdfTextExtractor.Line(text, y, 6, startX = startX, endX = endX, pageWidth = 595.276f)
+        val lines = listOf(
+            line(586f, 91f, 180f, "天线之间隐性干扰的可视化"),
+            line(586f, 310f, 392f, "考虑所有环境的天线分析"),
+            line(599f, 91f, 276f, "EMIT采用独特的多保真度方法"),
+            line(599f, 310f, 544f, "先进的天线环境仿真软件HFSS SBR+"),
+            line(610f, 91f, 263f, "并迅速识别复杂射频环境中的问题"),
+            line(610f, 310f, 544f, "安装的天线的方向图、近场及天线间的耦合"),
+            // 页码和页脚的真实 Y 值差 0.166（791.757 vs 791.591）——写成完全相同的
+            // 792f 会让 mergeSameLineRuns 误判成"同一行"直接合并掉，反而测不出
+            // 这条巧合碰撞；用真机实测的两个不同 Y 值，四舍五入到同一个整数桶
+            // （[PdfTextExtractor] 内 hasScatteredLayout 自己的分组逻辑）但不满足
+            // mergeSameLineRuns 的"同一行"判定（阈值 0.01），行为才跟真机一致。
+            line(791.757f, 20f, 24f, "5"),
+            line(791.591f, 37f, 98f, "//电子设计解决方案"),
+            line(113f, 79f, 120f, "天线设计"),
+            line(135f, 79f, 543f, "不仅可以单独分析天线"),
+        )
+        assertTrue(PdfTextExtractor.hasScatteredLayout(lines))
+    }
+
+    /**
+     * 反例：去掉真机数据里那组页码/页脚巧合碰撞（y~792 那两行），只剩 3 组
+     * 真实内容碰撞——低于门槛，不该判定为分散版式。用来确认阈值不是形同虚设。
+     */
+    @Test
+    fun `去掉页码页脚巧合碰撞后只剩3组时不判定为分散版式`() {
+        fun line(y: Float, startX: Float, endX: Float, text: String) =
+            PdfTextExtractor.Line(text, y, 6, startX = startX, endX = endX, pageWidth = 595.276f)
+        val lines = listOf(
+            line(586f, 91f, 180f, "天线之间隐性干扰的可视化"),
+            line(586f, 310f, 392f, "考虑所有环境的天线分析"),
+            line(599f, 91f, 276f, "EMIT采用独特的多保真度方法"),
+            line(599f, 310f, 544f, "先进的天线环境仿真软件HFSS SBR+"),
+            line(610f, 91f, 263f, "并迅速识别复杂射频环境中的问题"),
+            line(610f, 310f, 544f, "安装的天线的方向图、近场及天线间的耦合"),
+            line(113f, 79f, 120f, "天线设计"),
+            line(135f, 79f, 543f, "不仅可以单独分析天线"),
+            line(200f, 79f, 300f, "填充行一"),
+            line(220f, 79f, 300f, "填充行二"),
+        )
+        assertFalse(PdfTextExtractor.hasScatteredLayout(lines))
+    }
+
+    /**
+     * 正向对照：真机干净的两栏正文（左右两栏每一行都对齐到相同的 Y 高度）
+     * 天然也会命中这个更通用的信号——两个函数在这种场景上结论一致，不冲突。
+     */
+    @Test
+    fun `干净的两栏正文也会被判定为分散版式（跟hasColumnGap结论一致）`() {
+        val leftLines = (0 until 6).map { i ->
+            PdfTextExtractor.Line("左栏第${i}行", 100f + i * 20f, 1, startX = 50f, endX = 270f, pageWidth = 595.276f)
+        }
+        val rightLines = (0 until 6).map { i ->
+            PdfTextExtractor.Line("右栏第${i}行", 100f + i * 20f, 1, startX = 300f, endX = 575f, pageWidth = 595.276f)
+        }
+        assertTrue(PdfTextExtractor.hasScatteredLayout(leftLines + rightLines))
+    }
+
+    /**
+     * 假阳性防护：只是偶然出现一两处 Y 恰好相同（比如页眉和正文第一行凑巧对齐），
+     * 不该被当成"分散版式"——真机单栏正文页实测 0 组，这里给 2 组留安全边际，
+     * 门槛（[PdfTextExtractor] 内 `MIN_OVERLAPPING_Y_GROUPS`=5）远高于偶发情况。
+     */
+    @Test
+    fun `只有一两处偶然的Y坐标重合时不判定为分散版式`() {
+        val lines = (0 until 12).map { i ->
+            PdfTextExtractor.Line("正文第${i}行", 100f + i * 20f, 1, startX = 50f, endX = 400f, pageWidth = 595.276f)
+        } + listOf(
+            PdfTextExtractor.Line("页眉", 100f, 1, startX = 500f, endX = 520f, pageWidth = 595.276f),
+            PdfTextExtractor.Line("页码", 120f, 1, startX = 500f, endX = 510f, pageWidth = 595.276f),
+        )
+        assertFalse(PdfTextExtractor.hasScatteredLayout(lines))
     }
 
     /**

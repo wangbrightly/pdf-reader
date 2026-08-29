@@ -42,6 +42,8 @@
 
 两栏排版页**不追求重排出正确的阅读顺序**（用户明确拍板放弃这个目标，按高度分段检测的工作量/验证难度远超收益）——`hasColumnGap` 识别到就直接整页栅格化（复用下面 pdfium 那条路径），不逐段重排。已知局限：同一页"两栏/通栏混合"（比如页面顶部有一句跨两栏的介绍段落）会漏检，接受这个风险——漏检的代价只是维持当前已经修好的样子，不会更差，见 NOTES #54。
 
+`hasScatteredLayout`（NOTES #58）覆盖比 `hasColumnGap` 更宽的场景——不认"两个 X 区间"，认"同一 Y 高度出现 2 条及以上文字"（先调 `mergeSameLineRuns` 排除同一行的正常碎片再统计，阈值 `MIN_OVERLAPPING_Y_GROUPS=4`），命中同一条整页栅格化路径。**只查排除表格区域之后的 `nonTableLines`，检查点在表格检测之后**（`hasColumnGap` 还在表格检测之前，两者不对称，别改错位置）——普通表格每一行的几个单元格天然就是"同一 Y 多条文字"，会跟这个信号撞在一起，装机前的单元测试曾经因此炸出真回归（一个 3 列 4 行的小表格就命中阈值，抢在表格精确裁剪之前把整页正文吞掉栅格化）。改判断条件前**必须**在真实调用路径上跑一遍 `mergeSameLineRuns` 拿真实合并后的数据，不能只看原始坐标数字推——第一版按未合并数据数错过一次阈值，见 NOTES #58 完整教训。
+
 ## CMYK/YCCK JPEG、JBIG2：自己手写的解码器
 
 PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。**"跟 Pillow 逐像素比对通过"不等于"结果本身是对的"**——Pillow 自己对 YCCK 反色的默认处理也会错，两份早期 fixture 的参考答案因此错了很久没被测出来，靠独立于 Pillow 的 poppler 整页渲染交叉验证才发现，见 NOTES #40。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式，见 NOTES #35。CMYK（transform=0）反色约定逐图对采样值投票判断（Adobe 标准是"存的值反色"，但真实文档存在例外），见 NOTES #29/#32；YCCK（transform=2）不投票，固定整体反色（C/M/Y/K 四个分量一起翻转），见 NOTES #40。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 600 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，见 NOTES #38）。
@@ -80,6 +82,7 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 - `ReadingProgressStore` 无清理机制，条目随打开过的文件数线性增长（当前量级不算问题）
 - 扫描版 PDF（没有文字层）无法重排/调字号，需要 OCR，用户 2026-08-18 决定暂缓（见 NOTES #10）
 - 大文件（126MB+）`PDDocument.load` 本身耗时几秒到十几秒，试过换成临时文件缓冲但反而更慢，已回退，没找到有效优化手段（见 NOTES #23）
+- 短小的目录/标签类文字（行距不规律、单条内容很短）会被 `linesToParagraphs` 的"行间距中位数×1.5"分段启发式错误拼接成一整句乱码——不是 `hasScatteredLayout` 覆盖的场景（真机数据合并后同 Y 碰撞组数很低，不触发），还没排查，下次直接从这个函数在这类页面上的分段逻辑查起，见 NOTES #58 结尾
 
 真机型号是小米 mondrian，装机验证是这个项目的日常工作方式（几乎每次改动都真机复测），不是没做过。
 
