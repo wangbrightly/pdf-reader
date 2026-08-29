@@ -927,7 +927,9 @@ class PdfTextExtractorSessionTest {
      * 间距不超阈值（合并成一段），小节之间间距远超阈值（切开成两段），这样
      * 段落切分本身先验证过是符合预期的，图片插入位置的断言才有意义。
      *
-     * 页面坐标（PDF 坐标系，原点左下、y 向上，页高 300pt）：
+     * 页面坐标（PDF 坐标系，原点左下、y 向上，页高 300pt，页宽 595.276pt——
+     * 跟项目其它测试用真机页宽同一个惯例，2026-08-29 从原来的 200pt 窄页面
+     * 改过来，见下面 `sectionLineText` 那段注释）：
      * - 小节 A：两行文字在 y=280/268（topY=20/32），图片画在 y=200~230（topY=70）
      * - 小节 B：两行文字在 y=150/138（topY=150/162），图片画在 y=50~80（topY=220）
      *
@@ -939,7 +941,15 @@ class PdfTextExtractorSessionTest {
         val context = RuntimeEnvironment.getApplication()
         com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
         val document = PdfDocumentForTest()
-        val pageWidth = 200f
+        // 2026-08-29：isShortLine 改成量"这一行自己有多宽"而不是"右边界离页面
+        // 右侧多远"之后（见该函数 KDoc），原来 200pt 的窄页面配短句子在新公式
+        // 下量出来不到半页宽，被误判成"短行"触发紧凑列表规则，把本该合并的
+        // 两行拆开——这条测试的本意是"正常段落的两行"，不该被短行列表规则
+        // 误伤。改成跟项目其它测试一致的真实页宽（595.276pt），字号也调大到
+        // 20pt 让文字明显占到半页以上又不至于超出页面（真机数据不会出现比
+        // 页面还宽的单行文字，`isLineOnPage` 会把那种越界内容当跨页污染
+        // 过滤掉，太短或太长都会跟这条测试的本意不符）。
+        val pageWidth = 595.276f
         val pageHeight = 300f
         val page = com.tom_roush.pdfbox.pdmodel.PDPage(
             com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
@@ -947,19 +957,19 @@ class PdfTextExtractorSessionTest {
         document.pdDocument.addPage(page)
         val stream = PDPageContentStream(document.pdDocument, page)
         stream.beginText()
-        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.setFont(PDType1Font.HELVETICA, 20f)
         stream.newLineAtOffset(20f, 280f)
-        stream.showText("section A line one")
-        stream.newLineAtOffset(0f, -12f)
-        stream.showText("section A line two")
+        stream.showText("section A line one of the paragraph text")
+        stream.newLineAtOffset(0f, -20f)
+        stream.showText("section A line two of the paragraph text")
         stream.endText()
         stream.drawImage(document.tinyImage(), 20f, 200f, 40f, 30f)
         stream.beginText()
-        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.setFont(PDType1Font.HELVETICA, 20f)
         stream.newLineAtOffset(20f, 150f)
-        stream.showText("section B line one")
-        stream.newLineAtOffset(0f, -12f)
-        stream.showText("section B line two")
+        stream.showText("section B line one of the paragraph text")
+        stream.newLineAtOffset(0f, -20f)
+        stream.showText("section B line two of the paragraph text")
         stream.endText()
         stream.drawImage(document.tinyImage(), 20f, 50f, 40f, 30f)
         stream.close()

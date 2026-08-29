@@ -1611,9 +1611,32 @@ object PdfTextExtractor {
         return merged
     }
 
-    /** 见 [linesToParagraphs] KDoc"紧凑列表识别"一节。[Line.pageWidth] 为 0（没有提供这个信息）时恒为 `false`。 */
+    /**
+     * 见 [linesToParagraphs] KDoc"紧凑列表识别"一节。[Line.pageWidth] 为 0（没有
+     * 提供这个信息）时恒为 `false`。
+     *
+     * ## 2026-08-29 修复：改成量这一行本身有多宽，不是量右边界离页面右侧多远
+     *
+     * 第一版用 `endX / pageWidth`（这一行右边界的绝对位置）——对单栏列表成立
+     * （每一项都贴着左边距起笔，右边界位置就等价于这一行本身有多宽），但真机
+     * 反馈"好几个目录条目被拼接成一句乱码"（NOTES #58 结尾提过的独立问题），
+     * 追出来是多列图标网格：右边那一列的短标签（比如"EMS 分析"）哪怕文字本身
+     * 很短，右边界坐标依然落在页面偏右的位置，`endX/pageWidth` 算出来跟正常
+     * 整行文字差不多大，"连续两行都短"这条规则完全触发不了，行间距本身
+     * （真机实测约 14pt，和段内换行的量级接近）也不超过分段阈值，一整列
+     * 标签就这样被粘连成一段。
+     *
+     * 改成量这一行自己占多宽（`(endX-startX)/pageWidth`）——不管这一行在页面
+     * 上从哪起笔，只要文字本身短就判定"短"，多列网格右侧的短标签和单栏列表
+     * 左侧的短标签一视同仁。原有的单栏列表 fixture（`sample-compact-list.pdf`）
+     * 起笔都贴着左边距，换成量宽度只是把 [LIST_ITEM_MAX_WIDTH_RATIO] 判断
+     * 用的数值整体往下平移了"左边距/页宽"这一点点（真机数据这个量级在
+     * 7%~8%），对照 KDoc 记录过的真机校准区间（列表项 0.10~0.25、正常整行
+     * 0.90~0.94），平移这一点点之后两边离 0.5 这个门槛依然差得很远，不会
+     * 影响原有判断。
+     */
     private fun isShortLine(line: Line): Boolean =
-        line.pageWidth > 0f && line.endX / line.pageWidth < LIST_ITEM_MAX_WIDTH_RATIO
+        line.pageWidth > 0f && (line.endX - line.startX) / line.pageWidth < LIST_ITEM_MAX_WIDTH_RATIO
 
     /**
      * 见类注释"段落切分"一节主逻辑，这里补一段专门的说明。
