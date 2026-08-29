@@ -130,6 +130,125 @@ class PdfTextExtractorTest {
     }
 
     /**
+     * 2026-08-28 真机反馈修复（排查"图片和文字分开了"时顺带发现的另一个问题）——
+     * 见 [PdfTextExtractor.mergeSameLineRuns] KDoc 完整背景。数据照抄真机日志：
+     * 一份两栏排版文档，左栏标题"1/2 分频器"和右栏标题"CMOS PLL 合成器"落在
+     * 完全相同的 y 高度（142.48…，只是四舍五入误差），原来的合并逻辑只看 y
+     * 相同就直接拼接，会把两栏内容错误粘连成一条"1/2 分频器CMOS PLL 合成器"。
+     */
+    @Test
+    fun `y坐标相同但x坐标离得很远的两栏标题不会被错误合并成一行（真机两栏排版反例）`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("1/2 分频器", 142.48895f, 7, startX = 63.1604f, endX = 98.82032f, pageWidth = 595.276f),
+            PdfTextExtractor.Line(
+                "CMOS PLL 合成器", 142.48553f, 7, startX = 301.85703f, endX = 362.71622f, pageWidth = 595.276f,
+            ),
+        )
+
+        val merged = PdfTextExtractor.mergeSameLineRuns(lines)
+
+        assertEquals("两栏标题应该保持独立，不该被拼成一行", 2, merged.size)
+        assertEquals("1/2 分频器", merged[0].text)
+        assertEquals("CMOS PLL 合成器", merged[1].text)
+    }
+
+    /**
+     * 正向对照：同一份真机文档里真实存在的、因为中英文混排字体切换产生的正常
+     * 段内片段（"对"|"1.5GHz 带高速锁定"|"PLL 合成器锁定前的情况进行瞬态分析，"，
+     * 间隙实测 1.86~3.72pt），确认新加的 x 坐标距离检查不会误伤这种正常场景——
+     * 只拦真正的跨栏，不拦同一栏内的正常字体切换。
+     */
+    @Test
+    fun `正常字体切换产生的小间隙片段仍然合并成一行（真机中英文混排正例）`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("对", 154.83661f, 7, startX = 897.1342f, endX = 904.5742f, pageWidth = 595.276f),
+            PdfTextExtractor.Line(
+                "1.5GHz 带高速锁定", 154.83661f, 7, startX = 908.29425f, endX = 973.1078f, pageWidth = 595.276f,
+            ),
+            PdfTextExtractor.Line(
+                "PLL 合成器锁定前的情况进行瞬态分析，",
+                154.83661f,
+                7,
+                startX = 976.82855f,
+                endX = 1115.7203f,
+                pageWidth = 595.276f,
+            ),
+        )
+
+        val merged = PdfTextExtractor.mergeSameLineRuns(lines)
+
+        assertEquals("正常的段内字体切换片段应该合并成一行", 1, merged.size)
+        assertEquals("对1.5GHz 带高速锁定PLL 合成器锁定前的情况进行瞬态分析，", merged[0].text)
+    }
+
+    // ---- hasColumnGap：2026-08-28 真机反馈（"图片和文字分开了"，用户拍板不重排、识别到就整页栅格化）----
+
+    /**
+     * 真机"RF 电路"页的坐标形状简化版：左栏 6 行（X 落在 50~270 区间），右栏
+     * 6 行（X 落在 300~575 区间），中间留出约 30pt 的空白带——两边行数都远超
+     * [PdfTextExtractor] 里 `MIN_COLUMN_LINES_PER_SIDE`（真机实测两侧各 17/18
+     * 行，这里用 6 行简化但仍然远超门槛），应该判定为两栏。
+     */
+    @Test
+    fun `两栏排版、中间有干净空白带、两边行数都足够时判定为两栏`() {
+        val leftLines = (0 until 6).map { i ->
+            PdfTextExtractor.Line("左栏第${i}行", 100f + i * 20f, 1, startX = 50f, endX = 270f, pageWidth = 595.276f)
+        }
+        val rightLines = (0 until 6).map { i ->
+            PdfTextExtractor.Line("右栏第${i}行", 100f + i * 20f, 1, startX = 300f, endX = 575f, pageWidth = 595.276f)
+        }
+        assertTrue(PdfTextExtractor.hasColumnGap(leftLines + rightLines))
+    }
+
+    /**
+     * 真机"天线设计"页的已知局限反例：页面顶部有一句跨越几乎整个内容宽度的
+     * 介绍段落（真机实测宽度占内容区 78%），这句话"骑"在两栏分界线上，会让
+     * "全页无缺口"，[PdfTextExtractor.hasColumnGap] 因此判定不是两栏——如实
+     * 记录这是已知局限（见该函数 KDoc"已知局限"一节），不是这条测试要修的 bug，
+     * 这条测试确认的是当前"宁可漏检"的行为符合预期，不是意外裂开。
+     */
+    @Test
+    fun `有一行跨越两栏分界线时不判定为两栏（真机混合版式已知局限）`() {
+        val bridgingLine = PdfTextExtractor.Line("跨两栏的介绍段落", 80f, 1, startX = 60f, endX = 560f, pageWidth = 595.276f)
+        val leftLines = (0 until 6).map { i ->
+            PdfTextExtractor.Line("左栏第${i}行", 120f + i * 20f, 1, startX = 50f, endX = 270f, pageWidth = 595.276f)
+        }
+        val rightLines = (0 until 6).map { i ->
+            PdfTextExtractor.Line("右栏第${i}行", 120f + i * 20f, 1, startX = 300f, endX = 575f, pageWidth = 595.276f)
+        }
+        assertFalse(PdfTextExtractor.hasColumnGap(listOf(bridgingLine) + leftLines + rightLines))
+    }
+
+    /**
+     * 真机数据里的假阳性反例：一页散落的图注文字，凑巧留出一个孤立的小缺口
+     * （真机实测约 13.6pt，来自一个孤零零的页码），但缺口一边只有 1 行文字，
+     * 远低于 [PdfTextExtractor] 里的 `MIN_COLUMN_LINES_PER_SIDE`——两边都要
+     * 有足够多行文字才算真的两栏，孤立元素造成的缺口不该被当成栏间距。
+     */
+    @Test
+    fun `缺口一侧只有孤立的一两行文字时不判定为两栏`() {
+        val isolatedLine = PdfTextExtractor.Line("孤立页码", 700f, 1, startX = 20f, endX = 24f, pageWidth = 595.276f)
+        val restLines = (0 until 8).map { i ->
+            PdfTextExtractor.Line("散落图注${i}", 120f + i * 20f, 1, startX = 40f, endX = 550f, pageWidth = 595.276f)
+        }
+        assertFalse(PdfTextExtractor.hasColumnGap(listOf(isolatedLine) + restLines))
+    }
+
+    @Test
+    fun `没有明显缺口的单栏正文不判定为两栏`() {
+        val lines = (0 until 8).map { i ->
+            PdfTextExtractor.Line("正文第${i}行", 100f + i * 20f, 1, startX = 50f, endX = 500f + i, pageWidth = 595.276f)
+        }
+        assertFalse(PdfTextExtractor.hasColumnGap(lines))
+    }
+
+    @Test
+    fun `pageWidth为0（旧数据没有坐标信息）时不判定为两栏`() {
+        val lines = (0 until 12).map { PdfTextExtractor.Line("行$it", 100f + it * 20f, 1) }
+        assertFalse(PdfTextExtractor.hasColumnGap(lines))
+    }
+
+    /**
      * [PdfTextExtractor.classifyHeadings] 的单元测试——用户明确选择的策略："字号
      * 明显偏大 或 字体本身加粗，两个信号满足一个就算标题"（见该函数 KDoc）。
      */

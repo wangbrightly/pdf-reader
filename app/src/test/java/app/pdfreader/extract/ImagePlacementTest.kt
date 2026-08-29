@@ -118,4 +118,38 @@ class ImagePlacementTest {
         )
         assertEquals(-1, index)
     }
+
+    // ---- afterParagraphIndexByTopY：2026-08-28 真机反馈修复（"图片和文字分开了"）配套一节 ----
+
+    @Test
+    fun `图片落在两个段落中间时 插在topY较小的那个段落之后`() {
+        // 段落分别距页顶 20、150；图片距页顶 70，落在两者中间，应该插在段落 0 之后。
+        val index = ImagePlacement.afterParagraphIndexByTopY(paragraphTopYs = listOf(20f, 150f), imageTopY = 70f)
+        assertEquals(0, index)
+    }
+
+    @Test
+    fun `图片在所有段落下方时 插在最后一个段落之后`() {
+        val index = ImagePlacement.afterParagraphIndexByTopY(paragraphTopYs = listOf(20f, 150f), imageTopY = 220f)
+        assertEquals(1, index)
+    }
+
+    @Test
+    fun `图片在所有段落上方时 插在最前面`() {
+        val index = ImagePlacement.afterParagraphIndexByTopY(paragraphTopYs = listOf(100f, 200f), imageTopY = 10f)
+        assertEquals(-1, index)
+    }
+
+    @Test
+    fun `没有任何文字段落时 图片按topY一律插在最前面`() {
+        val index = ImagePlacement.afterParagraphIndexByTopY(paragraphTopYs = emptyList(), imageTopY = 50f)
+        assertEquals(-1, index)
+    }
+
+    @Test
+    fun `多张图片落在同一段落区间时 各自算出同一个插入下标`() {
+        val paragraphTopYs = listOf(20f, 150f)
+        assertEquals(0, ImagePlacement.afterParagraphIndexByTopY(paragraphTopYs, imageTopY = 60f))
+        assertEquals(0, ImagePlacement.afterParagraphIndexByTopY(paragraphTopYs, imageTopY = 90f))
+    }
 }

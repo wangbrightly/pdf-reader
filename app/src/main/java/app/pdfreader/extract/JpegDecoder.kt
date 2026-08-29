@@ -202,13 +202,32 @@ internal object JpegDecoder {
      * 装机复测过这 19 张全部正常解码、没有触发 OOM。
      *
      * 超过这个阈值直接拒绝解码、退回占位图——跟本类"范围外数据一律返回
-     * null"的一贯降级精神一致，比冒 OOM 崩溃风险划算。真正的解决办法是把
-     * `planes` 从 `IntArray` 换成占内存更小的存储、或者实现按需降采样解码
-     * （工作量高一个级别，这次没做，见 NOTES.md #34）。这次调阈值不是"猜一个
-     * 更大的数字糊弄过去"——如果以后再遇到"图片过大"占位图变多的真机反馈，
-     * 先查真实图片像素数落在哪个区间，别直接再调大这个常量。
+     * null"的一贯降级精神一致，比冒 OOM 崩溃风险划算。
+     *
+     * **2026-08-27 真正做了 KDoc 里早就标注过的那条"真正的解决办法"**：
+     * [planes] 从 `IntArray`（4 字节/像素）换成 `ByteArray`（1 字节/像素）
+     * ——IDCT 输出经色阶还原后就是普通 0-255 采样值，不需要 4 字节精度。
+     * 4 个分量的 plane 总内存从 16 字节/像素降到 4 字节/像素，峰值内存
+     * （4 个 byte plane + `argb` IntArray 4 字节/像素，`Bitmap` 自己的原生
+     * 缓冲区另算）比原来的"20 字节/像素"打了对折都不止。真机装机复测：
+     * 用这本文档实际撞到限制的两张图（3226×4374=1411 万像素、
+     * 2481×3367=835 万像素）+ 全文档扫出来最大的一张（3320×4501=1494 万
+     * 像素，同一份文档另一页），临时把阈值调到 2000 万跑通整份文档，三张
+     * 图全部解码成功、**没有 OOM、没有崩溃**（`dumpsys meminfo` 复测确认
+     * 进程存活，堆占用在正常范围），解码耗时 3.8~9.5 秒（像素数越大越慢，
+     * 但都在这套"页面解码推迟到锁外、多页可并发"的架构下可接受，不阻塞
+     * 其它页）。
+     *
+     * 阈值定在 **1600 万**（不是真机实测跑通的 2000 万那个上限本身）——
+     * 只比这份文档全文最大的真实图片（1494 万）留约 7% 余量，不是拍脑袋
+     * 选的更大数字：换了更省内存的存储结构之后，原来"1730 万像素确认 OOM"
+     * 这个数据点是在**旧的 IntArray 实现**上测出来的，没有理由假设新实现
+     * 在同一个像素数附近还会崩，但也没有重新去真机上找"新实现的 OOM 点"
+     * 具体在哪——按"查真实图片像素数落在哪个区间，覆盖住就行，不用留过多
+     * 冒进的余量"这条本类一贯的方法论，1600 万刚好覆盖已知的真实需求，
+     * 不做没有真机数据支撑的进一步冒险。
      */
-    internal const val MAX_CMYK_JPEG_PIXELS = 6_000_000
+    internal const val MAX_CMYK_JPEG_PIXELS = 16_000_000
 
     fun decode(bytes: ByteArray): DecodedImage? = runCatching { decodeInternal(bytes) }.getOrNull()
 
@@ -244,9 +263,20 @@ internal object JpegDecoder {
         // 尺寸）——采样比例低的分量（比如 4:2:0 里的 Cb/Cr）plane 天然更小，
         // 总内存比"强行按满分辨率分配 4 份"更省，不需要因为加了子采样支持就
         // 调高 [MAX_CMYK_JPEG_PIXELS]。
+        //
+        // 2026-08-27 OOM 阈值真机复现两次撞到之后的真正修复（NOTES #34 早就
+        // 标注过、之前没做的那条）：这里原来是 `IntArray`（4 字节/像素），但
+        // IDCT 输出经色阶还原后就是普通的 0-255 采样值，`ByteArray`（1 字节/
+        // 像素）完全够用——4 个分量的 plane 总内存从 16 字节/像素降到 4 字节/
+        // 像素，见 [MAX_CMYK_JPEG_PIXELS] KDoc"真正的解决办法"一节。写入时
+        // 提前做 `coerceIn(0,255)`（原来这一步在 [sample] 读取时才做，搬到
+        // 写入时是等价的——每个像素坐标只会被写入一次，不影响任何解码结果，
+        // 纯存储层面的优化，不改变一个像素的输出值）；读取时要 `and 0xFF`
+        // 转回无符号值（Kotlin 的 `Byte` 是有符号的，128~255 存进去会变成
+        // 负数，不加这个掩码会解出一堆错误的暗部像素）。
         val compPlaneWidth = IntArray(4) { mcusPerLine * frame.components[it].samplingH * 8 }
         val compPlaneHeight = IntArray(4) { mcusPerColumn * frame.components[it].samplingV * 8 }
-        val planes = Array(4) { IntArray(compPlaneWidth[it] * compPlaneHeight[it]) }
+        val planes = Array(4) { ByteArray(compPlaneWidth[it] * compPlaneHeight[it]) }
 
         val decodeTables = frame.scanComponents.map { sc ->
             val dc = frame.huffmanTables[HuffKey(0, sc.dcTableId)] ?: return null
@@ -308,7 +338,7 @@ internal object JpegDecoder {
                                 val rowOffset = (baseY + y) * planeW + baseX
                                 val srcOffset = y * 8
                                 for (x in 0 until 8) {
-                                    plane[rowOffset + x] = spatial[srcOffset + x]
+                                    plane[rowOffset + x] = spatial[srcOffset + x].coerceIn(0, 255).toByte()
                                 }
                             }
                         }
@@ -334,7 +364,7 @@ internal object JpegDecoder {
             val comp = frame.components[ci]
             val sx = x * comp.samplingH / hMax
             val sy = y * comp.samplingV / vMax
-            return planes[ci][sy * compPlaneWidth[ci] + sx].coerceIn(0, 255)
+            return planes[ci][sy * compPlaneWidth[ci] + sx].toInt() and 0xFF
         }
 
         // "默认朝向"下的 C/M/Y/K：transform=0 就是原始采样值本身；transform=2

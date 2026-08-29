@@ -245,15 +245,44 @@ class JpegDecoderCrossValidationTest {
     }
 
     /**
-     * 见 [JpegDecoder.MAX_CMYK_JPEG_PIXELS] KDoc——超过像素上限直接拒绝，不
-     * 冒 OOM 风险。`large-quadrant.jpg`（4500×3000，1350 万像素）远超上限
-     * （400 万），必须返回 null；`cmyk-quadrant-64.jpg`（64×64）远低于上限，
-     * 必须正常解码——一次测试覆盖阈值两侧，不只测"超限会拒绝"这一半。
+     * 2026-08-27 真机反馈修复（"这两张超大 CMYK 图片要不要放开解码限制"）：
+     * `MAX_CMYK_JPEG_PIXELS` 从 600 万调到 1600 万（见该常量 KDoc"真正的
+     * 解决办法"一节——`planes` 从 `IntArray` 换成 `ByteArray` 之后峰值内存
+     * 打了对折，真机装机复测过 1494 万像素不 OOM）。
+     *
+     * 原来这里用 `large-quadrant.jpg` 当"超过上限"的反例，但那份 fixture 是
+     * 3 分量 RGB JPEG（[JpegComponentCountTest]/[PdfTextExtractorJpegSubsamplingTest]
+     * 另外两处测试依赖它是 RGB，不能改）——用它测像素上限凑巧能通过
+     * `assertNull`，但真正命中的是"分量数不是 4"这条更早的拒绝分支（见
+     * [JpegDecoder] 里 `decodeInternal` 的检查顺序），根本没有真正测到像素
+     * 上限这条判断，是个巧合通过、名不副实的旧测试，这次连带修正。
+     *
+     * 换成两份专门为这条测试生成的、货真价实的 4 分量 CMYK 素材：
+     * `large-cmyk-quadrant.jpg`（4500×3000，1350 万像素，在新上限 1600 万
+     * 以内，应该正常解码）、`oversized-quadrant.jpg`（4500×4000，1800 万
+     * 像素，超过新上限，应该继续被拒绝）——一次测试覆盖新阈值两侧，两份
+     * fixture 都没有独立的参考 PNG（纯色块内容，用跟
+     * [四象限纯色 解码结果本身要接近原始红绿蓝黄四色 不只是跟参考实现一致]
+     * 同样的"结构性断言"验证解码结果本身合理，不依赖第三方参考实现）。
      */
     @Test
     fun `超过像素上限的CMYK JPEG 明确返回null 不冒OOM风险`() {
-        assertNull(JpegDecoder.decode(loadBytes("large-quadrant.jpg")))
-        assertNotNull(JpegDecoder.decode(loadBytes("cmyk-quadrant-64.jpg")))
+        val decoded = JpegDecoder.decode(loadBytes("large-cmyk-quadrant.jpg"))
+        assertNotNull("1350 万像素在 1600 万新上限以内，应该正常解码", decoded)
+        requireNotNull(decoded)
+        fun pixelAt(x: Int, y: Int): Triple<Int, Int, Int> {
+            val argb = decoded.argb[y * decoded.width + x]
+            return Triple((argb ushr 16) and 0xFF, (argb ushr 8) and 0xFF, argb and 0xFF)
+        }
+        val (r1, g1, b1) = pixelAt(decoded.width / 4, decoded.height / 4) // 左上：红
+        assertTrue("左上应该偏红：($r1,$g1,$b1)", r1 > g1 + 40 && r1 > b1 + 40)
+        val (r4, g4, b4) = pixelAt(decoded.width * 3 / 4, decoded.height * 3 / 4) // 右下：黄
+        assertTrue("右下应该偏黄：($r4,$g4,$b4)", r4 > b4 + 40 && g4 > b4 + 40)
+
+        assertNull(
+            "1800 万像素超过 1600 万新上限，应该继续拒绝",
+            JpegDecoder.decode(loadBytes("oversized-quadrant.jpg")),
+        )
     }
 
     @Test

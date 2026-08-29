@@ -148,6 +148,48 @@ data class TableRegion(val minX: Float, val minY: Float, val maxX: Float, val ma
  * 同一类风险，只是这次触发条件更具体（要求那条不相关的线本身很长、且被误认成
  * 表格的一部分），真机目前还没有实际撞见过这种反例，如果以后出现，需要重新
  * 评估这条检查要不要继续留着。
+ *
+ * ## 覆盖连续性检查（2026-08-28 加上）：真机第四次误判，"整体跨度"骗不过但"缺不缺口"能
+ *
+ * 真机反馈一份产品手册（"无线电系统/RF 电路"页，还有天线设计/电机仿真等好几页
+ * 用了同一种版式）：一页排成 2 列 × 3 行共 6 个独立小节，每个小节自己带一圈
+ * 装饰性边框（黑色标题条+细线勾边）。6 个方框整齐排成 2×3 网格，横线竖线各自
+ * 都轻松过 [MIN_GRID_LINES]，6 个方框大小相近，上一节的 `widthRatio`/`heightRatio`
+ * 检查（比较横线整体跨度和竖线整体跨度）在这种"整整齐齐的网格"上完全测不出
+ * 异常——**这次的误判几何形状本身就是一个正经的 2×3 网格**，跟上面三次误判
+ * （零散装饰线、封面色块、董事卡片）那种"两批线段偶然重叠"完全不同，是这个
+ * 检测器至今遇到的最像真表格的一次误判。
+ *
+ * **第一版修法（`hOwnSpanRatio`/`vOwnSpanRatio`，已废弃，如实记录踩过的坑）**：
+ * 最初以为"每条线自己有多长"能当信号——真表格的一条横向网格线贯穿表格整个
+ * 宽度，方框网格每个方框自己的边框只贯穿这一个方框的宽度。反编译本类自己的
+ * 真机 fixture（`sample-with-table.pdf`，Chromium 打印 `<table border>` 生成）
+ * 的原始 content stream 才发现这个假设本身是错的：**Chromium 逐格画边框**，
+ * 同一条表格网格线在真实数据里被拆成好几段（三列表格的一条横线是 `8 79 193 1
+ * re`+`201 79 242 1 re`+`443 79 192 1 re` 三段矩形，不是一条 `8 79 634 1`
+ * 通栏矩形）——单段长度只有列宽（193/242/192pt），远小于整条表格宽度
+ * （627pt），比值约 0.3，比这次要拦截的方框网格（约 0.5）还要低。用"单条线
+ * 长度占整体跨度的比例"做信号，会把这份连贯真表格自己的 fixture 也误杀
+ * （`PdfTextExtractorTableTest` 四条断言当场跑挂）——不是阈值选错，是这个
+ * 信号本身在"真表格允许逐格画线"这个前提下不成立，两种情况的比例区间是
+ * 反过来的，没有任何阈值能同时放过真表格、拦住方框网格。
+ *
+ * **真正的区别在于"分段之间连不连得上"，不是"每一段多长"**：Chromium 逐格
+ * 画的那些短线段，相邻两段是**首尾相接**的（前一列的右边界 x=201 正好是
+ * 后一列的左边界 x=201，同一条逻辑网格线被整整齐齐地切开，中间没有缝）；
+ * 方框网格里，第一列方框的右边框（x=300）和第二列方框的左边框（x=320）
+ * 之间隔着一条真实的设计间距（版式的"栏间距"/gutter，这次真机样本约 20pt）
+ * ——这才是能把两种情况分开、且不依赖"线段是不是被切开画"这个实现细节的
+ * 几何信号。把同一方向的所有线段的坐标区间（横线用 X 区间、竖线用 Y 区间）
+ * 排序后依次合并，真表格（不管逐格画还是通栏画）合并起来严丝合缝、零缺口；
+ * 方框网格的栏间距/行间距会在合并区间里露出一段实打实的空隙。
+ *
+ * [hasCoverageGap] 的容差（[COVERAGE_GAP_TOLERANCE_PT] = 3pt）只用来吸收取整/
+ * 反锯齿造成的坐标误差（跟 [CLUSTER_TOLERANCE_PT] 同一类考量），远小于这次
+ * 真实误判的 20pt 栏间距，也远小于真表格逐格画线时严格为 0 的间隙——两头都
+ * 留了足够宽的安全边际。用现有测试套件反过来验证过：所有"真表格"fixture
+ * （包括这次新发现问题的 `sample-with-table.pdf`）以及已经被用户接受的
+ * "页边距装饰边框"回归案例，合并区间都没有缺口，不受这条新检查影响。
  */
 object TableGridDetector {
     /** 判定"这条线段是水平/竖直"的容差：允许因为矩形厚度导致的 1pt 左右偏差。 */
@@ -164,6 +206,9 @@ object TableGridDetector {
 
     /** 见类 KDoc"横竖跨度比例检查"一节——横线整体跨度和竖线整体跨度的比值超过这个倍数就不像同一个表格。 */
     private const val MAX_EXTENT_RATIO = 2f
+
+    /** 见类 KDoc"覆盖连续性检查"一节——合并区间时，起点和前一段终点之间的间隙超过这个容差才算"缺口"（留出一点点给取整/反锯齿造成的误差）。 */
+    private const val COVERAGE_GAP_TOLERANCE_PT = 3f
 
     fun looksLikeTable(segments: List<LineSegment>): Boolean = tableRegionOrNull(segments) != null
 
@@ -205,6 +250,13 @@ object TableGridDetector {
         val heightRatio = maxOf(hHeight, vHeight) / minOf(hHeight, vHeight).coerceAtLeast(1f)
         if (heightRatio > MAX_EXTENT_RATIO) return null
 
+        // 见类 KDoc"覆盖连续性检查"一节——横线们的 X 区间合并起来，中间不能有
+        // 缺口（真表格哪怕逐格画边框，相邻单元格共享同一条分界线，合并起来严丝
+        // 合缝；独立方框排版的方框之间留了真实的设计间距，合并区间会露出缺口）。
+        // 竖线同理，检查它们的 Y 区间合并起来有没有缺口。
+        if (hasCoverageGap(horizontals.map { minOf(it.x1, it.x2)..maxOf(it.x1, it.x2) })) return null
+        if (hasCoverageGap(verticals.map { minOf(it.y1, it.y2)..maxOf(it.y1, it.y2) })) return null
+
         return TableRegion(
             minX = minOf(hMinX, vMinX),
             minY = minOf(hMinY, vMinY),
@@ -214,6 +266,24 @@ object TableGridDetector {
     }
 
     private fun LineSegment.length(): Float = hypot((x2 - x1).toDouble(), (y2 - y1).toDouble()).toFloat()
+
+    /**
+     * 见类 KDoc"覆盖连续性检查"一节——把 [ranges] 按起点排序后依次合并，中间只要
+     * 出现一次超过 [COVERAGE_GAP_TOLERANCE_PT] 的空隙就判定"不连续"。真表格哪怕
+     * 逐格拆成一段段（Chromium 打印表格的真实画法），相邻单元格共享同一条分界线，
+     * 合并起来严丝合缝（缺口=0）；独立方框排版的方框之间留了真实的设计间距
+     * （这次真机反馈的样本约 20pt），远超这个容差。
+     */
+    private fun hasCoverageGap(ranges: List<ClosedFloatingPointRange<Float>>): Boolean {
+        if (ranges.isEmpty()) return false
+        val sorted = ranges.sortedBy { it.start }
+        var currentEnd = sorted.first().endInclusive
+        for (range in sorted.drop(1)) {
+            if (range.start - currentEnd > COVERAGE_GAP_TOLERANCE_PT) return true
+            currentEnd = maxOf(currentEnd, range.endInclusive)
+        }
+        return false
+    }
 
     private fun LineSegment.isHorizontal(): Boolean =
         abs(y2 - y1) <= AXIS_TOLERANCE_PT && length() >= MIN_LINE_LENGTH_PT

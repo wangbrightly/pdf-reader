@@ -238,6 +238,36 @@ class TableGridDetectorTest {
         assertTrue(TableGridDetector.looksLikeTable(underRatio))
     }
 
+    // ---- 单条线自身长度占比检查：2026-08-28 加上，见类 KDoc 对应小节 ----
+
+    @Test
+    fun `2乘3独立方框排成的网格不构成表格（真机第四次误判反例）`() {
+        // 真机反馈的"无线电系统 RF 电路"页真实版式简化：2 列 × 3 行共 6 个独立
+        // 小节，每个小节自己带一圈装饰性边框（黑色标题条+细线勾边）。6 个方框
+        // 整齐排成网格，横竖跨度比例检查（上一节）测不出异常——这次两个方向的
+        // 整体跨度本身就很接近（两列宽度加起来 vs 三行高度加起来），跟真表格
+        // 的形状没有区别，只有"每个方框自己的边框只圈住这一个方框、不贯穿整个
+        // 网格宽/高"这个信号能把它和真表格分开。
+        val segments = mutableListOf<LineSegment>()
+        val colLefts = listOf(50f, 320f) // 两列，每列宽 250
+        val rowTops = listOf(600f, 400f, 200f) // 三行，每行高 180（PDF y 轴向上，从上往下 y 递减）
+        for (colLeft in colLefts) {
+            val colRight = colLeft + 250f
+            for (rowTop in rowTops) {
+                val rowBottom = rowTop - 180f
+                // 每个方框自己的边框——只贯穿这一个方框的宽/高，不贯穿整个网格。
+                segments.add(LineSegment(colLeft, rowTop, colRight, rowTop)) // 上边
+                segments.add(LineSegment(colRight, rowTop, colRight, rowBottom)) // 右边
+                segments.add(LineSegment(colRight, rowBottom, colLeft, rowBottom)) // 下边
+                segments.add(LineSegment(colLeft, rowBottom, colLeft, rowTop)) // 左边
+            }
+        }
+        assertFalse(
+            "6 个独立方框排成的网格不该被判定为表格——每条边框线只贯穿自己那个方框，不贯穿整个网格",
+            TableGridDetector.looksLikeTable(segments),
+        )
+    }
+
     @Test
     fun `looksLikeTable 和 tableRegionOrNull 的判断结果永远一致`() {
         // 两者共享同一套判断逻辑，不应该出现"looksLikeTable 说是表格，

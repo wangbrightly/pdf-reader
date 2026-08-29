@@ -584,6 +584,82 @@ class PdfTextExtractorSessionTest {
     }
 
     /**
+     * 2026-08-27 真机反馈修复（"第二页颜色不对"）：跟上面那条 NOTES #38/#39 的
+     * 测试不同——那条是"一张真的占满全页的图片"+"巧合的表格状线段"，这次
+     * 是完全没有占满全页图片的设计页（多个小缩略图配细边框/装饰线/背景色块），
+     * 矢量段凑巧被 [TableGridDetector] 判定出一个**精确等于整个页面 MediaBox**
+     * 的 [TableRegion]（真机日志验证过 minX=minY=0、maxX/maxY=页面宽高）——这种
+     * "四条边都跟页面边界零边距贴死"的形状本身就不像真表格，命中后原本会把
+     * 整页交给 PdfBox-Android 自己的 `PDFRenderer` 栅格化，那条渲染管线不认识
+     * DeviceCMYK，栅格化结果颜色全错（黑底蓝字）。
+     *
+     * 第一版修复只是让这种形状回退到"逐张小图 + 文字段落"的正常 reflow 分支，
+     * 真机复测发现观感更差——这一页的背景色块/装饰线条本来就是矢量图形，
+     * reflow 抽取模型只认文字段落和内嵌图片两种内容，完全没有"矢量填充"这个
+     * 概念，10 张互不相关的缩略图纵向罗列、丢光所有版式关系，看起来是一整块
+     * 灰色。改成跟 NOTES #48/#49 的 JPX 整页兜底同一条路：命中这个形状直接用
+     * [Session.renderPageWithAndroidPdfRenderer]（pdfium）整页栅格化，不落进
+     * 下面表格裁剪分支，也不落进 reflow 分支。
+     *
+     * 用网格线的坐标精确覆盖 `(0,0)` 到 `(pageWidth,pageHeight)` 复现这个形状。
+     * Robolectric 环境下 `android.graphics.pdf.PdfRenderer` 不可用（纯 JVM，
+     * 没有系统 PDF 渲染服务，见上面"占满全页的图片没内容且完全没有真实文字时"
+     * 那条测试同样的环境限制），`renderPageWithAndroidPdfRenderer` 内部
+     * `runCatching` 会静默返回 `null`——这条测试只能验证"决策分支选对了"（没有
+     * 落进表格裁剪分支产出错误尺寸的裁剪图，也没有落进 reflow 分支把小图和
+     * 文字都摆出来），不能验证真实像素，真机截图是实际正确性的证据。
+     */
+    @Test
+    fun `表格状矢量线段精确覆盖整个页面边界时判定为误判 改用整页栅格化兜底`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val image = document.tinyImage()
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("design page caption text")
+        stream.endText()
+        // 图片只占一角，远没有到"占满全页"的比例——跟上面那条测试的关键区别。
+        stream.drawImage(image, 10f, 10f, 40f, 30f)
+        // 装饰性矢量线的边界框精确等于整个页面（0,0)-(pageWidth,pageHeight)，
+        // 复现真机那份 Ansys 文档设计页的坐标形状。
+        val verticalXs = listOf(0f, pageWidth / 2f, pageWidth)
+        val horizontalYs = listOf(0f, pageHeight / 2f, pageHeight)
+        for (y in horizontalYs) {
+            stream.addRect(verticalXs.first(), y, verticalXs.last() - verticalXs.first(), 1f)
+            stream.fill()
+        }
+        for (x in verticalXs) {
+            stream.addRect(x, horizontalYs.first(), 1f, horizontalYs.last() - horizontalYs.first())
+            stream.fill()
+        }
+        stream.close()
+
+        val file = File.createTempFile("full-page-table-shaped-lines-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            // Robolectric 下 renderPageWithAndroidPdfRenderer 必然返回 null（见上面
+            // KDoc），修复后这条分支应该整页栅格化兜底、直接返回，blocks 因此应该
+            // 是空列表——不是表格裁剪分支产出的一张 ~611px 宽裁剪图（旧行为，
+            // PdfBox 自己的 PDFRenderer 在 Robolectric 下确实能跑，只是颜色是错的，
+            // 真机才看得出来），也不是 reflow 分支产出的"120×80 小图 + 文字段落"。
+            assertTrue("应该整页栅格化兜底（Robolectric 下即空列表），实际 blocks=$blocks", blocks.isEmpty())
+        }
+    }
+
+    /**
      * NOTES.md #42：真机反馈整页图片的页要等图片全解完才看到任何东西（尤其是
      * 不显示文字的 hasFullPageImage 页），加了 `onImageReady` 回调让每张图片
      * 刚解出来就能先展示，不用等整页处理完。这条测试验证回调本身的契约：
@@ -720,6 +796,191 @@ class PdfTextExtractorSessionTest {
         PdfTextExtractor.Session.open(context, file).use { session ->
             val texts = session.loadPage(1).blocks.filterIsInstance<DisplayBlock.Text>().map { it.text }
             assertEquals(listOf("real caption text"), texts)
+        }
+    }
+
+    /**
+     * 2026-08-28 真机反馈修复（排查"图片和文字分开了"时发现的更基础问题）：
+     * InDesign 导出的跨页拼版文档，一页的 content stream 会包含邻页的绘图指令
+     * （超出这一页自己 `MediaBox` 的部分——`MediaBox` 只是显示窗口，不是内容
+     * 边界）。真机验证过真实数据：读一份文档"RF 电路"页的文字，会连同前一页
+     * "天线设计"的全部内容一起读出来，X 坐标整体偏移了一个页面宽度（是负数，
+     * 肉眼看不见，但确实混进了段落列表）。
+     *
+     * 这条测试用最小的构造复现同一个坐标形状：一页正常写一段"这一页真正的
+     * 文字"（X 在页面范围内），content stream 里另外在页面左边界之外（X 是
+     * 负数）写一段"邻页文字"（模拟被拼版污染进来的内容）——`Session.loadPage`
+     * 的结果应该只有真正属于这一页的文字，邻页文字必须被 [PdfTextExtractor
+     * .isLineOnPage] 挡在外面，不出现在任何段落里。
+     */
+    @Test
+    fun `跨页拼版导致的越界文字不会混进这一页的段落里（InDesign拼版真机反例）`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 595.276f
+        val pageHeight = 807.874f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        // 邻页文字：X 坐标在页面左边界（0）之外，模拟拼版污染。
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(-500f, 700f)
+        stream.showText("neighboring page bleed text")
+        stream.endText()
+        // 这一页真正的文字：X 坐标在页面范围内。
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(50f, 400f)
+        stream.showText("real content on this page")
+        stream.endText()
+        stream.close()
+
+        val file = File.createTempFile("cross-page-bleed-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val texts = session.loadPage(1).blocks.filterIsInstance<DisplayBlock.Text>().map { it.text }
+            assertEquals(listOf("real content on this page"), texts)
+        }
+    }
+
+    /**
+     * 2026-08-28 真机反馈（"图片和文字分开了"）——用户拍板不追求重排出正确的
+     * 两栏阅读顺序，改成识别到两栏排版就整页栅格化，见
+     * [PdfTextExtractor.hasColumnGap] KDoc 完整背景。这条测试构造一个真实的
+     * 两栏页面（左栏/右栏各 6 段独立文字，中间留出干净的空白带），验证
+     * `Session.loadPage` 走的是整页栅格化分支，不是逐段文字重排。
+     *
+     * Robolectric 环境下 `android.graphics.pdf.PdfRenderer` 不可用（纯 JVM，
+     * 没有系统 PDF 渲染服务，见上面"占满全页的图片没内容且完全没有真实文字时"
+     * 那条测试同样的环境限制），`renderPageWithAndroidPdfRenderer` 内部
+     * `runCatching` 会静默返回 `null`——这条测试只能验证"决策分支选对了"
+     * （没有落进逐段文字重排分支，也没有把 12 段文字原样展示出来），不能验证
+     * 真实栅格化像素，真机截图是实际正确性的证据。
+     */
+    @Test
+    fun `识别到两栏排版时整页栅格化 不逐段重排文字（真机RF电路页简化复现）`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 595.276f
+        val pageHeight = 807.874f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        // 左栏 6 段独立文字，X 落在页面左半部分。
+        for (i in 0 until 6) {
+            stream.beginText()
+            stream.setFont(PDType1Font.HELVETICA, 12f)
+            stream.newLineAtOffset(50f, 700f - i * 80f)
+            stream.showText("left column section $i")
+            stream.endText()
+        }
+        // 右栏 6 段独立文字，X 落在页面右半部分，跟左栏之间留出干净的空白带。
+        for (i in 0 until 6) {
+            stream.beginText()
+            stream.setFont(PDType1Font.HELVETICA, 12f)
+            stream.newLineAtOffset(320f, 700f - i * 80f)
+            stream.showText("right column section $i")
+            stream.endText()
+        }
+        stream.close()
+
+        val file = File.createTempFile("two-column-layout-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue(
+                "识别到两栏排版后不该逐段重排文字，实际 blocks=$blocks",
+                blocks.none { it is DisplayBlock.Text },
+            )
+        }
+    }
+
+    /**
+     * 2026-08-28 真机反馈修复（"图片和文字分开了"）：真实场景是一份产品手册，
+     * 每页两栏×3 个独立小节，每个小节自己的标题+说明文字+1~3 张图——原来的
+     * 实现把一页里所有图片统一堆到这一页最后一段文字之后（见
+     * [ImagePlacement.afterParagraphIndexByTopY] KDoc 完整背景），一页 6 张图
+     * 全部挪到页面最后，跟它们各自的说明文字完全脱节。这条测试用最小的复现
+     * 场景——一页两个独立的"文字+图片"小节——验证修复后图片按自己的纵坐标
+     * 插回紧跟在它自己那段文字后面，不是全部堆在页面最后。
+     *
+     * 每个小节两行文字（不是一行）是必要的构造，不是随意加料：
+     * [linesToParagraphs] 用"本页所有相邻行间距的中位数 × 1.5"当分段阈值，
+     * 只有两行文字时中位数就是这一个间距本身，"间距 ≤ 间距×1.5"恒成立，两行
+     * 永远被并成一段，测不出"按小节分段"这个前提。每个小节内部两行用 12pt
+     * 的正常单倍行距（模拟一段说明文字自身的行距），两个小节之间隔 118pt
+     * （远大于小节内行距，模拟真实排版里"这一段说明文字讲完了，另起一个不
+     * 相关的小节"）——三个间距 `[12, 118, 12]` 中位数是 12，阈值 18，小节内
+     * 间距不超阈值（合并成一段），小节之间间距远超阈值（切开成两段），这样
+     * 段落切分本身先验证过是符合预期的，图片插入位置的断言才有意义。
+     *
+     * 页面坐标（PDF 坐标系，原点左下、y 向上，页高 300pt）：
+     * - 小节 A：两行文字在 y=280/268（topY=20/32），图片画在 y=200~230（topY=70）
+     * - 小节 B：两行文字在 y=150/138（topY=150/162），图片画在 y=50~80（topY=220）
+     *
+     * 修复前（图片统一堆最后）：`[段落A, 段落B, 图片A, 图片B]`。
+     * 修复后（按纵坐标插回）：`[段落A, 图片A, 段落B, 图片B]`。
+     */
+    @Test
+    fun `一页两个独立图文小节时 每张图片插回自己那段文字后面 不是全部堆在页面最后`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 280f)
+        stream.showText("section A line one")
+        stream.newLineAtOffset(0f, -12f)
+        stream.showText("section A line two")
+        stream.endText()
+        stream.drawImage(document.tinyImage(), 20f, 200f, 40f, 30f)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("section B line one")
+        stream.newLineAtOffset(0f, -12f)
+        stream.showText("section B line two")
+        stream.endText()
+        stream.drawImage(document.tinyImage(), 20f, 50f, 40f, 30f)
+        stream.close()
+
+        val file = File.createTempFile("two-image-text-sections-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            val kinds = blocks.map { if (it is DisplayBlock.Text) "T" else "I" }
+            assertEquals(
+                "图片应该紧跟在自己那段文字后面，实际 blocks=$blocks",
+                listOf("T", "I", "T", "I"),
+                kinds,
+            )
+            val texts = blocks.filterIsInstance<DisplayBlock.Text>().map { it.text }
+            assertEquals(2, texts.size)
+            assertTrue("第一段应该是小节 A 的两行：${texts[0]}", texts[0].contains("section A"))
+            assertTrue("第二段应该是小节 B 的两行：${texts[1]}", texts[1].contains("section B"))
         }
     }
 

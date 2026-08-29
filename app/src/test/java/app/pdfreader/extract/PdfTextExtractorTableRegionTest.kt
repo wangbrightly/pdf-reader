@@ -114,4 +114,66 @@ class PdfTextExtractorTableRegionTest {
         val segment = LineSegment(x1 = -0.5f, y1 = 0f, x2 = 612.5f, y2 = 792f)
         assertTrue(PdfTextExtractor.isSegmentOnPage(segment, pageWidth = 612f, pageHeight = 792f))
     }
+
+    // ---- isLineOnPage：2026-08-28 真机反馈修复（"图片和文字分开了"排查出的更基础问题）----
+
+    @Test
+    fun `左右边界都在页面宽度内的文字行判定为在页面上`() {
+        val line = PdfTextExtractor.Line(
+            text = "正文",
+            y = 100f,
+            page = 1,
+            startX = 50f,
+            endX = 200f,
+            pageWidth = 595.276f,
+        )
+        assertTrue(PdfTextExtractor.isLineOnPage(line))
+    }
+
+    @Test
+    fun `X坐标是负数、明显超出页面左边界的文字行判定为不在页面上（InDesign跨页拼版真机反例）`() {
+        // 真机实测复现的真实数值：跨页拼版文档"RF 电路"页读出来的邻页"天线设计"
+        // 文字，X 坐标整体偏移了一个页面宽度（595.276pt），落在页面左边界之外。
+        val line = PdfTextExtractor.Line(
+            text = "天线设计",
+            y = 112.97284f,
+            page = 7,
+            startX = -515.7883f,
+            endX = -474.8683f,
+            pageWidth = 595.276f,
+        )
+        assertFalse(PdfTextExtractor.isLineOnPage(line))
+    }
+
+    @Test
+    fun `X坐标超出页面右边界的文字行判定为不在页面上`() {
+        val line = PdfTextExtractor.Line(
+            text = "邻页内容",
+            y = 100f,
+            page = 6,
+            startX = 700f,
+            endX = 800f,
+            pageWidth = 595.276f,
+        )
+        assertFalse(PdfTextExtractor.isLineOnPage(line))
+    }
+
+    @Test
+    fun `贴着页面边缘、在容差范围内的文字行仍然判定为在页面上`() {
+        val line = PdfTextExtractor.Line(
+            text = "边缘文字",
+            y = 100f,
+            page = 1,
+            startX = -0.5f,
+            endX = 595.776f,
+            pageWidth = 595.276f,
+        )
+        assertTrue(PdfTextExtractor.isLineOnPage(line))
+    }
+
+    @Test
+    fun `pageWidth为0（旧测试手写构造Line、没传这个字段）时不过滤，保持原行为`() {
+        val line = PdfTextExtractor.Line(text = "旧测试构造的行", y = 100f, page = 1)
+        assertTrue(PdfTextExtractor.isLineOnPage(line))
+    }
 }

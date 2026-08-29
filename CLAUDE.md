@@ -30,7 +30,17 @@
 
 ## 表格检测
 
-信号是矢量网格线（填充矩形，不是描边直线——Chromium 打印出来的表格边框是这样），不是文字列对齐。策略保守，≥3 横线 + ≥3 竖线 + 横竖跨度比例不超过 2 倍才判定为表格，宁可漏检。命中页整页渲染成 Bitmap，复用图片展示的双指缩放机制。**整页图片优先于表格检测**（`scanHasFullPageImage=true` 时不跑 `TableGridDetector`）——装饰性设计页（色块/线条多）会让矢量线段凑巧组成假网格，见 NOTES #38/#39/#42。这是历史上反复误判的敏感区域（#17/#39/#42 三次不同触发场景），改动前务必读 `TableGridDetector` 类 KDoc 全文。
+信号是矢量网格线（填充矩形，不是描边直线——Chromium 打印出来的表格边框是这样），不是文字列对齐。策略保守，≥3 横线 + ≥3 竖线 + 横竖跨度比例不超过 2 倍 + 同方向线段坐标区间合并起来不能有缺口（`hasCoverageGap`，容差 3pt——独立方框排版的方框之间有真实设计间距，会露出缺口；真表格哪怕逐格画边框，相邻单元格共享分界线，合并起来零缺口，见 NOTES #52 踩过的坑：不能用"单条线自身长度占整体跨度的比例"，Chromium 逐格画表格边框会让这个信号反过来）才判定为表格，宁可漏检。命中页整页渲染成 Bitmap，复用图片展示的双指缩放机制。**整页图片优先于表格检测**（`scanHasFullPageImage=true` 时不跑 `TableGridDetector`）——装饰性设计页（色块/线条多）会让矢量线段凑巧组成假网格，见 NOTES #38/#39/#42。判定出的 `TableRegion` 精确覆盖整个页面 MediaBox（四条边零边距贴死页面边界，`TABLE_REGION_FULL_PAGE_REJECT_RATIO=0.95`）时同样判定为误判——真实数据表格不会做到这样，这种情况改用 `renderPageWithAndroidPdfRenderer`（pdfium）整页栅格化，**不用**下面这条 `PDFRenderer` 裁剪路径（PdfBox 自己的渲染器不认识 DeviceCMYK，会把 CMYK 缩略图的颜色全部读错），也不落回逐图 reflow（会丢光背景色块/装饰线条这些矢量图形，观感更差），见 NOTES #50。这是历史上反复误判的敏感区域（#17/#39/#42/#50/#52 五次不同触发场景），改动前务必读 `TableGridDetector` 类 KDoc 全文。
+
+## 图片在页面内的插入位置
+
+一页里的图片按各自的纵坐标（`PageImageResult.topY`，从图片的 CTM 换算出"距页顶多少 pt"）插回紧跟它自己那段文字后面（`ImagePlacement.afterParagraphIndexByTopY` + `PdfTextExtractor.interleaveTextAndImages`），不是简单地把一页所有图片统一堆在这一页最后一段文字之后——一页只有一张主图的文档看不出区别，一页塞了多张独立配图（杂志式排版，每个小节自己的文字+图片）就会把图文关系整个打散，见 NOTES #51。`extractContent`/`ImagePlacement.afterParagraphIndex`（按页归类，不看页内纵坐标）是更早期、目前只有测试在用的旧路径，不是 `Session.loadPage` 这条实际生效的阅读路径，两者不共享这条按纵坐标插入的逻辑。
+
+## 文字抽取的两个边界修复 + 两栏排版整页栅格化
+
+`isLineOnPage`：跟 `TableGridDetector` 那边的 `isSegmentOnPage` 同一个根因（InDesign 跨页拼版，`MediaBox` 只是显示窗口不是内容边界）——文字行也要过滤掉 X 坐标越界的（邻页内容混进来），不是只有矢量线段需要这层过滤，见 NOTES #53。`mergeSameLineRuns` 判断"是否同一行"除了看 Y 坐标相同，还要看 X 坐标离得够近（`LINE_MERGE_MAX_X_GAP_PT=20`）——两栏排版里左右栏标题经常同一 Y 高度，只看 Y 会把两栏内容错误粘连成一行，同样见 NOTES #53。
+
+两栏排版页**不追求重排出正确的阅读顺序**（用户明确拍板放弃这个目标，按高度分段检测的工作量/验证难度远超收益）——`hasColumnGap` 识别到就直接整页栅格化（复用下面 pdfium 那条路径），不逐段重排。已知局限：同一页"两栏/通栏混合"（比如页面顶部有一句跨两栏的介绍段落）会漏检，接受这个风险——漏检的代价只是维持当前已经修好的样子，不会更差，见 NOTES #54。
 
 ## CMYK/YCCK JPEG、JBIG2：自己手写的解码器
 

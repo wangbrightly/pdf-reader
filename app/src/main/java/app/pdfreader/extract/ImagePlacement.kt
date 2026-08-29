@@ -75,4 +75,48 @@ object ImagePlacement {
         }
         return result
     }
+
+    /**
+     * 2026-08-28 真机反馈修复（"图片和文字分开了"）：[afterParagraphIndexForRegion]
+     * 的单页简化版——调用方（`PdfTextExtractor.Session.loadPage`）已经保证段落和
+     * 图片在同一页，不需要再比较页码，只按纵坐标（[paragraphTopYs]/[imageTopY]，
+     * 同一套"距页顶多少 pt"坐标系，数值越小越靠页面顶部）算插入点。
+     *
+     * ## 为什么现在要做这件事——一个此前被上层"按页归类"策略掩盖的缺口
+     *
+     * 本类顶部 KDoc"为什么是按页归类而不是页面内精确纵坐标"一节，权衡下来选了
+     * "按页归类"（图片统一插在这一页最后一个段落之后），理由是"这个产品目标下
+     * 精度收益不成比例"。这条权衡对**每页只有一张主图**的文档成立——图片插在
+     * 最后一段之后，跟插在它原本该在的位置，读者体感差异很小。但真机反馈一份
+     * 产品手册（每页两栏×3 个独立小节，每个小节自己的标题+说明文字+1~3 张图，
+     * 一页最多 6 张图）暴露了这个权衡的边界：6 张图被整体挪到页面最后，跟它们
+     * 各自的说明文字完全脱节，"不追求精确嵌入"和"完全对不上"是两回事，后者已经
+     * 影响到内容可读性，不是可以接受的降级。
+     *
+     * 这次的修复**没有推翻**类 KDoc 那条原有权衡的核心结论（仍然不做"页面内
+     * 精确坐标+跨页统一坐标系"那套重量级实现，[PdfTextExtractor.Session.loadPage]
+     * 走的是"单页范围内、已经有现成 CTM 数据"这条更轻量的路——单页本身不存在
+     * "y 坐标跨页归零"这个问题，不需要类 KDoc 提到的"统一坐标系"改造），只是把
+     * 粒度从"按页"细化到"按页内纵坐标"，用的还是这个类一贯的"纯逻辑、不追求
+     * 精确嵌入原位置，只求大致摆在正确的段落附近"这个产品目标。
+     *
+     * @param paragraphTopYs 同一页内每个文字段落的 [topY]（跟 [imageTopY] 同一套
+     *   坐标系），按段落顺序排列——文字抽取本身是从页顶到页底的阅读顺序产出的，
+     *   这个列表天然是非递减的，函数据此做简单的线性扫描（不排序、不做更复杂的
+     *   搜索），跟 [afterParagraphIndex]/[afterParagraphIndexForRegion] 同样的
+     *   实现风格。
+     * @param imageTopY 这张图片的 [topY]。
+     * @return 应该插入在哪个段落下标之后（0-based）；`-1` 表示插在所有段落之前。
+     */
+    fun afterParagraphIndexByTopY(paragraphTopYs: List<Float>, imageTopY: Float): Int {
+        var result = -1
+        for (index in paragraphTopYs.indices) {
+            if (paragraphTopYs[index] <= imageTopY) {
+                result = index
+            } else {
+                break
+            }
+        }
+        return result
+    }
 }

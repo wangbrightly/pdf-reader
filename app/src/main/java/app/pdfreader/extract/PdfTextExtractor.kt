@@ -297,11 +297,30 @@ object PdfTextExtractor {
      */
     private const val LIST_ITEM_MAX_WIDTH_RATIO = 0.5f
 
+    /** 见 [mergeSameLineRuns] KDoc"2026-08-28 真机反馈修复"一节——同一视觉行内正常字体切换间隙实测 1.86~3.72pt，两栏标题间距实测约 203pt，阈值取在两者之间偏正常间隙一侧。 */
+    private const val LINE_MERGE_MAX_X_GAP_PT = 20f
+
+    /** 见 [hasColumnGap] KDoc——真机两栏版式的栏间距实测约 33.47pt，同一页里巧合的小缺口（比如孤立的页码）实测约 13.6pt，阈值取在两者之间。 */
+    private const val MIN_COLUMN_GAP_PT = 20f
+
+    /** 见 [hasColumnGap] KDoc——缺口两侧都至少要有这么多行文字才算"两栏"，不是巧合的孤立元素（比如单独的页码）造成的缺口；真机两栏页面两侧实测各有 17/18 行，远高于这个门槛。 */
+    private const val MIN_COLUMN_LINES_PER_SIDE = 5
+
     /** 见 [decodeRawImageByBitDepth] KDoc"尺寸安全阀"一节——超过这个像素数（宽×高）直接跳过，不手动解码。 */
     private const val MAX_MANUAL_DECODE_PIXELS = 30_000_000L
 
     /** 见 [PageContentStreamEngine.hasFullPageImage] KDoc——图片渲染宽/高都达到页面宽/高的这个比例才算"占满全页"。 */
     private const val FULL_PAGE_IMAGE_COVERAGE_RATIO = 0.7f
+
+    /**
+     * 见 [Session.loadPageLockedPhaseA] 里 `tableRegion` 那段 KDoc（2026-08-27
+     * 真机反馈"第二页颜色不对"）——[TableGridDetector] 判定出的区域宽/高都达到
+     * 页面宽/高的这个比例时，判定为"其实是误判，不是真表格"。真实数据表格
+     * 极少四条边都跟页面边界零边距贴死，故意留比 [FULL_PAGE_IMAGE_COVERAGE_RATIO]
+     * 更高的门槛（0.95 而不是 0.7）——这里要拦的是"精确等于整个 MediaBox"这种
+     * 极端形状，不该误伤"表格确实很大、占了页面七八成"这种正常情况。
+     */
+    private const val TABLE_REGION_FULL_PAGE_REJECT_RATIO = 0.95f
 
     /**
      * 见 [PageContentStreamEngine.hasVisibleContent] KDoc——每条边采样这么多个点
@@ -576,14 +595,25 @@ object PdfTextExtractor {
     /** [extractCmykJpegOrNull] 的返回值——已经从 [PDImage] 里复制出来的原始 JPEG 字节+基本信息，不再持有任何 PDFBox 对象引用。 */
     private data class CmykJpegExtraction(val bytes: ByteArray, val width: Int, val height: Int, val tooLarge: Boolean)
 
-    /** 见 [PageContentStreamEngine.imageResults] KDoc。 */
+    /**
+     * 见 [PageContentStreamEngine.imageResults] KDoc。[topY] 是这张图在页面坐标系里
+     * 距页顶多少 pt（跟 [Paragraph.topY] 同一套坐标系），2026-08-28 真机反馈修复
+     * （"图片和文字分开了"）新增——见 [PdfTextExtractor.interleaveTextAndImages] KDoc
+     * 完整背景。
+     */
     private sealed class PageImageResult {
-        data class Ready(val bitmap: Bitmap) : PageImageResult()
-        data class Pending(val job: PendingCmykJob) : PageImageResult()
+        abstract val topY: Float
+        data class Ready(val bitmap: Bitmap, override val topY: Float) : PageImageResult()
+        data class Pending(val job: PendingCmykJob) : PageImageResult() {
+            override val topY: Float get() = job.topY
+        }
     }
 
-    /** [PageImageResult.Pending] 携带的"锁外面解码需要的全部原料"——[CmykJpegExtraction] 之外，还要有 CTM/页面旋转才能在解码成功后正确摆朝向。 */
-    private data class PendingCmykJob(val extraction: CmykJpegExtraction, val ctm: PdfMatrix, val pageRotation: Int)
+    /**
+     * [PageImageResult.Pending] 携带的"锁外面解码需要的全部原料"——[CmykJpegExtraction]
+     * 之外，还要有 CTM/页面旋转才能在解码成功后正确摆朝向，[topY] 见 [PageImageResult] KDoc。
+     */
+    private data class PendingCmykJob(val extraction: CmykJpegExtraction, val ctm: PdfMatrix, val pageRotation: Int, val topY: Float)
 
     /**
      * "解不出来的图片"用一块诚实的占位图代替，不静默消失——真机反馈"有的图片干脆
@@ -923,7 +953,10 @@ object PdfTextExtractor {
             val stripper = LineCollectingStripper()
             stripper.getText(document)
             val t3 = System.currentTimeMillis()
-            val nonTableLines = stripper.lines.filterNot { line ->
+            // 见 isLineOnPage KDoc——跨页拼版文档会把邻页的文字也读进来，这里先过滤
+            // 掉再进入表格区域/段落切分逻辑，不让越界的假内容参与后续任何判断。
+            val onPageLines = stripper.lines.filter { isLineOnPage(it) }
+            val nonTableLines = onPageLines.filterNot { line ->
                 val region = renderedTableRegions[line.page]
                 region != null && isWithinTableBand(line.y, region, tableRegionPageHeights.getValue(line.page))
             }
@@ -1194,6 +1227,79 @@ object PdfTextExtractor {
     }
 
     /**
+     * 判断一行文字是不是落在它自己所在页面的可见范围内——跟 [isSegmentOnPage]
+     * 对矢量线段做的事一样，这次针对文字行。2026-08-28 真机反馈修复：InDesign
+     * 导出的跨页拼版文档（"两页当一整块画布画"是常见工作流），一页的 content
+     * stream 里会包含相邻页面的绘图指令（超出这一页自己 `MediaBox` 的部分——
+     * `MediaBox` 只是显示窗口，不是内容边界，跟 [isSegmentOnPage] KDoc 里那次
+     * 网页转 PDF 的矢量线段越界是同一类根因，但当时只顺手修了矢量线段这一种
+     * 内容，文字行完全没做这层过滤）。真机验证过：读一份文档"RF 电路"那一页的
+     * 文字，会连同前一页"天线设计"的全部 79 行文字一起读出来——内容完全相同，
+     * 只是 X 坐标整体偏移了一个页面宽度（X 是负数，肉眼看不见，但确实混进了
+     * 段落列表），是这次真机反馈"图片和文字分开了"背后一个更基础、此前完全
+     * 没被发现的正确性问题。
+     *
+     * 只检查 X（不检查 [Line.y]）——真机数据里越界的都是 X（相邻页面共享一块
+     * 横向铺开的画布），[Line.y] 已经是这一页自己坐标系里"距页顶多少 pt"，
+     * 不存在同样的跨页污染。[Line.pageWidth] 为 0（旧测试直接手写构造 [Line]、
+     * 没传这个字段）时不过滤，保持这些既有测试的行为不变。
+     */
+    internal fun isLineOnPage(line: Line): Boolean {
+        if (line.pageWidth <= 0f) return true
+        val minX = -PAGE_BOUNDS_TOLERANCE_PT
+        val maxX = line.pageWidth + PAGE_BOUNDS_TOLERANCE_PT
+        return line.startX in minX..maxX && line.endX in minX..maxX
+    }
+
+    /**
+     * 2026-08-28 真机反馈（"图片和文字分开了"）——用户明确拍板不追求"按正确顺序
+     * 重排两栏文字"这个更复杂的目标，改成"识别出这种页面、整页栅格化，不重排"。
+     * 这个函数只回答"这一页看起来像不像两栏排版"，命中时交给
+     * [renderPageWithAndroidPdfRenderer] 整页栅格化——不涉及任何"猜阅读顺序"的
+     * 判断，风险模型因此低得多：漏检的代价只是"这一页维持当前已经修好的样子"
+     * （不会比现在更差，[isLineOnPage]/[mergeSameLineRuns] 两个更基础的修复已经
+     * 生效），误判的代价只是"这一页少了调字号能力"（pdfium 渲染的内容本身完全
+     * 准确，不会显示错误）——两种代价都能接受，不需要做到完美检测。
+     *
+     * ## 方法：忽略 Y 坐标，把所有文字行的 X 区间合并起来找缺口
+     *
+     * 跟 [TableGridDetector.hasCoverageGap] 同一个技术（今天在那边刚验证过），
+     * 这次用在文字行的左右边界上：把这一页所有文字行按 X 排序，依次合并成
+     * 连续区间，只要中间出现一次超过 [MIN_COLUMN_GAP_PT] 的缺口，且缺口两边
+     * 各自至少有 [MIN_COLUMN_LINES_PER_SIDE] 行文字，就判定为两栏。
+     *
+     * **已知局限（真机数据验证过、如实记录，不是没想到）**：这个方法要求"全页
+     * 没有任何一行文字跨过这条缝"——真机反馈的原始文档里另一页"天线设计"同样
+     * 是两栏排版，但页面顶部有一句跨越 78% 内容宽度的介绍段落"骑"在两栏分界线
+     * 上（这句话本身就该跨两栏显示，是版式设计的一部分），这一句就足够让"全页
+     * 无缺口"，这个函数因此会漏判那一页。要正确处理"页面上半是两栏、这句介绍
+     * 又跨在分界线上"这种更复杂的混合版式，需要按高度分段检测（把页面切成
+     * 好几个横条分别判断），工作量和验证难度都高出一截——用户明确选择接受这个
+     * 漏检风险，不追加那层复杂度，见开头"风险模型"一节，漏检不会让页面变得
+     * 比现在更差。
+     *
+     * @param lines 已经过 [isLineOnPage] 边界过滤、这一页的文字行（合并前后都可以，
+     *   合并前的碎片一样能正确参与 X 区间合并计算，不要求调用方先调 [mergeSameLineRuns]）。
+     */
+    internal fun hasColumnGap(lines: List<Line>): Boolean {
+        val withPosition = lines.filter { it.pageWidth > 0f }
+        if (withPosition.size < MIN_COLUMN_LINES_PER_SIDE * 2) return false
+        val sorted = withPosition.sortedBy { it.startX }
+        var mergedEnd = sorted[0].endX
+        var leftCount = 1
+        for (i in 1 until sorted.size) {
+            val line = sorted[i]
+            if (line.startX - mergedEnd > MIN_COLUMN_GAP_PT) {
+                val rightCount = sorted.size - i
+                return leftCount >= MIN_COLUMN_LINES_PER_SIDE && rightCount >= MIN_COLUMN_LINES_PER_SIDE
+            }
+            mergedEnd = maxOf(mergedEnd, line.endX)
+            leftCount++
+        }
+        return false
+    }
+
+    /**
      * 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。
      * [topY] 是这个段落第一行的 [Line.y]（距页面顶部多少 pt），供目录页内精确定位用。
      */
@@ -1232,6 +1338,23 @@ object PdfTextExtractor {
      *
      * 合并用跟 [appendLine] 一样的"CJK 边界不加空格、其余情况加空格"规则——语义上
      * 这些片段本来就该拼成一段连续的视觉行文字，用同一套拼接规则合情合理。
+     *
+     * **2026-08-28 真机反馈修复（排查"图片和文字分开了"时顺带发现的另一个问题）**：
+     * 原来的"同一行"判断只看 y 坐标相同，完全不看 x 坐标离多远——两栏排版里，
+     * 左栏和右栏各自的标题经常恰好落在同一个 y 高度（同一"行"，只是左右两栏），
+     * 真机数据实测："1/2 分频器"（左栏，[Line.endX]=98.82）和"CMOS PLL 合成器"
+     * （右栏，[Line.startX]=301.86）y 坐标完全相等（142.48…），原来的逻辑会把
+     * 它们直接拼成一条"1/2 分频器CMOS PLL 合成器"——不是顺序乱，是两栏内容的
+     * 文字本身被错误粘连在一起。
+     *
+     * 补一条 x 坐标距离检查：只有下一个片段的 [Line.startX] 离当前已合并片段的
+     * [Line.endX] 不超过 [LINE_MERGE_MAX_X_GAP_PT] 才继续合并，超过就当作两条
+     * 独立的行。阈值取值依据同一份真机数据里两种情况的真实差距：同一视觉行内
+     * 因字体切换产生的正常片段间隙（中英文混排、数字用不同字体）实测在 1.86~
+     * 3.72pt 这个窄区间（比如"对"|"1.5GHz 带高速锁定"、"包括"|"VCO、分频器…"
+     * 这些真实的段内字体切换点），而两栏标题之间的间距实测约 203pt——两者差了
+     * 近 60 倍，中间留了极宽的安全区间，阈值选在两者之间靠近正常间隙一侧
+     * （不是贴着任何一个样本的边界值凑出来的）。
      */
     internal fun mergeSameLineRuns(lines: List<Line>): List<Line> {
         if (lines.size <= 1) return lines
@@ -1245,7 +1368,8 @@ object PdfTextExtractor {
         var currentEndX = lines[0].endX
         var currentPageWidth = lines[0].pageWidth
         for (i in 1 until lines.size) {
-            val sameLine = lines[i].page == currentPage && abs(lines[i].y - currentY) < 0.01f
+            val sameLine = lines[i].page == currentPage && abs(lines[i].y - currentY) < 0.01f &&
+                lines[i].startX - currentEndX <= LINE_MERGE_MAX_X_GAP_PT
             if (sameLine) {
                 appendLine(currentText, lines[i].text)
                 currentFontSize = maxOf(currentFontSize, lines[i].fontSize)
@@ -1634,7 +1758,7 @@ object PdfTextExtractor {
      * 只白付出计算代价（PDFBox 官方文档标注这个开关有性能代价，NOTES #16 也
      * 记过"没有排除法拿到直接对比数据，不确定具体多少成本"这个待办）。
      */
-    private class LineCollectingStripper(needsPosition: Boolean = true) : PDFTextStripper() {
+    internal class LineCollectingStripper(needsPosition: Boolean = true) : PDFTextStripper() {
         val lines = mutableListOf<Line>()
 
         init {
@@ -1756,9 +1880,36 @@ object PdfTextExtractor {
         var hasImages = false
             private set
 
-        /** 目前只有 JBIG2/手动位深解码/原生解码这几条"没证据显示是瓶颈"的路径在用，直接进 [PageImageResult.Ready]。 */
+        /**
+         * 目前只有 JBIG2/手动位深解码/原生解码这几条"没证据显示是瓶颈"的路径在用，
+         * 直接进 [PageImageResult.Ready]。这里读的是**调用这个函数那一刻**的
+         * `graphicsState.currentTransformationMatrix`——[addImage] 的所有调用点都在
+         * [drawImage] 的同步执行过程中（没有任何延迟/异步调用），当前 CTM 就是这张
+         * 图片自己的 CTM，不需要像 `deferCmykDecode=true` 那条路径一样额外
+         * `.clone()` 保存下来，见 [imageTopY] KDoc。
+         */
         private fun addImage(bitmap: Bitmap) {
-            imageResults.add(PageImageResult.Ready(bitmap))
+            imageResults.add(PageImageResult.Ready(bitmap, imageTopY(graphicsState.currentTransformationMatrix)))
+        }
+
+        /**
+         * 2026-08-28 真机反馈修复（"图片和文字分开了"）：算出一张图片在页面坐标系里
+         * 距页顶多少 pt——跟 [Paragraph.topY]/[TableRegion] 换算成 `pageHeight - maxY`
+         * 那套坐标系统一（本类其它地方反复用到的同一个"pt 距页顶多少"约定）。
+         *
+         * PDF 图片天然画在 `[0,1]x[0,1]` 单位正方形内，CTM 的平移分量
+         * （`e`=[PdfMatrix.getTranslateX]、`f`=[PdfMatrix.getTranslateY]）就是这个
+         * 正方形被变换后左下角落在页面坐标系（原点左下、y 轴向上）里的位置，缩放
+         * 分量（`d`=[PdfMatrix.getScaleY]）决定它往上还是往下延伸——`d>0` 时图片
+         * 从 `f` 向上画到 `f+d`（最高点是 `f+d`），`d<0`（图片被翻转）时从 `f` 向下
+         * 画到 `f+d`（最高点反而是 `f` 本身）：两种情况统一写成 `f + max(0, d)`。
+         * 用页高减掉这个"PDF 坐标系下的最高点"，换算成"距页顶多少 pt"，跟
+         * [tableCropRect]/[isWithinTableBand] 换算表格区域时用的是同一个公式
+         * （`pageHeightPt - pdfY`），不是这里重新发明的。
+         */
+        private fun imageTopY(ctm: PdfMatrix): Float {
+            val pdfTopY = ctm.translateY + maxOf(0f, ctm.scaleY)
+            return pageHeight - pdfTopY
         }
 
         private val pendingSegments = mutableListOf<LineSegment>()
@@ -2130,7 +2281,7 @@ object PdfTextExtractor {
                 val extraction = extractCmykJpegOrNull(pdImage)
                 if (extraction != null) {
                     val ctm = graphicsState.currentTransformationMatrix.clone()
-                    imageResults.add(PageImageResult.Pending(PendingCmykJob(extraction, ctm, pageRotation)))
+                    imageResults.add(PageImageResult.Pending(PendingCmykJob(extraction, ctm, pageRotation, imageTopY(ctm))))
                     // 见 [fullPageImageDecoded] KDoc——这里是乐观假设：CMYK/YCCK 解码
                     // 绝大多数情况会成功（范围外数据才会被拒绝，真机数据里是少数），
                     // 锁外真正解码失败的极端情况这次不做更精细的事后撤销处理，維持
@@ -2443,7 +2594,9 @@ object PdfTextExtractor {
                             stripper.getText(document)
                         }
                     }
-                    RunningFooterFilter.learnTitleLikeNoiseTexts(stripper.lines.map { PageTextLine(it.text, it.page) })
+                    RunningFooterFilter.learnTitleLikeNoiseTexts(
+                        stripper.lines.filter { isLineOnPage(it) }.map { PageTextLine(it.text, it.page) },
+                    )
                 }.getOrDefault(emptySet())
             }
         }
@@ -2534,12 +2687,60 @@ object PdfTextExtractor {
                             }
                         }
                         onImageReady?.invoke(bitmap)
-                        bitmap
+                        bitmap to result.topY
                     }
-                    val stitched = ImageStripStitcher.stitchIfTiled(images)
-                    PageContent(phaseA.textBlocks + stitched.map { DisplayBlock.Image(it) })
+                    // 见 ImageStripStitcher.stitchIfTiled KDoc——要么原样返回（元素数量
+                    // 不变），要么把全部元素拼成一张（元素数量变成 1），没有"部分拼接"
+                    // 的中间状态。元素数量不变时 topY 逐个对应关系不变；拼成一张时用
+                    // 参与拼接的这批图片里最靠上的 topY（min，见 [imageTopY] KDoc——
+                    // 数值越小越靠页面顶部）代表这整张拼接图的位置，这批切片本来就是
+                    // 同一处内容切出来的，取其中任意一张的位置误差都可以忽略。
+                    val bitmaps = images.map { it.first }
+                    val stitched = ImageStripStitcher.stitchIfTiled(bitmaps)
+                    val stitchedWithTopY = if (stitched.size == images.size) {
+                        images
+                    } else {
+                        listOf(stitched.single() to images.minOf { it.second })
+                    }
+                    PageContent(interleaveTextAndImages(phaseA.textBlocks, phaseA.textBlockTopYs, stitchedWithTopY))
                 }
             }
+        }
+
+        /**
+         * 见 [ImagePlacement.afterParagraphIndexByTopY] KDoc 完整背景（2026-08-28
+         * 真机反馈修复"图片和文字分开了"）——按每张图片的实际纵坐标把它插回最
+         * 接近的段落位置，不再是"这一页所有图片统一堆在最后一段之后"。
+         *
+         * [textBlocks] 全部是 [DisplayBlock.Text]（[loadPageLockedPhaseA] 构造
+         * 时的既有约定——图片在 Phase A 阶段还没解码/摆放，[PendingImages] 的
+         * `textBlocks` 只装文字），跟 [textBlockTopYs] 按下标一一对应，两者长度
+         * 相同（`scanFullPageImageDecoded=true` 时都是空列表——文字被隐藏，这
+         * 时候不管图片按什么顺序传进来，[ImagePlacement.afterParagraphIndexByTopY]
+         * 在空列表上必然对每张图都返回 `-1`，等价于"全部图片按原始顺序排在一起"，
+         * 不需要为这个分支专门写特殊处理）。
+         *
+         * 多张图片落在同一个插入点（[Map.groupBy] 相同的 key）时保持它们在
+         * [images] 里原有的相对顺序——`groupBy` 对同一个 key 的元素按遍历到的
+         * 先后顺序收集，[images] 本身的顺序来自 `imageResults`（[drawImage] 遇到
+         * `Do` 操作符的顺序），同一小节内的图片通常也是按内容流顺序画的，这个
+         * 顺序假设跟 [ImageStripStitcher] 类 KDoc"拼接顺序"一节是同一个假设。
+         */
+        private fun interleaveTextAndImages(
+            textBlocks: List<DisplayBlock>,
+            textBlockTopYs: List<Float>,
+            images: List<Pair<Bitmap, Float>>,
+        ): List<DisplayBlock> {
+            val imagesByAfterIndex = images.groupBy { (_, topY) ->
+                ImagePlacement.afterParagraphIndexByTopY(textBlockTopYs, topY)
+            }
+            val blocks = mutableListOf<DisplayBlock>()
+            imagesByAfterIndex[-1]?.forEach { (bitmap, _) -> blocks.add(DisplayBlock.Image(bitmap)) }
+            textBlocks.forEachIndexed { index, textBlock ->
+                blocks.add(textBlock)
+                imagesByAfterIndex[index]?.forEach { (bitmap, _) -> blocks.add(DisplayBlock.Image(bitmap)) }
+            }
+            return blocks
         }
 
         /** 见 [loadPage] KDoc"两阶段"一节。 */
@@ -2547,8 +2748,19 @@ object PdfTextExtractor {
             /** 表格分支（裁剪图靠 [PDFRenderer]，不经过 [JpegDecoder]）已经在锁内处理完，没有锁外工作要做。 */
             data class Complete(val content: PageContent) : PageLoadPhaseA()
 
-            /** 非表格分支：[textBlocks] 已经是最终结果，[imageResults] 里的 [PageImageResult.Pending] 要在锁外解码。 */
-            data class PendingImages(val textBlocks: List<DisplayBlock>, val imageResults: List<PageImageResult>) : PageLoadPhaseA()
+            /**
+             * 非表格分支：[textBlocks] 已经是最终结果（`DisplayBlock.Text` 逐段落，
+             * 顺序跟 [textBlockTopYs] 一一对应——`scanFullPageImageDecoded=true` 时
+             * 文字被隐藏，两个列表都是空的），[imageResults] 里的 [PageImageResult.Pending]
+             * 要在锁外解码。[textBlockTopYs] 供锁外 [interleaveTextAndImages] 按图片
+             * 实际纵坐标插回正确的段落位置用，见 2026-08-28 真机反馈修复（"图片和
+             * 文字分开了"）。
+             */
+            data class PendingImages(
+                val textBlocks: List<DisplayBlock>,
+                val textBlockTopYs: List<Float>,
+                val imageResults: List<PageImageResult>,
+            ) : PageLoadPhaseA()
         }
 
         /**
@@ -2610,6 +2822,19 @@ object PdfTextExtractor {
             stripper.endPage = pageNo
             runCatching { stripper.getText(document) }
             val tAfterStripper = System.currentTimeMillis()
+            // 见 isLineOnPage KDoc——跨页拼版文档会把邻页的文字也读进来，这里先
+            // 过滤掉再进入表格区域/段落切分逻辑。
+            val onPageLines = stripper.lines.filter { isLineOnPage(it) }
+
+            // 见 hasColumnGap KDoc——两栏排版页不追求重排出正确阅读顺序，识别出来
+            // 直接整页栅格化（复用 renderPageWithAndroidPdfRenderer，跟表格/JPX
+            // 那几条整页兜底同一条路径），在这里提前返回，不进入下面任何一条
+            // 段落切分/表格检测/图片抽取分支。
+            if (hasColumnGap(onPageLines)) {
+                val blocks = mutableListOf<DisplayBlock>()
+                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                return PageLoadPhaseA.Complete(PageContent(blocks))
+            }
 
             // 跟表格检测合并成一次遍历，decodeImages 固定传 true、deferCmykDecode
             // 固定传 true——原来这里传 decodeImages=false（只扫结构不解码图片），
@@ -2660,7 +2885,46 @@ object PdfTextExtractor {
             // "整页图片"这个信号来源完全不同、更具体的判断，优先于"矢量线段凑巧像
             // 网格"这个更弱的启发式——两者本来就是互斥的页面类型，同一页不该两条
             // 规则都命中却选了错误的那条。
-            val tableRegion = if (scanHasFullPageImage) null else TableGridDetector.tableRegionOrNull(onPageSegments)
+            // 2026-08-27 真机反馈修复（"第二页颜色不对"）：上面这条 NOTES #39 的
+            // 修复只覆盖"整页刚好是一张图片"这一种误判；这本 Ansys 文档的第 2 页
+            // 是设计感很强的标题页（多个缩略图配细边框、装饰线条、色块背景），
+            // 12872 条矢量段里同样凑巧命中"≥3 横+≥3 竖、边界框重叠"，但这次
+            // TableGridDetector 判定出的 [TableRegion] 精确等于整个页面 MediaBox
+            // （minX=minY=0，maxX/maxY=页面宽高，真机日志验证过）——真实数据表格
+            // 不会做到四条边都跟页面边界零边距贴死，这种"占满全页"形状本身就是
+            // 新的信号：这不是一张可以按"表格裁一块图、旁边保留正文"处理的真表格，
+            // 是一整张设计稿（背景色块、装饰线条这些矢量图形，本类的抽取模型完全
+            // 没有实现——只认文字段落和内嵌图片两种内容，没有"平铺矢量填充"这个
+            // 概念），唯一能正确还原的方式是整页栅格化，跟旁边有没有真表格是两个
+            // 问题。
+            //
+            // 命中这条时**不能**沿用下面表格分支那条 PdfBox-Android 自己的
+            // `PDFRenderer` 栅格化——那条渲染管线不认识 DeviceCMYK（真机日志
+            // "Unsupported color space kind: DeviceCMYK. Will try DeviceRGB
+            // instead"），会把 CMYK 四个分量的原始采样值直接当 RGB 读，页面里的
+            // CMYK JPEG 缩略图因此花成了黑底蓝字。也**不能**直接放弃表格分支、
+            // 落回下面"逐张小图 + 文字段落"的正常 reflow 分支——真机验证过这条
+            // 路径拿到的是 10 张互不相关的缩略图纵向罗列，背景色块/装饰线条/绝对
+            // 定位关系全部丢失（reflow 模型从设计上就没有"矢量填充"这个内容
+            // 类型），观感是一整块灰色色块，比错误的颜色更没用。正确的处理是复用
+            // NOTES #48/#49 已经验证过的 [renderPageWithAndroidPdfRenderer]（Android
+            // 系统自带 pdfium，同样不受 DeviceCMYK 这个坑影响，见该函数调用点的
+            // KDoc）整页栅格化，直接返回，不进入下面表格分支/reflow 分支的任何
+            // 一条。没有改 [TableGridDetector] 本身的判定条件（NOTES #17），只是
+            // 在判定结果之上加一层"这真的是一张只占页面一部分的表格吗"的合理性
+            // 检查，检查不通过时改走整页栅格化。
+            val rawTableRegion = if (scanHasFullPageImage) null else TableGridDetector.tableRegionOrNull(onPageSegments)
+            val tableRegionCoversFullPage = rawTableRegion != null && run {
+                val pageWidth = page.mediaBox.width
+                (rawTableRegion.maxX - rawTableRegion.minX) / pageWidth >= TABLE_REGION_FULL_PAGE_REJECT_RATIO &&
+                    (rawTableRegion.maxY - rawTableRegion.minY) / pageHeight >= TABLE_REGION_FULL_PAGE_REJECT_RATIO
+            }
+            if (tableRegionCoversFullPage) {
+                val blocks = mutableListOf<DisplayBlock>()
+                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                return PageLoadPhaseA.Complete(PageContent(blocks))
+            }
+            val tableRegion = rawTableRegion
             val hasImages = scanResult.second
             val tAfterTableDetect = System.currentTimeMillis()
             if (tAfterTableDetect - tPageStart > 300) {
@@ -2682,15 +2946,15 @@ object PdfTextExtractor {
                     "PdfReaderDebug",
                     "loadPage(page=$pageNo) 慢页拆分 文字抽取=${tAfterStripper - tPageStart}ms " +
                         "矢量扫描=${tAfterScan - tAfterStripper}ms 表格检测=${tAfterTableDetect - tAfterScan}ms " +
-                        "矢量段数=${scanResult.first.size} 原始行数=${stripper.lines.size} " +
+                        "矢量段数=${scanResult.first.size} 原始行数=${onPageLines.size} " +
                         "内容流解压后字节数=${contentBytes.first} 读取内容流耗时=${contentBytes.second}ms " +
                         "占满全页图片=$scanHasFullPageImage",
                 )
             }
             val nonTableLines = if (tableRegion != null) {
-                stripper.lines.filterNot { isWithinTableBand(it.y, tableRegion, pageHeight) }
+                onPageLines.filterNot { isWithinTableBand(it.y, tableRegion, pageHeight) }
             } else {
-                stripper.lines
+                onPageLines
             }
             val rawParagraphs = linesToParagraphs(nonTableLines)
             val noiseIndices = RunningFooterFilter.pageNoiseIndices(
@@ -2770,18 +3034,26 @@ object PdfTextExtractor {
             // 成功）会把图解码失败、文字又被隐藏，变成整页空白——只有图片真的
             // 解码成功时才隐藏文字，解码失败时展示文字，好歹不是空白页。
             val textBlocks = mutableListOf<DisplayBlock>()
+            val textBlockTopYs = mutableListOf<Float>()
             if (!scanFullPageImageDecoded) {
                 filtered.forEachIndexed { index, paragraph ->
                     textBlocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
+                    textBlockTopYs.add(paragraph.topY)
                 }
             }
-            // 图片插在这一页最后一个段落之后——跟 extractContent/旧 Session 的
-            // "同页图片统一插在该页最后一个段落之后（按页归类）"是同一条约定，
-            // 单页范围内 ImagePlacement.afterParagraphIndex 天然只会算出"最后一个
-            // 段落之后"这一个结果，不需要真的调用它。真正解码/拼接图片是锁外面
-            // [loadPage] 的事，这里只把 [scanImageResults] 原样交出去。
+            // 2026-08-28 真机反馈修复（"图片和文字分开了"）：原来这里的做法是"同一页
+            // 图片统一插在这一页最后一个段落之后"（跟 extractContent/旧 Session 的
+            // 约定一致）——单张主图的书看不出问题，但一页塞了多个独立图文小节的
+            // 文档（真机反馈：一份产品手册，每页两栏×3 个小节，每个小节自己的标题+
+            // 说明文字+1~3 张图）会把这一页全部 6 张图整体挪到页面最后，跟它们各自
+            // 该配的说明文字完全脱节，读起来图文对不上。改成按每张图在原页面上的
+            // 实际纵坐标（[PageImageResult.topY]，跟 [Paragraph.topY] 同一套"距页顶
+            // 多少 pt"坐标系）插回最接近的段落位置——真正的插入计算挪到锁外
+            // [interleaveTextAndImages]（要等图片解码/拼接完，拼接后的图片数量可能
+            // 比拼接前少，topY 也要跟着重新归并，这一步必须在拼接之后做），这里只把
+            // [scanImageResults] 和 [textBlockTopYs] 原样交出去。
             return if (hasImages) {
-                PageLoadPhaseA.PendingImages(textBlocks, scanImageResults)
+                PageLoadPhaseA.PendingImages(textBlocks, textBlockTopYs, scanImageResults)
             } else {
                 PageLoadPhaseA.Complete(PageContent(textBlocks))
             }
