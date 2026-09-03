@@ -46,15 +46,23 @@
 
 `linesToParagraphs` 里"紧凑列表识别"用的 `isShortLine`（NOTES #59）量的是"这一行自己有多宽"（`(endX-startX)/pageWidth`），**不是**"右边界离页面右侧多远"（`endX/pageWidth`，第一版这么写过，多列网格右侧的短标签哪怕文字本身很短也测不出来，会跟旁边的短标签粘连成一大段乱码，见 NOTES #59）。改这个函数或者它的阈值 `LIST_ITEM_MAX_WIDTH_RATIO` 之前，先想清楚是要测"内容本身多宽"还是"位置在页面哪"——这两个概念在单栏排版里恰好等价，在多列排版里完全不是一回事。
 
-`PageContentStreamEngine.hasReusedImage`（NOTES #60）覆盖的是前面三条规则都测不出来的另一类场景——**同一张图片对象在页内被复用**（设计稿式拼贴：一张装饰色块摆在好几个不同位置/角度当"连接箭头"用），不是文字堆叠也不是矢量网格线。用 `pdImage as? PDImageXObject` 取 `cosObject`（`COSStream`）存进 `IdentityHashMap` backed 的 `Set`，第二次见到**同一个实例**（不是内容/尺寸相同的两个不同对象——同一个资源名被 `/Do` 调用多次时 PdfBox-Android 确实返回同一个实例，`decodeJpegSoftMaskCompositeOrNull` 那段注释验证过）就命中，同样整页栅格化。图片数量本身**不是**可靠信号——本文档另几个多图页（含 #51/#52 修过的"RF 电路"6 图小节页）都是每张图各不相同，只统计"数量多"会跟 #51 已经修好的"一页多个独立图文小节"场景冲突。
+同一条"紧凑列表识别"还有个边界情况（`isBulletMarker`，NOTES #65）：项目符号本身（`o`/`•` 这类单字符标记）物理宽度极窄，会被 `isShortLine` 也判成"短行"，跟它自己配对的正文一起满足"连续两行都短"，被切在符号和内容之间——`compactListBoundary` 判断加了"`lines[i-1]` 不是符号"这个条件（`isBulletMarker`，绝对宽度 `BULLET_MARKER_MAX_WIDTH_PT=15pt`，不用比例——符号物理尺寸不随页宽缩放）。符号只该跟"上一个列表项"之间产生边界，不该跟"自己的内容"之间产生边界。
+
+`PageContentStreamEngine.hasReusedImage`（NOTES #60）覆盖的是前面三条规则都测不出来的另一类场景——**同一张图片对象在页内被复用**（设计稿式拼贴：一张装饰色块摆在好几个不同位置/角度当"连接箭头"用），不是文字堆叠也不是矢量网格线。用 `pdImage as? PDImageXObject` 取 `cosObject`（`COSStream`）存进 `IdentityHashMap` backed 的 `Set`，第二次见到**同一个实例**（不是内容/尺寸相同的两个不同对象——同一个资源名被 `/Do` 调用多次时 PdfBox-Android 确实返回同一个实例，`decodeSoftMaskCompositeOrNull` 那段注释验证过）就命中，同样整页栅格化。图片数量本身**不是**可靠信号——本文档另几个多图页（含 #51/#52 修过的"RF 电路"6 图小节页）都是每张图各不相同，只统计"数量多"会跟 #51 已经修好的"一页多个独立图文小节"场景冲突。
+
+`hasLabelColumnWithSideContent`（NOTES #61）覆盖的是另一类三栏版式——分类标签+产品名徽章+短语列表，`hasColumnGap`/`hasScatteredLayout` 都测不出来（缝隙被跨栏说明文字焊死；短语各自落在不同 Y，测不出"并排"）。信号是"一整列短语精确对齐到同一个 `startX`"，但**必须加一道校验**：这一列的垂直范围内，页面上要确实存在至少 3 条别的文字、且 `startX` 比这一列小至少 40pt（`LEFT_CONTENT_MIN_GAP_PT`）——单独"同一 X 对齐"会把普通缩进列表也误判（左边是页面留白，几何上长得一样），这道校验是用户明确要求加的，权衡过"先上线看真机效果"更快但更冒险的路线。
+
+`PageContentStreamEngine.hasOverlappingImages`（NOTES #62）是 `hasReusedImage` 的姊妹信号——同一类"设计稿式拼贴"，手法从"复用同一个对象"换成"摆放多个不同对象让它们物理重叠"。用 CTM 算每张图片的包围盒，两两重叠面积占较小那张自身面积的比例达到 `MIN_IMAGE_OVERLAP_RATIO=0.15` 就命中（真机三组数据横跨 21%~66%，阈值取在最低值之下留安全边际；正常图片"边缘贴合不重叠"的重叠比趋近于 0）。**排查这类反馈时先用 CTM 精确核对重叠关系，不要凭页面图片数量或肉眼截图猜**——同一次调查曾经因为用户口头描述的页码/现象跟自己的诊断结论对不上而查错方向，见 NOTES #62 完整过程。
 
 ## CMYK/YCCK JPEG、JBIG2：自己手写的解码器
 
 PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。**"跟 Pillow 逐像素比对通过"不等于"结果本身是对的"**——Pillow 自己对 YCCK 反色的默认处理也会错，两份早期 fixture 的参考答案因此错了很久没被测出来，靠独立于 Pillow 的 poppler 整页渲染交叉验证才发现，见 NOTES #40。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式，见 NOTES #35。CMYK（transform=0）反色约定逐图对采样值投票判断（Adobe 标准是"存的值反色"，但真实文档存在例外），见 NOTES #29/#32；YCCK（transform=2）不投票，固定整体反色（C/M/Y/K 四个分量一起翻转），见 NOTES #40。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 600 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，见 NOTES #38）。
 
-## JPEG 编码的软蒙版（/SMask）：绕开 PdfBox 自己的合成，不是绕开解码
+## JPEG/JPX 编码的软蒙版（/SMask）：绕开 PdfBox 自己的合成，不是绕开解码
 
-蒙版格式是 JPEG（`softMask.suffix=="jpg"`，不管底图本身是什么格式）时，`pdImage.image` 内部的蒙版合成有 bug，产出纯黑图片——蒙版单独解码是正常的，蒙版是 PNG/JPX 格式时合成也完全正常，只有"JPEG 格式蒙版"这一种组合会坏，见 NOTES #57。修法是调用 `imageXObject.image` 前临时用 `COSDictionary.removeItem(COSName.SMASK)` 摘掉蒙版（解码完 `setItem` 放回去），让 PdfBox 自己一直可靠的底图解码逻辑在"没有蒙版参与合成"的情况下跑，蒙版单独用 `BitmapFactory` 解码灰度值当 alpha 通道手动合成——**不是**判断"底图和蒙版是不是都是 JPEG"（第一版这么判断过，装机复测完全没效果，根因是这份文档的底图 `suffix` 其实是 `"png"` 不是 `"jpg"`，判断条件从一开始就没生效，靠在真实调用路径上加**无条件**日志才纠正过来）。这是本类第二次"先分析第三方工具输出（这次是 `pdfimages -list`）反推判断条件，装机才发现推错了"的教训，改判断条件前先用真机日志把 `PDImage` 实际字段值实测一遍，不要靠外部工具的分组结果反推。
+蒙版格式是 JPEG 或 JPX（`softMask.suffix=="jpg"`/`"jpx"`，不管底图本身是什么格式）时，`pdImage.image` 内部的蒙版合成有 bug，产出纯黑图片——蒙版单独解码是正常的，只有这两种蒙版格式会坏，见 NOTES #57/#63。修法是调用 `imageXObject.image` 前临时用 `COSDictionary.removeItem(COSName.SMASK)` 摘掉蒙版（解码完 `setItem` 放回去），让 PdfBox 自己一直可靠的底图解码逻辑在"没有蒙版参与合成"的情况下跑，蒙版单独解码（JPEG 用 `BitmapFactory`，JPX 用 `Jpeg2000Decoder`）灰度值当 alpha 通道手动合成——**不是**判断"底图和蒙版是不是都是 JPEG"（第一版这么判断过，装机复测完全没效果，根因是这份文档的底图 `suffix` 其实是 `"png"` 不是 `"jpg"`，判断条件从一开始就没生效，靠在真实调用路径上加**无条件**日志才纠正过来）。这是本类第二次"先分析第三方工具输出（这次是 `pdfimages -list`）反推判断条件，装机才发现推错了"的教训，改判断条件前先用真机日志把 `PDImage` 实际字段值实测一遍，不要靠外部工具的分组结果反推。**#57 那次"蒙版是 PNG/JPX 时合成都正常"这条结论后来被 #63 推翻**——样本量不够就断言"其它组合没事"是会过期的，遇到同一类 bug 的新反馈别直接采信旧结论说"这个组合之前验证过没问题"。
+
+蒙版解码失败时函数返回**已经解码成功的不带蒙版底图**（完全不透明），不是 `null`——第一版失败时返回 `null`（回退到 `pdImage.image` 那条已知有 bug 的通用路径），Robolectric 诊断时意外发现"即使确认蒙版解码失败，最终展示的图片依然正常"，追下去是 `imageXObject.image` 内部有解码缓存，函数自己已经成功解码过一次底图，调用方兜底那行代码在**同一个 `PDImageXObject` 实例**上第二次调用命中了缓存——这份行为没有任何文档保证，不能依赖，见 NOTES #63"实测意外发现"一节。**JPX 蒙版真正解码成功、透明区域是否正确抠图没有真机专门验证过**，只确认过"不再是纯黑"——`Jpeg2000Decoder` 依赖真实 Android native 库，Robolectric 测不到这一层。
 
 ## JPX/JPEG2000：接的是第三方 native 库，不是手写解码器
 
@@ -65,6 +73,10 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 **图片"占满全页且解码成功"≠"值得为它隐藏文字/占屏幕空间"**：`PageContentStreamEngine.hasVisibleContent`（亮度标准差采样，阈值 12）判断这张图是不是接近纯色的背景层——不是的话正常展示；是的话不仅不隐藏文字，图片本身也整个跳过不展示（`addRealImage`），避免"图解码成功了但内容毫无价值"占用比真实文字大得多的屏幕空间，见 NOTES #49 完整的三轮真机回归过程。
 
 **PDF 蒙版（`/Mask` stencil masking）目前不合成，遇到就跳过**：`PageContentStreamEngine.drawImage` 检测到 JPX 图片带 `getMask()`/`getSoftMask()` 就直接跳过不展示——真正合成需要知道蒙版抠掉的区域下方画了什么，等同于整页栅格化，不是两张位图简单叠加。`hasSkippedFullPageImage` 记录这次跳过；当页面**同时**满足"真实文字字符数低于阈值"（`MIN_REAL_TEXT_CHARS_FOR_FALLBACK_SKIP = 10`，不能用 `filtered.isEmpty()`——真机数据证实封面页会有孤立噪音字符骗过"是否为空"判断）时，改用 `Session.renderPageWithAndroidPdfRenderer` 整页栅格化兜底（**不是** PdfBox 自己的 `PDFRenderer`——真机验证过后者对同一份数据一样渲染不全，根因是 PdfBox-Android 从未实现 JBIG2 解码，`PDFRenderer` 内部渲染管线一样受限；`android.graphics.pdf.PdfRenderer` 是系统自带的 pdfium 引擎，对 JBIG2+蒙版支持成熟，真机验证过完整正确）。
+
+## Wingdings/Webdings 图标字体：字母键位提取出来的"文字"没有语义，整段过滤
+
+`LineCollectingStripper.writeString`（`isDecorativeSymbolFont`，NOTES #64）：这两个字体是纯图标字体（键盘字母键位对应箭头/项目符号这类图标，不是字母本身，PDF 的 `ToUnicode` 映射表如实记录"这是键盘 l 键"但这串数据从设计上不是给人读的语义文字），textPositions 全部来自这两个字体名就整段跳过，不进 `lines`。**判断条件精确匹配"Wingdings"/"Webdings"这两个字体家族名字符串，不能扩大化**——同一份文档大量用 `Symbol` 字体排版真实希腊字母/数学符号（公式变量），按"字体名不常见就过滤"这种更简单的思路会把公式内容删光，是比"多几个孤立字符"严重得多的破坏。构造测试 fixture 时注意：`page.resources.getFont()` 拿标准 14 字体（比如 `PDType1Font.HELVETICA`）返回的是跨 JVM 进程共享的静态单例，直接在它的 `cosObject` 上 `setItem` 改名会让副作用泄漏到同一进程内其它测试，要先用 `COSDictionary(COSDictionary)` 拷贝一份独立字典再改名。
 
 ## `Session` 并发安全
 
@@ -84,6 +96,9 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 - 只有外框无内部分隔线的表格会漏检，继续按文字重排（行列打散）
 - 完全无边框线的表格（纯空白对齐）检测不到
 - `ReadingProgressStore` 无清理机制，条目随打开过的文件数线性增长（当前量级不算问题）
+- **PdfBox-Android 对某些 `/Indexed` 调色板 + FlateDecode 栅格数据的图片解码高度算错**（2026-09-03 排查 NOTES #62 时发现，未修复：`.colorSpace.numberOfComponents` 疑似把 Indexed 空间误报成 3 分量，导致按 RGB 而不是按索引单分量读取字节，行数因此被压缩到约 1/3、颜色也错）——真机这次撞到的具体页面被 `hasOverlappingImages` 整页栅格化兜底掉了，问题本身**没有修**，如果以后遇到"图片显示高度不对/颜色错乱但不是纯黑"且没有触发任何整页栅格化规则的页面，先查是不是这个坑，不要当成新 bug 从头排查
+- JPX 蒙版合成"不再是纯黑"已验证，但"透明区域真的正确抠图了"没有真机专门验证过，见"JPEG/JPX 编码的软蒙版"一节
+- 同一段说明文字引用的插图如果原书排版把插图印在下一页（图文本来就跨页），逐页独立处理的架构接不上，会出现"读到一堆提到图的文字、翻页后突然冒出一整块图片"——用户 2026-09-03 已知情况后拍板不投入开发，接受为局限
 - 扫描版 PDF（没有文字层）无法重排/调字号，需要 OCR，用户 2026-08-18 决定暂缓（见 NOTES #10）
 - 大文件（126MB+）`PDDocument.load` 本身耗时几秒到十几秒，试过换成临时文件缓冲但反而更慢，已回退，没找到有效优化手段（见 NOTES #23）
 
