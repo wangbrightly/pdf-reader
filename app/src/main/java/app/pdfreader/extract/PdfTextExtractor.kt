@@ -979,6 +979,88 @@ object PdfTextExtractor {
     }
 
     /**
+     * 2026-09-03 新增：调色板索引色（`/Indexed`）图片——[decodeRawImageByBitDepth]
+     * KDoc"范围限定"一节早就记录过这是已知缺口，这次真机反馈"图片显示高度不对/
+     * 颜色错乱"（排查 NOTES #62 图片重叠那次顺带撞见，不是这次真机反馈的主因，
+     * 但既然发现了就一并修掉）才真正动手实现。
+     *
+     * ## 根因：PdfBox-Android 把 `/Indexed` 颜色空间误识别成 DeviceRGB
+     *
+     * 真机诊断直接读原始 `COSDictionary`：`/ColorSpace` 字段是
+     * `[/Indexed, [/ICCBased, ...], 15, <48字节调色板流>]`——标准的"调色板索引色"
+     * 结构（16 色调色板，每种颜色 3 字节 RGB，索引值 0~15，`bitsPerComponent=8`
+     * 意味着每个像素存一个字节的索引值，不是三个字节的 RGB）。但
+     * `pdImage.colorSpace.name`/`colorSpace.numberOfComponents` 分别报出
+     * `"DeviceRGB"`/`3`——**PdfBox-Android 的颜色空间解析完全没有识别出这是
+     * Indexed，直接当 DeviceRGB 处理**，不是"分量数报错"这种局部问题（这一点
+     * 比最初怀疑的更严重）。后续 `pdImage.image`（或 [decodeRawImageByBitDepth]
+     * 那条走 `colorSpace.numberOfComponents` 反推的路径）会按"每像素 3 字节"读
+     * 只有"每像素 1 字节"的索引数据，60040 字节的索引数据被硬读出 60040/3≈20013
+     * 个"像素"，换算成 316 宽的图，高度只剩 316×190 应有高度的 1/3（63 而不是
+     * 190），颜色也全错（索引字节被直接拿去当 RGB 用）。
+     *
+     * ## 修法：不依赖 PDColorSpace，直接读 COS 结构拿调色板
+     *
+     * 绕开这条从根上就解析错误的 `PDColorSpace`，直接从 `PDImageXObject.cosObject`
+     * 取 `/ColorSpace` 数组自己解析——PDF 规范里 Indexed 颜色空间固定是
+     * `[/Indexed, 基色空间, hival, 调色板数据]` 这个四元组（基色空间的具体类型
+     * 不重要，只要调色板本身是按基色空间分量数打包的 RGB/CMYK/灰度值即可，这次
+     * 范围限定在调色板本身是 3 分量——真机数据这个组合，其它分量数遇到直接放弃，
+     * 不猜）。调色板数据可能是 `COSStream`（大调色板）或 `COSString`（小调色板，
+     * PDF 规范允许两种表示），两种都要处理。像素数据本身（`bitsPerComponent=8`
+     * 时）就是逐字节的索引值，`pdImage.createInputStream()` 拿到的已经是
+     * FlateDecode 解压后的原始字节，不需要额外处理。
+     *
+     * 范围限定：只处理 `bitsPerComponent==8`（真机数据确认过的形状，索引值 0~255
+     * 的调色板索引最常见，其它位深遇到直接放弃）、没有 `/SMask`（有软蒙版的索引色
+     * 图片目前没有真机样本，[decodeSoftMaskCompositeOrNull] 会在这条分支之后拦截
+     * 到但内部调用 `imageXObject.image` 解码底图，同样会撞上这个坑——这个组合
+     * 目前范围外，遇到照旧走已知会出问题的通用路径，不新增风险，只是没有更好）。
+     * 越界索引（脏数据）夹紧到调色板范围内，不抛异常也不显示越界颜色。
+     *
+     * 任何一步失败（不是 Indexed 颜色空间、调色板分量数不是 3、字节数对不上、
+     * 位深不是 8、有软蒙版）都返回 `null`，调用方回退到原有路径——对不在范围内
+     * 的图片，行为跟这次修复之前完全一样。
+     */
+    private fun decodeIndexedColorImageOrNull(pdImage: PDImage): Bitmap? = runCatching {
+        val imageXObject = pdImage as? com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject ?: return null
+        if (imageXObject.softMask != null) return null
+        if (pdImage.bitsPerComponent != 8) return null
+        val csArray = imageXObject.cosObject.getDictionaryObject(com.tom_roush.pdfbox.cos.COSName.COLORSPACE)
+            as? com.tom_roush.pdfbox.cos.COSArray ?: return null
+        if (csArray.size() < 4) return null
+        val tag = csArray.getObject(0) as? com.tom_roush.pdfbox.cos.COSName ?: return null
+        if (tag != com.tom_roush.pdfbox.cos.COSName.getPDFName("Indexed")) return null
+        val hival = (csArray.getObject(2) as? com.tom_roush.pdfbox.cos.COSNumber)?.intValue() ?: return null
+        if (hival !in 0..255) return null
+        val lookupBytes = when (val lookupBase = csArray.getObject(3)) {
+            is com.tom_roush.pdfbox.cos.COSStream -> lookupBase.createInputStream().use { it.readBytes() }
+            is com.tom_roush.pdfbox.cos.COSString -> lookupBase.bytes
+            else -> return null
+        }
+        val paletteComponents = 3
+        if (lookupBytes.size < (hival + 1) * paletteComponents) return null
+
+        val width = pdImage.width
+        val height = pdImage.height
+        if (width <= 0 || height <= 0) return null
+        if (width.toLong() * height.toLong() > MAX_MANUAL_DECODE_PIXELS) return null
+        val rawBytes = pdImage.createInputStream().use { it.readBytes() }
+        if (rawBytes.size < width * height) return null
+
+        val pixels = IntArray(width * height)
+        for (i in pixels.indices) {
+            val index = (rawBytes[i].toInt() and 0xFF).coerceAtMost(hival)
+            val base = index * paletteComponents
+            val r = lookupBytes[base].toInt() and 0xFF
+            val g = lookupBytes[base + 1].toInt() and 0xFF
+            val b = lookupBytes[base + 2].toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+    }.getOrNull()
+
+    /**
      * 从 [bytes] 里第 [rowStartByte] 字节开始，跳过 [bitOffset] 位，读出 [bitCount]
      * 位，按大端（高位在前）拼成一个整数——PDF 图像样本流的标准打包方式，见
      * [decodeRawImageByBitDepth] KDoc。越界（行数据不够）按 0 处理，不抛异常，
@@ -2836,6 +2918,17 @@ object PdfTextExtractor {
                             "实际字节数=$actualBytes",
                     )
                 }
+                return
+            }
+            // 见 decodeIndexedColorImageOrNull KDoc 完整背景：PdfBox-Android 把
+            // /Indexed 调色板颜色空间误识别成 DeviceRGB，导致按 3 分量/像素读取
+            // 只有 1 分量/像素的索引数据，图片被压扁、颜色也错——必须在下面
+            // CMYK/JPX/软蒙版/通用回退这几条路径之前拦截，那几条最终都会走到
+            // 同一段误判颜色空间的合成逻辑。
+            val indexedResult = runCatching { decodeIndexedColorImageOrNull(pdImage) }.getOrNull()
+            if (indexedResult != null) {
+                val ctm = graphicsState.currentTransformationMatrix
+                addRealImage(indexedResult, ctm, isFullPageCoverage)
                 return
             }
             // 见 decodeCmykJpegOrNull KDoc 完整背景：4 分量 CMYK/YCCK JPEG 在这台

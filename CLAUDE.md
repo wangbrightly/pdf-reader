@@ -54,6 +54,10 @@
 
 `PageContentStreamEngine.hasOverlappingImages`（NOTES #62）是 `hasReusedImage` 的姊妹信号——同一类"设计稿式拼贴"，手法从"复用同一个对象"换成"摆放多个不同对象让它们物理重叠"。用 CTM 算每张图片的包围盒，两两重叠面积占较小那张自身面积的比例达到 `MIN_IMAGE_OVERLAP_RATIO=0.15` 就命中（真机三组数据横跨 21%~66%，阈值取在最低值之下留安全边际；正常图片"边缘贴合不重叠"的重叠比趋近于 0）。**排查这类反馈时先用 CTM 精确核对重叠关系，不要凭页面图片数量或肉眼截图猜**——同一次调查曾经因为用户口头描述的页码/现象跟自己的诊断结论对不上而查错方向，见 NOTES #62 完整过程。
 
+## 调色板索引色（/Indexed）图片：PdfBox-Android 把颜色空间从根上就识别错了
+
+`decodeIndexedColorImageOrNull`（NOTES #66）——不是"分量数偶尔报错"这种局部问题：`pdImage.colorSpace.name`/`.numberOfComponents` 对真正的 Indexed 颜色空间图片直接报出 `"DeviceRGB"`/`3`，PdfBox-Android 的颜色空间解析从根上就没识别出 `/Indexed` 这个类型。后续任何依赖 `pdImage.colorSpace`/`pdImage.image` 的路径都会按"每像素 3 字节 RGB"读只有"每像素 1 字节索引值"的数据，图片被压扁到约 1/3 高度、颜色也全错（索引字节被直接当 RGB 分量用）。**不依赖 `PDColorSpace`**（这个版本的公开 API 里根本没有 `PDIndexed` 类，从根上就不可靠），直接从 `PDImageXObject.cosObject` 读 `/ColorSpace` 数组自己按 PDF 规范解析（`[/Indexed, 基色空间, hival, 调色板]` 四元组，调色板可能是 `COSStream` 或 `COSString`，两种都要处理）。范围限定：调色板本身 3 分量、`bitsPerComponent==8`、没有 `/SMask`（有软蒙版的索引色图片目前没有真机样本，遇到照旧走通用路径）。拦截点在 CMYK/JPX/软蒙版判断之前——这几条最终都会落到同一段误判颜色空间的合成逻辑。**这条修复不用等真机复测**：纯 Kotlin 手写像素循环，不经过 `BitmapFactory`，Robolectric 下的解码结果就是真实结果。
+
 ## CMYK/YCCK JPEG、JBIG2：自己手写的解码器
 
 PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。**"跟 Pillow 逐像素比对通过"不等于"结果本身是对的"**——Pillow 自己对 YCCK 反色的默认处理也会错，两份早期 fixture 的参考答案因此错了很久没被测出来，靠独立于 Pillow 的 poppler 整页渲染交叉验证才发现，见 NOTES #40。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式，见 NOTES #35。CMYK（transform=0）反色约定逐图对采样值投票判断（Adobe 标准是"存的值反色"，但真实文档存在例外），见 NOTES #29/#32；YCCK（transform=2）不投票，固定整体反色（C/M/Y/K 四个分量一起翻转），见 NOTES #40。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 600 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，见 NOTES #38）。
@@ -96,7 +100,6 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 - 只有外框无内部分隔线的表格会漏检，继续按文字重排（行列打散）
 - 完全无边框线的表格（纯空白对齐）检测不到
 - `ReadingProgressStore` 无清理机制，条目随打开过的文件数线性增长（当前量级不算问题）
-- **PdfBox-Android 对某些 `/Indexed` 调色板 + FlateDecode 栅格数据的图片解码高度算错**（2026-09-03 排查 NOTES #62 时发现，未修复：`.colorSpace.numberOfComponents` 疑似把 Indexed 空间误报成 3 分量，导致按 RGB 而不是按索引单分量读取字节，行数因此被压缩到约 1/3、颜色也错）——真机这次撞到的具体页面被 `hasOverlappingImages` 整页栅格化兜底掉了，问题本身**没有修**，如果以后遇到"图片显示高度不对/颜色错乱但不是纯黑"且没有触发任何整页栅格化规则的页面，先查是不是这个坑，不要当成新 bug 从头排查
 - JPX 蒙版合成"不再是纯黑"已验证，但"透明区域真的正确抠图了"没有真机专门验证过，见"JPEG/JPX 编码的软蒙版"一节
 - 同一段说明文字引用的插图如果原书排版把插图印在下一页（图文本来就跨页），逐页独立处理的架构接不上，会出现"读到一堆提到图的文字、翻页后突然冒出一整块图片"——用户 2026-09-03 已知情况后拍板不投入开发，接受为局限
 - 扫描版 PDF（没有文字层）无法重排/调字号，需要 OCR，用户 2026-08-18 决定暂缓（见 NOTES #10）
