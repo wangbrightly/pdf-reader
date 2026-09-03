@@ -46,6 +46,8 @@
 
 `linesToParagraphs` 里"紧凑列表识别"用的 `isShortLine`（NOTES #59）量的是"这一行自己有多宽"（`(endX-startX)/pageWidth`），**不是**"右边界离页面右侧多远"（`endX/pageWidth`，第一版这么写过，多列网格右侧的短标签哪怕文字本身很短也测不出来，会跟旁边的短标签粘连成一大段乱码，见 NOTES #59）。改这个函数或者它的阈值 `LIST_ITEM_MAX_WIDTH_RATIO` 之前，先想清楚是要测"内容本身多宽"还是"位置在页面哪"——这两个概念在单栏排版里恰好等价，在多列排版里完全不是一回事。
 
+`PageContentStreamEngine.hasReusedImage`（NOTES #60）覆盖的是前面三条规则都测不出来的另一类场景——**同一张图片对象在页内被复用**（设计稿式拼贴：一张装饰色块摆在好几个不同位置/角度当"连接箭头"用），不是文字堆叠也不是矢量网格线。用 `pdImage as? PDImageXObject` 取 `cosObject`（`COSStream`）存进 `IdentityHashMap` backed 的 `Set`，第二次见到**同一个实例**（不是内容/尺寸相同的两个不同对象——同一个资源名被 `/Do` 调用多次时 PdfBox-Android 确实返回同一个实例，`decodeJpegSoftMaskCompositeOrNull` 那段注释验证过）就命中，同样整页栅格化。图片数量本身**不是**可靠信号——本文档另几个多图页（含 #51/#52 修过的"RF 电路"6 图小节页）都是每张图各不相同，只统计"数量多"会跟 #51 已经修好的"一页多个独立图文小节"场景冲突。
+
 ## CMYK/YCCK JPEG、JBIG2：自己手写的解码器
 
 PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CMYK/YCCK JPEG（纯黑或花屏），JBIG2 完全没实现——两个都自己从头写了解码器（`JpegDecoder.kt`/`Jbig2GenericRegionDecoder.kt`/`Jbig2SymbolTextDecoder.kt`），正确性靠 Pillow（libjpeg-turbo）/`jbig2-imageio` 逐像素交叉验证，范围严格限定在真机确认过的数据形状，范围外一律返回 `null` 退回占位图（不猜、不冒险给出可能错误的内容）。**"跟 Pillow 逐像素比对通过"不等于"结果本身是对的"**——Pillow 自己对 YCCK 反色的默认处理也会错，两份早期 fixture 的参考答案因此错了很久没被测出来，靠独立于 Pillow 的 poppler 整页渲染交叉验证才发现，见 NOTES #40。CMYK→RGB 用的是乘法公式 `(255-C)×(255-K)/255`，不是教科书常见的加法公式，见 NOTES #35。CMYK（transform=0）反色约定逐图对采样值投票判断（Adobe 标准是"存的值反色"，但真实文档存在例外），见 NOTES #29/#32；YCCK（transform=2）不投票，固定整体反色（C/M/Y/K 四个分量一起翻转），见 NOTES #40。已知局限：JBIG2 Huffman 编码符号词典未实现；CMYK/YCCK JPEG 不支持渐进式、超过 600 万像素（`JpegDecoder.MAX_CMYK_JPEG_PIXELS`，见 NOTES #38）。

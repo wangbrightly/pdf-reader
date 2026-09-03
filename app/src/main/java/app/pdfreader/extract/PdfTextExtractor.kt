@@ -298,6 +298,17 @@ object PdfTextExtractor {
      */
     private const val LIST_ITEM_MAX_WIDTH_RATIO = 0.5f
 
+    /**
+     * 见 [linesToParagraphs] KDoc"紧凑列表识别的一个真实边界情况：项目符号本身
+     * 也会被误判成独立列表项"一节——真机数据（HFSS.pdf）"o"项目符号本身宽度
+     * 只有 4.5pt（几乎就是单个字符的宽度），跟真正的短列表项（同一份数据里
+     * "basis"这个单词宽度 25.6pt，是列表项内容本身，不是符号）差了 5 倍以上，
+     * 阈值取在两者之间、明显偏向"符号"这一侧，两边都留了充足余量。用绝对
+     * pt 值而不是比例——项目符号的物理宽度基本是固定的（就是一个字形的宽度），
+     * 不随页面宽度缩放，用比例反而会引入不必要的页宽依赖。
+     */
+    private const val BULLET_MARKER_MAX_WIDTH_PT = 15f
+
     /** 见 [mergeSameLineRuns] KDoc"2026-08-28 真机反馈修复"一节——同一视觉行内正常字体切换间隙实测 1.86~3.72pt，两栏标题间距实测约 203pt，阈值取在两者之间偏正常间隙一侧。 */
     private const val LINE_MERGE_MAX_X_GAP_PT = 20f
 
@@ -315,6 +326,21 @@ object PdfTextExtractor {
 
     /** 见 [hasScatteredLayout] KDoc——真机数据里同一视觉行的 Y 坐标是精确复用同一个浮点值（同一套版式网格生成），不需要容差；但为了不被极小的浮点误差绊倒，四舍五入到整数 pt 再分组。 */
     private const val SCATTERED_LAYOUT_Y_BUCKET_PT = 1f
+
+    /** 见 [hasLabelColumnWithSideContent] KDoc——真机"CPS 热分析"页短语列有 14 行精确对齐到同一个 startX，普通缩进列表条目数通常个位数，门槛定在 6，两者之间留了安全边际，跟 [MIN_OVERLAPPING_Y_GROUPS] 同一类考量。 */
+    private const val MIN_LABEL_COLUMN_LINES = 6
+
+    /** 见 [hasLabelColumnWithSideContent] KDoc——真机数据里同一列的 `startX` 精确复用同一个浮点值，不需要容差，只是防止极小浮点误差把同一列拆成两组，跟 [SCATTERED_LAYOUT_Y_BUCKET_PT] 同一类考量。 */
+    private const val LABEL_COLUMN_X_BUCKET_PT = 2f
+
+    /** 见 [hasLabelColumnWithSideContent] KDoc——左侧内容的 `startX` 至少要比标签列小这么多才算"真的在左边"，不是合并容差以内的巧合。真机数据标签列 startX≈431pt，左侧最近的徽章文字 startX≈234pt，差约 197pt，阈值取远小于这个差距、但明显大于普通字符宽度的量。 */
+    private const val LEFT_CONTENT_MIN_GAP_PT = 40f
+
+    /** 见 [hasLabelColumnWithSideContent] KDoc——真机数据这一页有 8 条不同的左侧内容行，普通缩进列表左边是页面留白应该是 0 条，门槛定在 3，留了安全边际。 */
+    private const val MIN_LEFT_CONTENT_LINES = 3
+
+    /** 见 [PageContentStreamEngine.hasOverlappingImages] KDoc——真机三组故意叠放的图片重叠比例横跨 21%~66%，阈值取在最低值之下留安全边际；正常图片"边缘贴合但不重叠"的重叠比趋近于 0，远低于这个阈值。 */
+    private const val MIN_IMAGE_OVERLAP_RATIO = 0.15f
 
     /** 见 [decodeRawImageByBitDepth] KDoc"尺寸安全阀"一节——超过这个像素数（宽×高）直接跳过，不手动解码。 */
     private const val MAX_MANUAL_DECODE_PIXELS = 30_000_000L
@@ -519,52 +545,97 @@ object PdfTextExtractor {
      * 根因还是 PdfBox-Android 自己的合成逻辑（`pdImage.image` 内部走 `applyMask`）
      * 处理 JPEG 编码蒙版有 bug，跟底图本身是什么格式无关——同一份 JPEG 蒙版字节
      * 单独用 `BitmapFactory` 解码是正常的灰度图（这台设备上反复验证过 JPEG 解码
-     * 本身没问题，见 [decodeJpegWithNativeSubsampling]），蒙版格式是 PNG/JPX 时
-     * `pdImage.image` 的合成完全正常（真机数据里这两种蒙版对应的图片亮度都在
-     * 正常范围）。
+     * 本身没问题，见 [decodeJpegWithNativeSubsampling]）。
      *
-     * ## 修法：绕开 PdfBox 的合成，底图交给 PdfBox 自己解码（去掉蒙版之后），蒙版自己解码，手动叠加
+     * ## 2026-09-03 扩展：蒙版是 JPX 编码时同样会合成出纯黑，之前"PNG/JPX 蒙版
+     * 合成完全正常"这条结论是错的
      *
-     * 底图不再限定必须是 JPEG——直接复用 PdfBox-Android 自己成熟的 `PDImageXObject
-     * .getImage()`，只是调用前**临时把 `/SMask` 从底图的 `COSDictionary` 里摘掉**
-     * （`removeItem(COSName.SMASK)`），解码完再放回去（`setItem` 恢复原值，不影响
-     * 这个 `PDImageXObject` 后续任何其它用途）——这样拿到的是"没有蒙版参与合成"的
-     * 纯底图像素，不管底图原本是 JPEG/PNG/其它格式，都交给 PdfBox 自己一直可靠的
-     * 解码逻辑处理，我们不用重新造一个"识别任意底图格式再解码"的轮子。蒙版单独用
-     * `BitmapFactory.decodeByteArray` 解码原始 JPEG 字节（灰度值当 alpha 通道，
-     * `R`/`G`/`B` 三个通道对灰度 JPEG 应该相等，直接取 `R`），跟底图逐像素手动
-     * 拼成新的 `ARGB_8888` 位图。蒙版和底图的像素尺寸如果不一致（PDF 规范允许
-     * `/SMask` 跟主图分辨率不同），先用 `Bitmap.createScaledBitmap` 把蒙版缩放到
-     * 跟底图一致再取样——不追求跟 PDF 规范"用归一化坐标插值"完全等价，双线性缩放
-     * 对这种量级的分辨率差异视觉上足够。
+     * 上面这段 KDoc 曾经断言"蒙版格式是 PNG/JPX 时 `pdImage.image` 的合成完全
+     * 正常（真机数据里这两种蒙版对应的图片亮度都在正常范围）"——真机反馈"当前页
+     * 文字与图片分开显示"（用户指出具体是第 30 页，不是第 16 页那次已经查完的
+     * 问题），排查过程先怀疑还是版式判定漏检（跟第 16 页同一类问题），装了新版本
+     * 真机截图却看到一段纯黑矩形夹在正常文字和正常图片之间——用 Robolectric
+     * 诊断测试跑 `Session.loadPage(30)` 逐张导出真实解码出的图片、采样中心/四角
+     * 像素，直接实锤第 4 张图（399x244）五个采样点全部是 `0x00000000`（纯黑，
+     * 不是"偏暗"）。核对这张图的 `pdImage.suffix` 是 `jpg`（3 分量，不是 CMYK，
+     * 不会被前面的 CMYK 拦截分支收走），蒙版是 `jpx`——用 `pdfimages -list` 对
+     * 全书 36 页扫描确认这不是孤例，**37 张图、分布在 17 个不同页面**都是这个
+     * 组合（jpeg 底图 + jpx 蒙版），只是其中大多数页面因为命中了别的整页栅格化
+     * 规则（两栏/散乱版式/表格误判等）而没有走到我们自己的图片解码分支，这个 bug
+     * 才一直没在真机上暴露出来——第 30/31 页恰好是单栏顺序排版、不触发任何整页
+     * 栅格化规则的页面，图片解码 bug 才第一次真正对用户可见。之前"PNG/JPX 蒙版
+     * 都正常"这条结论显然是在样本量不够（没覆盖到 jpeg+jpx 这个具体组合）的情况
+     * 下下的，这次教训是**同一类 bug 的判断条件不能只验证过一种底图/蒙版组合就
+     * 断言"其它组合都没事"**，尤其当"没事"这个结论本身没有真机数据支撑、只是没
+     * 遇到反例。
      *
-     * 触发条件只看蒙版：`imageXObject.softMask?.suffix=="jpg"`——不看底图格式（上面
-     * 踩过这个坑）。不处理 `PDImageXObject.getMask()` 那种 stencil mask（不同机制，
-     * 见 [PageContentStreamEngine.drawImage] JPX 分支的 KDoc"目前不合成，遇到就
-     * 跳过"一节），也不处理蒙版是 PNG/JPX 的组合（真机数据证实那两种本来就是正常的，
-     * 没有理由额外绕开 PdfBox 自己的合成逻辑，多一层自己的解码只会多一个新的出错点）。
-     * 任何一步失败（不是 JPEG 蒙版、`removeItem`/`setItem`/解码任何一步抛异常）都
-     * 返回 `null`，调用方回退到下面 `pdImage.image` 那条通用路径——对不在范围内的
-     * 图片，行为跟这次修复之前完全一样。
+     * ## 修法：跟 JPEG 蒙版同一个技术——绕开 PdfBox 的合成，蒙版单独解码，手动叠加
      *
-     * ## 已知局限：Robolectric 验证不了"是不是真的不黑了"
+     * 底图解码逻辑完全不变（仍然是"摘掉 /SMask 再调用 `imageXObject.image`"，见
+     * 下面代码）——问题只在蒙版这一步：JPEG 蒙版用 `BitmapFactory.decodeByteArray`
+     * 解码 `DCTDecode` 原始字节，JPX 蒙版改用项目已经在用、真机验证过可靠的
+     * [Jpeg2000Decoder.decode] 解码 `JPXDecode` 原始字节（跟 [PageContentStreamEngine
+     * .drawImage] 里 `pdImage.suffix=="jpx"` 那条分支读取底图字节的方式一致）——
+     * 两种蒙版解码出来的都是灰度图（JPX 蒙版的色彩空间是 DeviceGray，`Jpeg2000Decoder`
+     * 解出来的 R/G/B 三通道对灰度图应该相等，取 R 通道当 alpha 值跟 JPEG 蒙版
+     * 那条分支完全同一个假设，不是新增的推测），后续"取 alpha、跟底图逐像素合成"
+     * 这一段是两种蒙版格式共用的（提到函数末尾，不重复实现两遍）。
      *
-     * 跟 [decodeJpegWithNativeSubsampling] KDoc 记录的坑一样，Robolectric 环境下
-     * `BitmapFactory.decodeByteArray` 解码结果尺寸可信、像素内容不可信（影子实现
-     * 不是真的 JPEG 解码器）。单元测试（[PdfTextExtractorSoftMaskTest]）只能验证
-     * "这条新路径确实被触发"，验证"合成结果真的不是纯黑"必须靠真机——这次吃过
-     * "第一版真机复测才发现判断条件从一开始就没生效"的教训，装上新版本后必须重新
-     * 完整走一遍真机截图核对，不能只看"编译过、单测过"就当作已验证。
+     * 触发条件从"`softMask.suffix=="jpg"`"放宽成"`suffix=="jpg"` 或 `"jpx"`"，
+     * 依然只看蒙版格式、不看底图格式（上面踩过的坑）。不处理 `PDImageXObject
+     * .getMask()` 那种 stencil mask（不同机制，见 [PageContentStreamEngine
+     * .drawImage] JPX 分支 KDoc"目前不合成，遇到就跳过"一节），也不处理蒙版是
+     * PNG 的组合——**这条没有改动**，是因为真机数据里从未见过 PNG 蒙版对应的图片
+     * 变黑，不是因为验证过"PNG 蒙版没问题"这个结论足够可靠（上面这次教训之后，
+     * 不再没有反例就直接断言"这种组合没事"，只是如实说"目前没有证据显示 PNG
+     * 蒙版有问题，也没有专门验证过"）。**两种失败要分开处理**：不是 jpg/jpx
+     * 蒙版、或者摘掉 `/SMask` 之后底图本身解码失败（`imageXObject.image` 返回
+     * `null` 或抛异常）——这两种直接返回 `null`，调用方回退到下面 `pdImage
+     * .image` 那条通用路径，对不在范围内的图片行为跟这次修复之前完全一样；
+     * **底图解码成功、只是蒙版这一步解码失败**——见下面"实测意外发现"一节，
+     * 返回已经解码成功的不带蒙版的底图（完全不透明），不落回通用路径。
+     *
+     * ## 实测意外发现：底图解码一次的副作用，会让"失败就交给通用路径"这个設計本身不可靠
+     *
+     * 第一版蒙版解码失败时也是直接 `return null`（跟"不是 jpg/jpx"那两种失败
+     * 一样处理），装 Robolectric 诊断跑第 30 页真实数据时意外发现：即使
+     * [Jpeg2000Decoder.decode] 确认解码失败（加日志实测过，`decoded=false`），
+     * 最终展示的图片依然是彩色的、原始尺寸的正常内容，不是预期中回退到
+     * "通用路径"应该产出的纯黑图——追下去发现是 `imageXObject.image` 内部
+     * 有解码结果缓存，这个函数已经用"摘掉 /SMask 再调一次"的方式**成功解码
+     * 过一次底图**（拿到 `baseBitmap` 那一步），下面调用方兜底那行代码
+     * `pdImage.image` 是**同一个 `PDImageXObject` 实例**上的第二次调用，命中
+     * 了 PdfBox-Android 内部缓存，直接返回了第一次那份"没有蒙版参与合成"的
+     * 结果——不是这次修复真的通过某种方式合成对了，是缓存副作用"顺便"绕开了
+     * 通用路径那段有 bug 的合成代码。这份行为**没有任何官方文档保证**（纯粹
+     * 是读代码+装机实测撞出来的实现细节，PdfBox-Android 完全可以在未来版本
+     * 改掉这个缓存策略），不能当成可以依赖的机制——所以改成显式返回
+     * `baseBitmap`，不管蒙版解码成功还是失败，"底图已经解码成功"这个事实
+     * 都不会再对函数的返回值产生任何不确定性，读代码的人也不用知道 PdfBox
+     * 内部有没有缓存这件事。
+     *
+     * ## 已知局限：Robolectric 验证不了"合成出来的透明效果对不对"，JPX 这条分支比 JPEG 那条更严重
+     *
+     * JPEG 蒙版那条分支好歹能在 Robolectric 下验证"尺寸对不对"（`BitmapFactory`
+     * 影子实现尺寸可信、像素不可信，见 [decodeJpegWithNativeSubsampling] KDoc 同一个
+     * 局限）；JPX 蒙版这条分支连"尺寸对不对"都验证不了——[Jpeg2000Decoder.decode]
+     * 依赖真实 Android native 库（`jp2-android`），Robolectric 纯 JVM 环境下
+     * `System.loadLibrary` 必定失败，单元测试只能验证"JPX 蒙版这条新分支被
+     * 正确识别、蒙版解码失败时优雅回退到不带蒙版的底图、不崩溃"（跟
+     * [PdfTextExtractorImageTest] 里 JPX 图片本身那条 wiring 测试同一个局限），
+     * 验证"蒙版真的解出来了、抠图效果对不对"必须靠真机——第 30 页真机截图是
+     * 这次修复实际生效的证据，不是单元测试；即便真机上蒙版解码成功，本类
+     * 目前也没有专门测试过"透明区域真的透明了"，只确认过"不再是纯黑"。
      */
-    private fun decodeJpegSoftMaskCompositeOrNull(pdImage: PDImage): Bitmap? = runCatching {
+    private fun decodeSoftMaskCompositeOrNull(pdImage: PDImage): Bitmap? = runCatching {
         val imageXObject = pdImage as? com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
             ?: return null
         val softMask = imageXObject.softMask ?: return null
-        if (softMask.suffix != "jpg") return null
+        if (softMask.suffix != "jpg" && softMask.suffix != "jpx") return null
 
         // 临时摘掉 /SMask 再调用 PdfBox 自己的 getImage()——不管底图本身是什么
         // 格式（JPEG/PNG/其它），交给 PdfBox 一直可靠的底图解码逻辑处理，只是
-        // 不让它有机会跑到内部那段处理 JPEG 蒙版会出 bug 的合成代码。解码完立刻
+        // 不让它有机会跑到内部那段处理蒙版合成会出 bug 的代码。解码完立刻
         // 把 /SMask 放回去，这个 PDImageXObject 后续（比如同一份内容流里被引用
         // 第二次）还是完整的，不留下被我们改坏的状态。
         val smaskEntry = imageXObject.cosObject.getDictionaryObject(com.tom_roush.pdfbox.cos.COSName.SMASK)
@@ -577,8 +648,21 @@ object PdfTextExtractor {
             }
         } ?: return null
 
-        val maskBytes = softMask.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
-        val maskBitmapRaw = BitmapFactory.decodeByteArray(maskBytes, 0, maskBytes.size) ?: return null
+        // 蒙版解码失败（JPX 这条分支在这台设备的正常工作条件下不该失败，但
+        // 不能假设"native 库一定可用"——见类 KDoc"已知局限"一节，Robolectric
+        // 环境下必定失败）时，返回**已经解码成功的不带蒙版的底图**（完全
+        // 不透明），不落回下面那条已知会产出纯黑的通用路径（`pdImage.image`
+        // 在 /SMask 完整时的内部合成）——底图内容本来就是对的，只是丢了
+        // "抠掉部分区域变透明"这个效果，比整张图变黑或者赌一把通用路径的
+        // 内部缓存机制"碰巧"返回同一份底图（不可靠、没有文档保证的行为，
+        // 见下面 KDoc"实测意外发现"一节）稳妥得多。
+        val maskBitmapRaw = if (softMask.suffix == "jpg") {
+            val maskBytes = softMask.createInputStream(listOf("DCTDecode", "DCT")).use { it.readBytes() }
+            BitmapFactory.decodeByteArray(maskBytes, 0, maskBytes.size)
+        } else {
+            val maskBytes = softMask.createInputStream(listOf("JPXDecode")).use { it.readBytes() }
+            Jpeg2000Decoder.decode(maskBytes)
+        } ?: return baseBitmap
         val maskBitmap = if (maskBitmapRaw.width != baseBitmap.width || maskBitmapRaw.height != baseBitmap.height) {
             Bitmap.createScaledBitmap(maskBitmapRaw, baseBitmap.width, baseBitmap.height, true)
         } else {
@@ -1507,6 +1591,65 @@ object PdfTextExtractor {
     }
 
     /**
+     * 2026-09-03 新增：真机反馈"这本书当前页文字与图片分开显示，应该显示为
+     * 图片"，排查到 `ansys_electronic_test.pdf` 第 16 页（"芯片-封装-系统
+     * (CPS)热分析解决方案"）——三栏"分类标签+产品名徽章+短语列表"版式（左栏
+     * "芯片级/封装级/系统级"、中栏黑色产品名徽章、右栏一串独立短语如"时序
+     * 影响""3DIC 分析"），[hasColumnGap] 和 [hasScatteredLayout] 都测不出来：
+     * 前者要求"一条干净缝隙分两半"，这页有一句跨栏说明文字（"晶圆级封装中
+     * 热量引起的互连应力分析"）把中右两栏之间本该有的缝隙焊死；后者要求
+     * "同一 Y 高度多条文字"，但右栏 14 条短语各自落在不同的 Y（180.5/196.6/
+     * 212.6/……），互不重叠，测不出"并排"。
+     *
+     * ## 信号：一整列短语精确对齐到同一个 X，且这一列的垂直范围内左边确实有别的内容
+     *
+     * 真机数据显示右栏 14 条短语的 [Line.startX] 精确到小数点都是同一个浮点值
+     * （431.2pt，同一套版式网格生成），比 [hasScatteredLayout] 用的"同 Y"更
+     * 能捕捉这种"纵向对齐成一列"的版式——但单独这一条信号有明确的误判风险：
+     * 一份普通的缩进项目符号列表（比如本类文档"已知局限"那类）几何上长得
+     * 一模一样（多行文字精确对齐到同一个左边距 X），会被误判成图标列表整页
+     * 栅格化，把能调字号的正常列表也毁了。
+     *
+     * **加一道更严格的校验**（用户拍板要求，权衡过"只用简单信号先上线看真机
+     * 效果"的更快路线，选了更稳的这条）：真正的"标签列"只有在紧挨着别的内容
+     * （图标/徽章/分类标题）时才有意义，不会独立存在——要求这一列的垂直范围
+     * 内，页面上确实存在至少 [MIN_LEFT_CONTENT_LINES] 条不同的其它文字，且
+     * 这些文字的 `startX` 比这一列的 `startX` 小至少 [LEFT_CONTENT_MIN_GAP_PT]
+     * （真机数据这一页有 8 条这样的左侧文字——"芯片级"/"Ansys RedHawk-3DIC"
+     * 等——分布在整个列的 Y 范围内，见下面单测）。普通缩进列表左边是页面
+     * 留白，不会有这批"别的内容"，这道校验能把它排除掉。
+     *
+     * ## 跟表格检测的先后顺序：同 [hasScatteredLayout]，必须排除表格区域之后再查
+     *
+     * 无边框但有内部对齐的表格（比如右侧一列数值靠右对齐）几何上跟这个信号
+     * 无法区分——但这类表格本来就在"完全无边框线的表格检测不到"的已知局限
+     * 范围内（见类 KDoc"已知局限"一节），命中这条规则会把它们也整页栅格化，
+     * 属于已经接受的兜底行为（漏检代价小），不是新增风险；跟 [hasScatteredLayout]
+     * 一样放在表格区域检测之后、只查 `nonTableLines`，避免跟有边框表格的精确
+     * 裁剪路径冲突（同一份 KDoc"跟表格检测的先后顺序"一节的真机回归案例，
+     * 这条规则没有重新踩这个坑，但吸取了同一个教训）。
+     *
+     * @param lines 已经过 [isLineOnPage] 边界过滤、且已经排除表格区域的这一页
+     *   文字行，合并前后都可以（函数内部会自己调 [mergeSameLineRuns]）。
+     */
+    internal fun hasLabelColumnWithSideContent(lines: List<Line>): Boolean {
+        val withPosition = lines.filter { it.pageWidth > 0f }
+        if (withPosition.size < MIN_LABEL_COLUMN_LINES) return false
+        val merged = mergeSameLineRuns(withPosition)
+        val columns = merged.groupBy { (it.startX / LABEL_COLUMN_X_BUCKET_PT).roundToInt() }
+        return columns.values.any { column ->
+            if (column.size < MIN_LABEL_COLUMN_LINES) return@any false
+            val columnStartX = column[0].startX
+            val minY = column.minOf { it.y }
+            val maxY = column.maxOf { it.y }
+            val leftContentLines = merged.count { other ->
+                other.startX <= columnStartX - LEFT_CONTENT_MIN_GAP_PT && other.y in minY..maxY
+            }
+            leftContentLines >= MIN_LEFT_CONTENT_LINES
+        }
+    }
+
+    /**
      * 内部用：段落文字 + 这个段落所在的页码（页码从 1 起，用于图片按页归类）。
      * [topY] 是这个段落第一行的 [Line.y]（距页面顶部多少 pt），供目录页内精确定位用。
      */
@@ -1639,6 +1782,16 @@ object PdfTextExtractor {
         line.pageWidth > 0f && (line.endX - line.startX) / line.pageWidth < LIST_ITEM_MAX_WIDTH_RATIO
 
     /**
+     * 见 [linesToParagraphs] KDoc"紧凑列表识别的一个真实边界情况"一节——项目
+     * 符号（`o`/`•`/`-` 这类单字符标记）物理宽度极窄，[isShortLine] 会把它也
+     * 判定成"短行"，跟它自己配对的正文内容一起满足"连续两行都短"，被错误地
+     * 从自己的内容前面切开。这个函数专门识别"这一行窄到不像是真正的列表项
+     * 内容，更像是一个符号"，只看绝对宽度（[BULLET_MARKER_MAX_WIDTH_PT]），
+     * 不看页宽比例——符号的物理尺寸不随页面宽度缩放。
+     */
+    private fun isBulletMarker(line: Line): Boolean = (line.endX - line.startX) <= BULLET_MARKER_MAX_WIDTH_PT
+
+    /**
      * 见类注释"段落切分"一节主逻辑，这里补一段专门的说明。
      *
      * ## 紧凑列表识别（2026-08-25 补上，见 NOTES.md #14/#37）
@@ -1675,6 +1828,26 @@ object PdfTextExtractor {
      * 远短于半页宽，会被新规则误判成 5 项列表。这次改成了更接近真实段落的两行
      * 换行（第一行接近页宽，第二行天然更短），不影响该测试原本要验证的东西
      * （页脚水印过滤），见该文件里的改动记录。
+     *
+     * ## 2026-09-03 补丁：项目符号本身也会被这条规则误伤，切在符号和自己的内容之间
+     *
+     * 真机反馈"这本书里出现了很多单行的'o'"（`HFSS.pdf`，跟同一次会话里"l"那个
+     * Wingdings 图标字体问题不是同一回事，这次是普通 Courier New 字体，作者
+     * 真的手打了字母 `o` 当项目符号，是合法内容不是编码噪音）——真机坐标数据
+     * 显示：`o` 项目符号本身宽度只有 4.5pt（单个字符宽度），跟它自己配对的
+     * 正文如果恰好能塞进一行（比如"Add an incident plane wave"，widthRatio
+     * 0.216，满足 [isShortLine]），"符号"和"内容"这一对就会被当成"连续两个
+     * 短列表项"切开——`o Draw a segmented...`这一条能正常合并，纯粹是因为
+     * 后面那句话长到会换行、不满足"短行"这个前提，纯属侥幸，不是规则本身
+     * 正确处理了这种情况；后续 6 个符号里有 5 个都因为配对的内容恰好一行
+     * 装得下而被错误切开。
+     *
+     * 加了 [isBulletMarker]（只看绝对宽度，[BULLET_MARKER_MAX_WIDTH_PT]，
+     * 不看页宽比例——符号的物理尺寸是固定的，不随页面宽度缩放）识别"这一行
+     * 窄到不像列表项内容，更像是个符号"，`compactListBoundary` 判断加了
+     * `lines[i-1]` 不是符号这个条件——符号只应该跟"上一个列表项"之间产生
+     * 边界（那个边界检查时 `lines[i-1]` 是上一项的内容，不是符号，不受影响），
+     * 不该跟"自己的内容"之间产生边界。
      */
     internal fun linesToParagraphs(rawLines: List<Line>): List<Paragraph> {
         val lines = mergeSameLineRuns(rawLines)
@@ -1710,7 +1883,19 @@ object PdfTextExtractor {
             // 段落里基本不会发生。[Line.pageWidth] 为 0（旧测试直接构造 `Line` 没
             // 传这个字段）时 [isShortLine] 恒为 false，这条新规则完全不生效，
             // 行为退化成这次改动之前的样子，不影响任何没有提供这个信息的调用方。
-            val compactListBoundary = isShortLine(lines[i - 1]) && isShortLine(lines[i])
+            //
+            // 见 [isBulletMarker] KDoc——`lines[i-1]` 是项目符号本身（`o`/`•`
+            // 这类单字符标记，物理宽度极窄）时不算数：符号天然也满足"短行"，跟
+            // 它自己配对的正文一起会被误判成"连续两行都短的两个列表项"，切在
+            // 符号和内容之间（真机反馈：`o Draw a segmented...`能正常合并是因为
+            // 后面那句话很长会换行、不满足"短行"，但后续 5 个"o"后面接的都是能
+            // 塞进一行的短语，"符号+短语"两者都短，全部被错误切开）。符号该往
+            // 前面的边界（它跟上一个列表项之间）切，不该往后面的边界（它跟自己
+            // 的内容之间）切——`lines[i-1]` 是符号时不满足这个方向的边界条件，
+            // 强制并入正文；符号跟上一项之间的边界由检查"上一项"和"这个符号"
+            // 这一对时的 `compactListBoundary` 负责（那一对里 `lines[i-1]` 是
+            // 上一项的内容，不是符号，不受这条例外影响）。
+            val compactListBoundary = isShortLine(lines[i - 1]) && isShortLine(lines[i]) && !isBulletMarker(lines[i - 1])
             // 跨页强制切段落：y 坐标每翻一页就从页顶重新开始，纯按 gap 判断在跨页处
             // 没有意义，见类注释"图片抽取"一节。
             if (pageChanged || gap > paragraphThreshold || compactListBoundary) {
@@ -1997,6 +2182,10 @@ object PdfTextExtractor {
 
         override fun writeString(text: String, textPositions: MutableList<TextPosition>) {
             if (text.isBlank()) return
+            // 见类 KDoc"Wingdings/Webdings 装饰性字符过滤"一节——这两种字体是纯
+            // 图标字体，键盘字母键位对应的是箭头/项目符号这类图标，不是真的字母，
+            // ToUnicode 映射出来的"文字"完全没有语义，整段跳过不收进 lines。
+            if (textPositions.isNotEmpty() && textPositions.all { isDecorativeSymbolFont(it.font.name) }) return
             val y = textPositions.firstOrNull()?.yDirAdj ?: return
             val fontSize = textPositions.maxOfOrNull { it.fontSizeInPt } ?: 0f
             val boldCount = textPositions.count { isBoldTextPosition(it) }
@@ -2009,6 +2198,52 @@ object PdfTextExtractor {
             val pageWidth = textPositions.firstOrNull()?.pageWidth ?: 0f
             lines.add(Line(fixRadicalVariants(text), y, currentPageNo, fontSize, isBold, startX, endX, pageWidth))
         }
+    }
+
+    /**
+     * 2026-09-03 新增：真机反馈"这本书里出现了很多单行的'l'和'O'"（用户实际指的是
+     * 另一份文档 `HFSS.pdf`，一份大型技术手册，不是当天在查的数学教材或 Ansys
+     * 文档）——真机截图看到一份操作步骤列表里每一步之间都插了一个孤立的字母
+     * "l"："l / Generate mesh / l / Specify solution settings / l / ..."。
+     *
+     * ## 排查：用独立的 poppler `pdftotext` 交叉核实过，不是 PdfBox-Android 单独的问题
+     *
+     * 先怀疑是不是又一次"CID→Unicode 映射歧义"（跟本类"部首变体"那个已修 bug
+     * 同一类），但这次 `pdftotext -layout` 独立提取同一份文档，"l"依然原样出现在
+     * 同样的位置——这排除了"PdfBox-Android 自己映射错了、poppler 映射对了"这种
+     * 可修的情况；两套完全独立的实现给出一致结果，说明问题出在 PDF 文件自己的
+     * 字体数据里，不是抽取器的 bug。
+     *
+     * ## 根因：Wingdings 是纯图标字体，键位对应的"字母"没有语义
+     *
+     * 加诊断直接读每个字符对应的 `TextPosition.font.name`，实锤这些"l"全部来自
+     * 字体 `ERXUTR+Wingdings-Regular`——Wingdings/Webdings 是 Windows 系统自带的
+     * "键位替换成图标"字体（微软经典设计：在 Wingdings 字体下敲字母 `l` 键，
+     * 屏幕上显示的是一个向下的箭头图标，不是字母 L 本身），PDF 里这段文字的
+     * `ToUnicode` 映射表如实记录了"这个字形对应键盘上的 l 键"，但这串 ToUnicode
+     * 数据从设计上就不是给人读的语义文字，是给字体渲染引擎用来找到正确图标字形的
+     * 内部索引——所有支持 ToUnicode 的 PDF 文字提取器（PdfBox、poppler 概莫能外）
+     * 都会如实提取出这个"没有意义的中间产物"，这不是哪个库的 bug，是 Wingdings
+     * 这类图标字体本身的设计跟"提取文字获得语义内容"这个假设天然不兼容。
+     * 全书扫描过：这份 HFSS 手册里 Wingdings 字体贡献了 6461 次孤立"l"（图标应该是
+     * 流程步骤间的箭头）+ 30 次孤立"n"（另一个图标，同一类噪音）。
+     *
+     * ## 不能用"过滤掉 Symbol 字体"这种更简单粗暴的思路——会删掉真实数学内容
+     *
+     * 全书扫描顺带发现这份技术手册大量使用 `Symbol` 字体（不是 Wingdings/Webdings）
+     * 排版希腊字母/数学符号（α、β、ω、γ、φ、σ、δ、θ、τ、ε、µ、Ω、π 等，公式里
+     * 常见的物理量符号），这些是**真实、有意义的正文内容**，只是恰好也不是用
+     * "普通"字体渲染的——如果按"字体名字不常见就过滤"这种更简单的思路，会把
+     * 全书公式里的希腊字母变量全部删掉，是比"多几个孤立 l"严重得多的破坏。
+     * 判断条件必须精确匹配"Wingdings"/"Webdings"这两个具体的图标字体家族名，
+     * 不能扩大化到"任何非标准字体"。
+     *
+     * @return 这个字体名是不是"纯图标字体"（键位字形跟字母含义无关，提取出来的
+     *   "文字"应该整体丢弃，不当作正文内容）。
+     */
+    internal fun isDecorativeSymbolFont(fontName: String?): Boolean {
+        if (fontName == null) return false
+        return fontName.contains("Wingdings", ignoreCase = true) || fontName.contains("Webdings", ignoreCase = true)
     }
 
     /**
@@ -2109,6 +2344,104 @@ object PdfTextExtractor {
 
         var hasImages = false
             private set
+
+        /**
+         * 2026-09-02 新增：真机反馈"这本书页面并没有显示成图片，相反还把文字和
+         * 图片分开分别显示了"——排查到 `ansys_electronic_test.pdf` 第 20 页，
+         * 用 `pdfimages -list` 核对发现根因是**同一张图片对象在这一页里被
+         * 引用了不止一次**（这份文档唯一一处，其余所有多图页——包括 #51/#52
+         * 修过的"RF 电路"6 图小节页——每张图都只出现一次）：设计师把一张小
+         * 色块图当"连接箭头/高亮装饰"用，在原始 PDF 里通过好几次不同的位置/
+         * 角度摆放拼出视觉连接效果，本类的抽取模型只认"文字段落 + 顺序排列的
+         * 独立配图"，没有"同一图片重复摆放拼图"这个概念——处理结果是这一页
+         * 显示成"文字、然后好几张一模一样的色块"，跟设计师想要的"一张融合了
+         * 箭头指向关系的信息图"完全对不上，读起来自然是"文字和图片分开了"。
+         *
+         * 判定方法：[PDImage] 在同一份内容流里被同一个 `/Do` 资源名重复引用
+         * 时，PdfBox-Android 返回的是**同一个 [PDImageXObject] 实例**（不是
+         * 内容相同的两份拷贝）——[decodeSoftMaskCompositeOrNull] 那段
+         * "这个 PDImageXObject 后续（比如同一份内容流里被引用第二次）还是
+         * 完整的" 注释已经确认过这个事实。用 `IdentityHashMap` backed 的
+         * `Set` 记这一页见过的 `cosObject`（`COSStream`，这个实例哪怕跨越
+         * 多次 `/Do` 调用也是同一个对象，用它当身份标识比拿宽高/字节数这类
+         * "内容相同但物理上是两张不同图"的信号更准确），第二次见到同一个
+         * 就置位——只看 `PDImageXObject`（`is` 判断），[PDInlineImage] 天生
+         * 每次都是内容流里现画的独立数据，不存在"复用同一个对象"这个概念，
+         * 不参与这个统计。
+         *
+         * 跟 [hasFullPageImage]/[hasScatteredLayout] 是同一个"整页栅格化"
+         * 兜底路径（见调用点），风险模型一致：漏检的代价是维持当前已经修好
+         * 的样子，不会更差；误判的代价是这一页少了调字号能力，pdfium 渲染
+         * 内容本身准确——真正会重复引用同一张图片对象的场景（设计稿式拼贴）
+         * 本身就不适合当作可重排的正文来处理。
+         */
+        var hasReusedImage = false
+            private set
+        private val seenImageObjectIdentities = java.util.Collections.newSetFromMap(
+            java.util.IdentityHashMap<Any, Boolean>(),
+        )
+
+        /**
+         * 2026-09-03 新增：真机反馈"第 30 页文字与图片还是分开了"——排查 [hasReusedImage]
+         * 那次沿用的思路（复用同一张图片对象）在这页测不出来，这页每张图片都是
+         * 各不相同的独立对象，问题不在"复用"，在"故意叠放"：真机数据用 CTM 精确
+         * 核对过，这一页有三组各自独立的图片互相重叠——一组两张 316×190 的图表
+         * （交叉/散点两层叠加，面积重叠比约 21%）、一组两张 310×202 的曲线图
+         * （S/Z 参数图叠加，重叠比约 60%）、一组三张 404×191 的电路板高亮图
+         * （三个连接点各自一张高亮图叠在同一张底图位置附近，两两重叠比 32%~66%）。
+         * 本类的抽取模型把每张图当独立、顺序排列的展示块处理，完全没有"故意
+         * 叠放"这个内容类型——即使每张图本身都解码正确（这次真机反馈之前已经
+         * 顺带修好一个真正的解码 bug，见 [decodeSoftMaskCompositeOrNull]"2026-09-03
+         * 扩展"一节，但那不是这页图文分离的根本原因），reflow 出来的结果也是
+         * "三张图各自单独一整块、纵向堆叠"，跟设计师想要的"多层叠加成一张完整
+         * 图表"完全对不上——这跟 [hasReusedImage] 是同一类"设计稿式拼贴"，只是
+         * 拼贴手法从"复用同一张图片对象"换成了"摆放多个不同的图片对象让它们在
+         * 页面上物理重叠"。
+         *
+         * ## 信号：任意两张图片在页面坐标系里的包围盒有实质重叠
+         *
+         * 用 CTM 的 `translateX`/`translateY`/`scaleX`/`scaleY` 算出每张图片的
+         * 包围盒（不假设 scale 一定是正数——PDF 允许翻转，`minOf`/`maxOf` 兜底），
+         * 两两之间只要重叠面积占较小那张图片自身面积的比例达到 [MIN_IMAGE_OVERLAP_RATIO]
+         * 就判定为"故意重叠"。阈值定在真机三组数据里最低的重叠比（约 21%）之下、
+         * 留了安全边际——正常文档里图片之间要么完全不接触、要么最多边缘贴在一起
+         * （比如无缝拼接的地图瓦片，边界重合但重叠面积趋近于 0），这种"边缘重合"
+         * 天然远低于这个阈值，不会被误判；真正设计上要叠放的图表/高亮标注，
+         * 重叠比例天然会显著更高（真机三组数据横跨 21%~66%，中间没有可疑的
+         * 临界值聚集）。
+         *
+         * 跟 [hasReusedImage] 是同一个"整页栅格化"兜底路径（见调用点），风险模型
+         * 一致：漏检的代价是维持当前已经修好的样子，不会更差；误判的代价是这一页
+         * 少了调字号能力，pdfium 渲染内容本身准确。
+         */
+        var hasOverlappingImages = false
+            private set
+        private val seenImageBounds = mutableListOf<ImageBoundsPt>()
+
+        private data class ImageBoundsPt(val minX: Float, val maxX: Float, val minY: Float, val maxY: Float)
+
+        /** 见 [hasOverlappingImages] KDoc"信号"一节——算出这张图的包围盒，跟已经见过的每一张比对重叠比例，记录进 [seenImageBounds] 供后续图片比对。 */
+        private fun recordImageBoundsAndCheckOverlap(ctm: PdfMatrix) {
+            val minX = minOf(ctm.translateX, ctm.translateX + ctm.scaleX)
+            val maxX = maxOf(ctm.translateX, ctm.translateX + ctm.scaleX)
+            val minY = minOf(ctm.translateY, ctm.translateY + ctm.scaleY)
+            val maxY = maxOf(ctm.translateY, ctm.translateY + ctm.scaleY)
+            val area = (maxX - minX) * (maxY - minY)
+            if (area > 0f) {
+                for (other in seenImageBounds) {
+                    val overlapX = minOf(maxX, other.maxX) - maxOf(minX, other.minX)
+                    val overlapY = minOf(maxY, other.maxY) - maxOf(minY, other.minY)
+                    if (overlapX > 0f && overlapY > 0f) {
+                        val otherArea = (other.maxX - other.minX) * (other.maxY - other.minY)
+                        val intersectionArea = overlapX * overlapY
+                        if (intersectionArea / minOf(area, otherArea) >= MIN_IMAGE_OVERLAP_RATIO) {
+                            hasOverlappingImages = true
+                        }
+                    }
+                }
+            }
+            seenImageBounds.add(ImageBoundsPt(minX, maxX, minY, maxY))
+        }
 
         /**
          * 目前只有 JBIG2/手动位深解码/原生解码这几条"没证据显示是瓶颈"的路径在用，
@@ -2408,6 +2741,16 @@ object PdfTextExtractor {
 
         override fun drawImage(pdImage: PDImage) {
             hasImages = true
+            // 见 hasReusedImage KDoc——统计要覆盖 decodeImages=false 的结构扫描阶段
+            // （表格检测那趟扫描也要能拿到结果，不用等真正解码），放在这里而不是
+            // 下面 `if (!decodeImages) return` 之后。
+            val imageXObject = pdImage as? com.tom_roush.pdfbox.pdmodel.graphics.image.PDImageXObject
+            if (imageXObject != null && !seenImageObjectIdentities.add(imageXObject.cosObject)) {
+                hasReusedImage = true
+            }
+            // 见 hasOverlappingImages KDoc——同样要覆盖 decodeImages=false 的
+            // 结构扫描阶段，理由跟 hasReusedImage 那条一致。
+            recordImageBoundsAndCheckOverlap(graphicsState.currentTransformationMatrix)
             // 见 hasFullPageImage KDoc——用 CTM 的 scaleX/scaleY（图片在页面坐标系
             // 下的实际渲染宽高，不是原始像素尺寸）跟页面尺寸比，两边都够大才算
             // "占满全页"。放在 decodeImages=false 的扫描阶段也要算（不依赖后面
@@ -2593,10 +2936,10 @@ object PdfTextExtractor {
                 }
                 return
             }
-            // 见 decodeJpegSoftMaskCompositeOrNull KDoc 完整背景：底图和蒙版都是
-            // JPEG 编码时，PdfBox-Android 自己的合成（`pdImage.image` 内部调用）
-            // 会产出纯黑图片，必须在下面这条通用回退路径之前拦截。
-            val softMaskComposite = decodeJpegSoftMaskCompositeOrNull(pdImage)
+            // 见 decodeSoftMaskCompositeOrNull KDoc 完整背景：蒙版是 JPEG 或 JPX
+            // 编码时，PdfBox-Android 自己的合成（`pdImage.image` 内部调用）会
+            // 产出纯黑图片，必须在下面这条通用回退路径之前拦截。
+            val softMaskComposite = decodeSoftMaskCompositeOrNull(pdImage)
             if (softMaskComposite != null) {
                 val ctm = graphicsState.currentTransformationMatrix
                 addRealImage(softMaskComposite, ctm, isFullPageCoverage)
@@ -3106,6 +3449,13 @@ object PdfTextExtractor {
             // 兜底"这条判断要用到的另一半信号。
             var scanHasSkippedFullPageImage = false
             var scanImageResults: List<PageImageResult> = emptyList()
+            // 见 PageContentStreamEngine.hasReusedImage KDoc——同一张图片对象在这
+            // 一页里被重复引用（设计稿式拼贴，不是"正文配了好几张不同的图"）。
+            var scanHasReusedImage = false
+            // 见 PageContentStreamEngine.hasOverlappingImages KDoc——多张不同的
+            // 图片对象在页面坐标系里故意物理重叠（同一类"设计稿式拼贴"，手法
+            // 不同）。
+            var scanHasOverlappingImages = false
             val scanResult = runCatching {
                 val engine = PageContentStreamEngine(page, decodeImages = true, deferCmykDecode = true)
                 engine.processPage(page)
@@ -3113,9 +3463,23 @@ object PdfTextExtractor {
                 scanFullPageImageDecoded = engine.fullPageImageDecoded
                 scanHasSkippedFullPageImage = engine.hasSkippedFullPageImage
                 scanImageResults = engine.imageResults
+                scanHasReusedImage = engine.hasReusedImage
+                scanHasOverlappingImages = engine.hasOverlappingImages
                 engine.segments to engine.hasImages
             }.getOrDefault(emptyList<LineSegment>() to false)
             val tAfterScan = System.currentTimeMillis()
+            // 见 PageContentStreamEngine.hasReusedImage/hasOverlappingImages
+            // KDoc——检测到同一张图片对象被复用、或者多张不同图片被故意摆放
+            // 成物理重叠，直接整页栅格化，不进入下面表格检测/散乱版式检测/
+            // reflow 任何一条分支（这类页面本身就不是"文字配图"的内容模型，
+            // 用哪条 reflow 分支处理都只会把设计师摆好的拼贴关系拆散）。放在
+            // 表格检测之前——原因跟 [hasColumnGap] 那条早退一样：这两个信号
+            // 已经足够明确，不需要等表格检测结果再决定。
+            if (scanHasReusedImage || scanHasOverlappingImages) {
+                val blocks = mutableListOf<DisplayBlock>()
+                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                return PageLoadPhaseA.Complete(PageContent(blocks))
+            }
             val onPageSegments = scanResult.first.filter { isSegmentOnPage(it, page.mediaBox.width, pageHeight) }
             // NOTES.md #39：整页图片优先于表格检测，不再对 scanHasFullPageImage=true
             // 的页面跑 TableGridDetector——真机年报封面页（设计感很强、装饰线条多）
@@ -3205,6 +3569,14 @@ object PdfTextExtractor {
             // 排除表格之后仍然散乱的页面才整页栅格化，普通表格继续走下面精确裁剪
             // 的路径不受影响。
             if (hasScatteredLayout(nonTableLines)) {
+                val blocks = mutableListOf<DisplayBlock>()
+                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                return PageLoadPhaseA.Complete(PageContent(blocks))
+            }
+
+            // 见 hasLabelColumnWithSideContent KDoc——跟 hasScatteredLayout 同一个
+            // 理由，放在表格区域检测之后、只查 nonTableLines。
+            if (hasLabelColumnWithSideContent(nonTableLines)) {
                 val blocks = mutableListOf<DisplayBlock>()
                 renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
                 return PageLoadPhaseA.Complete(PageContent(blocks))

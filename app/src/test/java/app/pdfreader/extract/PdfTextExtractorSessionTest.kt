@@ -660,6 +660,176 @@ class PdfTextExtractorSessionTest {
     }
 
     /**
+     * 2026-09-02 真机反馈修复（"文字和图片分开显示了"）：`ansys_electronic_test.pdf`
+     * 第 20 页用 `pdfimages -list` 核对确认，根因是**同一张图片对象在这一页里被
+     * 复用了 3 次**（设计师把一张装饰色块当"连接箭头"用，摆在 3 个不同位置/角度
+     * 拼出视觉连接效果）——见 [PdfTextExtractor.PageContentStreamEngine
+     * .hasReusedImage] KDoc 完整背景。这条测试复现最小场景：**同一个
+     * `PDImageXObject` 实例**（不是内容相同的两份拷贝，见下面反例）被
+     * `drawImage` 调用两次。
+     *
+     * Robolectric 下 `renderPageWithAndroidPdfRenderer` 必然返回 null（跟上面
+     * "表格状矢量线段"那条测试同样的环境限制），这条测试只能验证"决策分支选对
+     * 了"（blocks 是空列表，不是 reflow 分支产出的"文字段落 + 两张一样的小图"），
+     * 不能验证真实像素，真机截图是实际正确性的证据。
+     */
+    @Test
+    fun `同一张图片对象在页内被复用两次时整页栅格化兜底`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        // 只建一个 PDImageXObject 实例，调用方两次 drawImage 传的是同一个引用——
+        // 跟真实 PDF 里同一个资源名被 `/Do` 调用两次是同一回事（PdfBox-Android
+        // 内部资源解析也会返回同一个实例，见 hasReusedImage KDoc 引用的
+        // decodeSoftMaskCompositeOrNull 那段注释）。
+        val sharedImage = document.tinyImage()
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("infographic caption text")
+        stream.endText()
+        stream.drawImage(sharedImage, 10f, 10f, 40f, 30f)
+        stream.drawImage(sharedImage, 120f, 200f, 40f, 30f)
+        stream.close()
+
+        val file = File.createTempFile("reused-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue("应该整页栅格化兜底（Robolectric 下即空列表），实际 blocks=$blocks", blocks.isEmpty())
+        }
+    }
+
+    /**
+     * 反例：两张**内容相同但物理上是两个不同对象**的图片（各自单独
+     * `createFromByteArray` 出来，就像 [PdfDocumentForTest.tinyImage] 每次调用
+     * 都新建一份）不该触发整页栅格化——这是 #51 已经修好的"一页多个独立图文
+     * 小节"场景（每节自己的文字+图），不能被这次新加的检测误伤。
+     */
+    @Test
+    fun `两张内容相同但物理上是不同对象的图片不触发整页栅格化`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 250f)
+        stream.showText("section one caption")
+        stream.endText()
+        stream.drawImage(document.tinyImage(), 10f, 200f, 40f, 30f)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 100f)
+        stream.showText("section two caption")
+        stream.endText()
+        stream.drawImage(document.tinyImage(), 10f, 50f, 40f, 30f)
+        stream.close()
+
+        val file = File.createTempFile("distinct-image-objects-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue("不该整页栅格化，应该正常 reflow", blocks.any { it is DisplayBlock.Text })
+            assertEquals("两张图应该都正常展示，不是被裁成一张", 2, blocks.count { it is DisplayBlock.Image })
+        }
+    }
+
+    /**
+     * 2026-09-03 真机反馈修复（"第 30 页文字与图片还是分开了"）：延续上面
+     * `hasReusedImage` 那次修复的思路，但这页不是"复用同一张图片对象"，是
+     * "两张不同的图片对象被故意摆放成物理重叠"——真机数据用 CTM 精确核对过，
+     * 见 [PdfTextExtractor.PageContentStreamEngine.hasOverlappingImages]
+     * KDoc 完整背景。这条测试构造两张**内容不同、物理上也是不同对象**的图片
+     * （避免跟 [hasReusedImage] 那条规则搞混），故意让它们的包围盒有实质重叠
+     * （X:[10,70]∩[40,100]=[40,70]=30pt，Y:[10,70]∩[30,90]=[30,70]=40pt，
+     * 交集面积 1200，两张图各自面积都是 3600，重叠比 1200/3600≈33%，远高于
+     * [PdfTextExtractor] 内 `MIN_IMAGE_OVERLAP_RATIO`=15% 的门槛）。
+     */
+    @Test
+    fun `两张不同图片对象故意物理重叠时整页栅格化兜底`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 12f)
+        stream.newLineAtOffset(20f, 150f)
+        stream.showText("layered chart caption text")
+        stream.endText()
+        stream.drawImage(document.tinyImage(), 10f, 10f, 60f, 60f)
+        stream.drawImage(document.tinyImage(), 40f, 30f, 60f, 60f)
+        stream.close()
+
+        val file = File.createTempFile("overlapping-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue("应该整页栅格化兜底（Robolectric 下即空列表），实际 blocks=$blocks", blocks.isEmpty())
+        }
+    }
+
+    /**
+     * 反例：两张不同图片对象**边缘贴合但不重叠**（第一张右边界 x=70 恰好
+     * 是第二张左边界 x=70，包围盒 X 区间刚好相邻不相交）——正常图片并排
+     * 摆放的常见形状，重叠面积应该是 0，不该被新加的检测误判成"故意重叠"。
+     */
+    @Test
+    fun `两张图片边缘贴合但不重叠时不触发整页栅格化`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 200f
+        val pageHeight = 300f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        stream.drawImage(document.tinyImage(), 10f, 10f, 60f, 60f)
+        stream.drawImage(document.tinyImage(), 70f, 10f, 60f, 60f)
+        stream.close()
+
+        val file = File.createTempFile("adjacent-image-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertEquals("边缘贴合不算重叠，两张图应该都正常展示", 2, blocks.count { it is DisplayBlock.Image })
+        }
+    }
+
+    /**
      * NOTES.md #42：真机反馈整页图片的页要等图片全解完才看到任何东西（尤其是
      * 不显示文字的 hasFullPageImage 页），加了 `onImageReady` 回调让每张图片
      * 刚解出来就能先展示，不用等整页处理完。这条测试验证回调本身的契约：
@@ -904,6 +1074,107 @@ class PdfTextExtractorSessionTest {
             assertTrue(
                 "识别到两栏排版后不该逐段重排文字，实际 blocks=$blocks",
                 blocks.none { it is DisplayBlock.Text },
+            )
+        }
+    }
+
+    /**
+     * 2026-09-03 真机反馈（"这本书当前页文字与图片分开显示，应该显示为图片"）——
+     * "CPS 热分析"页的三栏"分类标签+产品名徽章+短语列表"版式，见
+     * [PdfTextExtractor.hasLabelColumnWithSideContent] KDoc 完整背景。这条测试
+     * 构造一个真实的三栏页面（右栏 6 条短语对齐同一 X、左边有 3 条不同的其它
+     * 内容），验证 `Session.loadPage` 走的是整页栅格化分支。Robolectric 环境
+     * 限制同上面两栏测试，只能验证决策分支选对了，不能验证真实像素。
+     */
+    @Test
+    fun `识别到标签列且左侧有其它内容时整页栅格化（真机CPS热分析页简化复现）`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 595.276f
+        val pageHeight = 807.874f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        // 右栏 6 条短语，精确对齐同一个 X（431pt）。
+        listOf(200f, 220f, 240f, 260f, 280f, 300f).forEachIndexed { i, topY ->
+            stream.beginText()
+            stream.setFont(PDType1Font.HELVETICA, 10f)
+            stream.newLineAtOffset(431f, pageHeight - topY)
+            stream.showText("phrase label $i")
+            stream.endText()
+        }
+        // 左边不同 X 的 3 条内容（分类标签+产品名徽章），落在短语列的 Y 范围内。
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 10f)
+        stream.newLineAtOffset(80f, pageHeight - 210f)
+        stream.showText("category label")
+        stream.endText()
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 10f)
+        stream.newLineAtOffset(230f, pageHeight - 230f)
+        stream.showText("product badge name")
+        stream.endText()
+        stream.beginText()
+        stream.setFont(PDType1Font.HELVETICA, 10f)
+        stream.newLineAtOffset(80f, pageHeight - 290f)
+        stream.showText("category label two")
+        stream.endText()
+        stream.close()
+
+        val file = File.createTempFile("label-column-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue(
+                "识别到标签列后不该逐段重排文字，实际 blocks=$blocks",
+                blocks.none { it is DisplayBlock.Text },
+            )
+        }
+    }
+
+    /**
+     * 反例（用户明确要求加的校验，防止误伤正常缩进列表）：6 条精确对齐同一
+     * X 的列表项，但左边是页面留白，没有别的内容——这跟上面标签列的构造
+     * 唯一的区别就是"左边有没有其它内容"，验证这道校验真的能把普通缩进
+     * 列表放过、不整页栅格化。
+     */
+    @Test
+    fun `普通缩进列表不会被标签列规则误伤 仍然正常重排`() {
+        val context = RuntimeEnvironment.getApplication()
+        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context)
+        val document = PdfDocumentForTest()
+        val pageWidth = 595.276f
+        val pageHeight = 807.874f
+        val page = com.tom_roush.pdfbox.pdmodel.PDPage(
+            com.tom_roush.pdfbox.pdmodel.common.PDRectangle(pageWidth, pageHeight),
+        )
+        document.pdDocument.addPage(page)
+        val stream = PDPageContentStream(document.pdDocument, page)
+        listOf(200f, 220f, 240f, 260f, 280f, 300f).forEachIndexed { i, topY ->
+            stream.beginText()
+            stream.setFont(PDType1Font.HELVETICA, 10f)
+            stream.newLineAtOffset(90f, pageHeight - topY)
+            stream.showText("list item $i")
+            stream.endText()
+        }
+        stream.close()
+
+        val file = File.createTempFile("indented-list-doc", ".pdf")
+        file.deleteOnExit()
+        document.pdDocument.save(file)
+        document.pdDocument.close()
+
+        PdfTextExtractor.Session.open(context, file).use { session ->
+            val blocks = session.loadPage(1).blocks
+            assertTrue(
+                "普通缩进列表不该被判定为标签列、不该整页栅格化，实际 blocks=$blocks",
+                blocks.any { it is DisplayBlock.Text },
             )
         }
     }

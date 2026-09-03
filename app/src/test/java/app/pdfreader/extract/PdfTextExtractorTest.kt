@@ -368,6 +368,143 @@ class PdfTextExtractorTest {
         assertFalse(PdfTextExtractor.hasColumnGap(lines))
     }
 
+    // ---- hasLabelColumnWithSideContent：2026-09-03 真机反馈"这本书当前页文字
+    // 与图片分开显示，应该显示为图片"，排查到"CPS 热分析"页的三栏"分类标签+
+    // 产品名徽章+短语列表"版式，hasColumnGap/hasScatteredLayout 都测不出来，
+    // 见 PdfTextExtractor.hasLabelColumnWithSideContent KDoc 完整背景 ----
+
+    /**
+     * 真机页面简化复现：右栏 6 条短语精确对齐到同一个 startX（431.2，用真机
+     * 实测值），左边在这一列的 Y 范围内有 3 条不同的其它文字（"芯片级"/
+     * "Ansys RedHawk-3DIC"/"封装级"，同样取自真机数据）——精确等于
+     * [PdfTextExtractor] 内 `MIN_LABEL_COLUMN_LINES`=6 和 `MIN_LEFT_CONTENT_LINES`
+     * =3 两个门槛，应该判定为标签列。
+     */
+    @Test
+    fun `一列短语对齐同一X且左侧有其它内容时判定为标签列`() {
+        fun line(y: Float, startX: Float, endX: Float, text: String) =
+            PdfTextExtractor.Line(text, y, 16, startX = startX, endX = endX, pageWidth = 595.276f)
+        val phraseColumn = listOf(
+            line(180.5f, 431.2f, 476.6f, "信号功率EM"),
+            line(196.6f, 431.2f, 471.4f, "待机漏电流"),
+            line(212.6f, 431.2f, 463.3f, "时序影响"),
+            line(228.7f, 431.2f, 466.7f, "3DIC分析"),
+            line(280.9f, 431.2f, 464.1f, "CTA生成"),
+            line(296.9f, 431.2f, 495.5f, "芯片封装的热分析"),
+        )
+        val leftContent = listOf(
+            line(206.1f, 81.1f, 111.3f, "芯片级"),
+            line(207.9f, 233.7f, 390.0f, "Ansys RedHawk-3DIC"),
+            line(296.0f, 81.1f, 111.3f, "封装级"),
+        )
+        assertTrue(PdfTextExtractor.hasLabelColumnWithSideContent(phraseColumn + leftContent))
+    }
+
+    /**
+     * 反例（用户明确要求加的校验，防止误伤正常缩进列表）：同样是 6 条精确对齐
+     * 同一 startX 的短语，但左边是页面留白，没有别的内容——普通的缩进项目符号
+     * 列表几何上就长这样，不该被判定为标签列，不然能调字号的正常列表会被
+     * 误伤成整页栅格化。
+     */
+    @Test
+    fun `缩进列表左边是页面留白没有其它内容时不判定为标签列`() {
+        val lines = (0 until 6).map { i ->
+            PdfTextExtractor.Line("列表项$i", 180f + i * 16f, 1, startX = 90f, endX = 260f, pageWidth = 595.276f)
+        }
+        assertFalse(PdfTextExtractor.hasLabelColumnWithSideContent(lines))
+    }
+
+    /**
+     * 边界值：左侧内容只有 2 条，低于 [PdfTextExtractor] 内
+     * `MIN_LEFT_CONTENT_LINES`=3——确认门槛不是形同虚设，差一条也不该命中。
+     */
+    @Test
+    fun `左侧内容条数不足门槛时不判定为标签列`() {
+        fun line(y: Float, startX: Float, endX: Float, text: String) =
+            PdfTextExtractor.Line(text, y, 16, startX = startX, endX = endX, pageWidth = 595.276f)
+        val phraseColumn = listOf(
+            line(180.5f, 431.2f, 476.6f, "信号功率EM"),
+            line(196.6f, 431.2f, 471.4f, "待机漏电流"),
+            line(212.6f, 431.2f, 463.3f, "时序影响"),
+            line(228.7f, 431.2f, 466.7f, "3DIC分析"),
+            line(280.9f, 431.2f, 464.1f, "CTA生成"),
+            line(296.9f, 431.2f, 495.5f, "芯片封装的热分析"),
+        )
+        val leftContent = listOf(
+            line(206.1f, 81.1f, 111.3f, "芯片级"),
+            line(207.9f, 233.7f, 390.0f, "Ansys RedHawk-3DIC"),
+        )
+        assertFalse(PdfTextExtractor.hasLabelColumnWithSideContent(phraseColumn + leftContent))
+    }
+
+    /**
+     * 边界值：对齐同一 X 的短语只有 5 条，低于 [PdfTextExtractor] 内
+     * `MIN_LABEL_COLUMN_LINES`=6——就算左侧内容足够，行数不够也不该命中。
+     */
+    @Test
+    fun `对齐同一X的短语条数不足门槛时不判定为标签列`() {
+        fun line(y: Float, startX: Float, endX: Float, text: String) =
+            PdfTextExtractor.Line(text, y, 16, startX = startX, endX = endX, pageWidth = 595.276f)
+        val phraseColumn = listOf(
+            line(180.5f, 431.2f, 476.6f, "信号功率EM"),
+            line(196.6f, 431.2f, 471.4f, "待机漏电流"),
+            line(212.6f, 431.2f, 463.3f, "时序影响"),
+            line(228.7f, 431.2f, 466.7f, "3DIC分析"),
+            line(280.9f, 431.2f, 464.1f, "CTA生成"),
+        )
+        val leftContent = listOf(
+            line(206.1f, 81.1f, 111.3f, "芯片级"),
+            line(207.9f, 233.7f, 390.0f, "Ansys RedHawk-3DIC"),
+            line(296.0f, 81.1f, 111.3f, "封装级"),
+        )
+        assertFalse(PdfTextExtractor.hasLabelColumnWithSideContent(phraseColumn + leftContent))
+    }
+
+    @Test
+    fun `pageWidth为0（旧数据没有坐标信息）时不判定为标签列`() {
+        val lines = (0 until 8).map { PdfTextExtractor.Line("行$it", 100f + it * 20f, 1) }
+        assertFalse(PdfTextExtractor.hasLabelColumnWithSideContent(lines))
+    }
+
+    // ---- isDecorativeSymbolFont：2026-09-03 真机反馈"这本书里出现了很多单行的
+    // 'l'和'O'"（另一份大型技术手册 HFSS.pdf，流程步骤列表每一步之间插了个孤立
+    // 字母 l）——用独立的 poppler pdftotext 交叉核实过同样提取出"l"，排除了
+    // PdfBox-Android 自己映射错的可能；加诊断实锤这些"l"全部来自 Wingdings 图标
+    // 字体（键位对应箭头图标，不是字母 L 本身，ToUnicode 映射表如实记录"这是
+    // l 键位"但这串数据从设计上就不是给人读的语义文字）。见 PdfTextExtractor
+    // .isDecorativeSymbolFont KDoc 完整背景 ----
+
+    @Test
+    fun `Wingdings字体判定为装饰性图标字体`() {
+        assertTrue(PdfTextExtractor.isDecorativeSymbolFont("ERXUTR+Wingdings-Regular"))
+        assertTrue(PdfTextExtractor.isDecorativeSymbolFont("Wingdings"))
+        assertTrue(PdfTextExtractor.isDecorativeSymbolFont("wingdings-bold"))
+    }
+
+    @Test
+    fun `Webdings字体判定为装饰性图标字体`() {
+        assertTrue(PdfTextExtractor.isDecorativeSymbolFont("Webdings"))
+    }
+
+    /**
+     * 反例（用户明确要求的边界，见 [PdfTextExtractor.isDecorativeSymbolFont]
+     * KDoc"不能用过滤 Symbol 字体这种更简单粗暴的思路"一节）：`Symbol` 字体在
+     * 真机这份技术手册里被大量用来排版真实的希腊字母/数学符号变量（α/β/ω 等
+     * 公式里的物理量），是有意义的正文内容，不能被误伤——判断条件必须精确匹配
+     * "Wingdings"/"Webdings" 这两个具体字体家族名，不能扩大化到"任何非标准字体"。
+     */
+    @Test
+    fun `Symbol字体不判定为装饰性图标字体（会误删真实希腊字母公式内容）`() {
+        assertFalse(PdfTextExtractor.isDecorativeSymbolFont("Symbol"))
+    }
+
+    @Test
+    fun `普通字体不判定为装饰性图标字体`() {
+        assertFalse(PdfTextExtractor.isDecorativeSymbolFont("Helvetica"))
+        assertFalse(PdfTextExtractor.isDecorativeSymbolFont("SimHei"))
+        assertFalse(PdfTextExtractor.isDecorativeSymbolFont(null))
+    }
+
     /**
      * [PdfTextExtractor.classifyHeadings] 的单元测试——用户明确选择的策略："字号
      * 明显偏大 或 字体本身加粗，两个信号满足一个就算标题"（见该函数 KDoc）。

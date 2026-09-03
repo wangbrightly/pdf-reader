@@ -84,4 +84,113 @@ class CompactListParagraphSplitTest {
             secondNaturalParagraph,
         )
     }
+
+    // ---- 2026-09-03 真机反馈修复"这本书里出现了很多单行的'o'"（HFSS.pdf，跟同一次
+    // 会话里"l"的 Wingdings 图标字体问题不是同一回事，这次是 Courier New 字体，
+    // 作者真的手打了字母 o 当项目符号）——见 PdfTextExtractor.isBulletMarker /
+    // linesToParagraphs KDoc"2026-09-03 补丁"一节完整背景。以下坐标全部取自真机
+    // HFSS.pdf 第 120 页的真实提取数据（612pt 宽 letter 页面），不是构造的数字 ----
+
+    private fun line(y: Float, startX: Float, endX: Float, text: String, fontSize: Float = 14f) =
+        PdfTextExtractor.Line(text, y, 120, fontSize = fontSize, startX = startX, endX = endX, pageWidth = 612f)
+
+    /**
+     * 真机复现：第一个 `o` 项目符号（y=509.82，宽度只有 4.5pt）后面跟着一句会
+     * 换行成两行的长内容——这一条在改动前就能正常合并（`isShortLine` 对长内容
+     * 那一行本来就是 false，不满足"连续两行都短"），改动后不该变化，是回归
+     * 保护，不是新增能力。
+     */
+    @Test
+    fun `项目符号后面接会换行的长内容时正常合并（改动前后行为一致）`() {
+        val lines = listOf(
+            line(509.82f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(512.83f, 119.3f, 532.0f, "Draw a segmented version of the ogive geometry using an equation based curve as its"),
+            line(527.08f, 119.3f, 144.9f, "basis"),
+        )
+        val paragraphs = PdfTextExtractor.linesToParagraphs(lines)
+        assertEquals("三行应该合并成一段", 1, paragraphs.size)
+        assertEquals(
+            "o Draw a segmented version of the ogive geometry using an equation based curve as its basis",
+            paragraphs[0].text,
+        )
+    }
+
+    /**
+     * 真机反馈的真正 bug：`o` 项目符号后面接的内容如果本身能塞进一行（不需要
+     * 换行），"符号"和"内容"就都满足 [PdfTextExtractor] 内 `isShortLine`，被
+     * 旧逻辑当成"连续两个短列表项"切开，读起来变成孤零零的"o"单独一行。
+     * 用真机第二个符号原样的坐标复现（y=541.32/544.33）。
+     */
+    @Test
+    fun `项目符号后面接单行短内容时不再被错误切开`() {
+        val lines = listOf(
+            line(509.82f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(512.83f, 119.3f, 532.0f, "Draw a segmented version of the ogive geometry using an equation based curve as its"),
+            line(527.08f, 119.3f, 144.9f, "basis"),
+            line(541.32f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(544.33f, 119.3f, 251.3f, "Add an incident plane wave"),
+        )
+        val paragraphs = PdfTextExtractor.linesToParagraphs(lines)
+        assertEquals(
+            "应该是两段（两个列表项各自完整），实际=${paragraphs.size}：${paragraphs.map { it.text }}",
+            2,
+            paragraphs.size,
+        )
+        assertEquals("o Add an incident plane wave", paragraphs[1].text)
+    }
+
+    /**
+     * 真机完整 6 项列表复现（HFSS.pdf 第 120 页第二个符号开始的全部 6 项，
+     * 每一项内容都能塞进一行）——确认修复后每一项都正确带着自己的符号独立
+     * 成段，列表项之间该有的边界（符号跟"上一项"之间）依然正常切开，不是
+     * "干脆全部合并成一大段"这种矫枉过正的副作用。
+     */
+    @Test
+    fun `连续多个项目符号+单行内容 每项独立成段且都带着自己的符号`() {
+        val lines = listOf(
+            line(541.32f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(544.33f, 119.3f, 251.3f, "Add an incident plane wave"),
+            line(558.57f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(561.58f, 119.3f, 217.1f, "Assign an IE Region"),
+            line(575.82f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(578.83f, 119.3f, 298.4f, "Specify solution setting for the design"),
+            line(593.07f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(596.08f, 119.3f, 240.9f, "Run the HFSS simulation"),
+            line(610.32f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(613.33f, 119.3f, 305.7f, "Create a current overlay and animate it"),
+            line(627.57f, 106.9f, 111.4f, "o", fontSize = 10f),
+            line(630.58f, 119.3f, 262.3f, "Create a monostatic RCS plot"),
+        )
+        val paragraphs = PdfTextExtractor.linesToParagraphs(lines)
+        val texts = paragraphs.map { it.text }
+        assertEquals(
+            listOf(
+                "o Add an incident plane wave",
+                "o Assign an IE Region",
+                "o Specify solution setting for the design",
+                "o Run the HFSS simulation",
+                "o Create a current overlay and animate it",
+                "o Create a monostatic RCS plot",
+            ),
+            texts,
+        )
+    }
+
+    /**
+     * 反例：确认这次修复没有让真正的紧凑列表（普通短语，不是项目符号）退化——
+     * 复用类顶部注释描述的 `sample-compact-list.pdf` 那组真机校准数据规律
+     * （列表项 widthRatio 0.10~0.25），用两个"正常长度的短列表项"（不是单字符
+     * 符号）构造，确认它们依然会被 [PdfTextExtractor.isBulletMarker] 排除在外
+     * （宽度远超 [PdfTextExtractor] 内 `BULLET_MARKER_MAX_WIDTH_PT`=15pt），
+     * 该切开的边界还是会正常切开。
+     */
+    @Test
+    fun `两个真正的短列表项（不是符号）之间依然正常切开`() {
+        val lines = listOf(
+            line(100f, 60f, 160f, "第一章绪论"), // widthRatio (160-60)/612=0.163，真机同一量级
+            line(120f, 60f, 200f, "第二章相关工作"), // widthRatio (200-60)/612=0.229
+        )
+        val paragraphs = PdfTextExtractor.linesToParagraphs(lines)
+        assertEquals("两个短列表项应该保持独立成段，不该被新的符号例外误伤", 2, paragraphs.size)
+    }
 }
