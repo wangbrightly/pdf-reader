@@ -18,6 +18,13 @@ import org.robolectric.RobolectricTestRunner
  * 数学计算部分不需要 Robolectric，`Rect` 只是个纯数据容器，选它单纯是因为
  * [PdfTextExtractor.tableCropRect] 的返回类型已经是 `Rect`，不需要为了这条测试
  * 再引入一个自定义的四元组类型。
+ *
+ * 2026-09-04 追加 [PdfTextExtractor.cvRegionToTableRegion]（v0.3.0 路线 B）——同一类
+ * 坐标换算，只是输入换成了 [LayoutDetector] 的 [LayoutRegion]（bitmap 像素坐标）而
+ * 不是已经是 PDF 坐标的 [TableRegion]，Y 轴翻转公式跟上面两个函数完全一致。这段
+ * 数学是端到端真机测试（`LayoutDetectorRescueInstrumentedTest`）唯一没有真正走到过
+ * 的部分——那次真机测试因为 CV 没能识别出手写的无边框表格 fixture，提前在"没找到
+ * table"那步就返回了，这里补一层独立验证，不依赖真机/CV 能不能认出表格。
  */
 @RunWith(RobolectricTestRunner::class)
 class PdfTextExtractorTableRegionTest {
@@ -67,6 +74,69 @@ class PdfTextExtractorTableRegionTest {
         // 144dpi 是 72dpi 的两倍，裁剪矩形的宽高也应该大致翻倍（整数取整允许 1px 误差）。
         assertTrue(kotlin.math.abs(at144Dpi.width() - at72Dpi.width() * 2) <= 2)
         assertTrue(kotlin.math.abs(at144Dpi.height() - at72Dpi.height() * 2) <= 2)
+    }
+
+    // ---- cvRegionToTableRegion：v0.3.0 路线 B，见 PdfTextExtractor.cvRegionToTableRegion KDoc ----
+
+    @Test
+    fun `dpi=72时CV像素区域正确换算成PDF坐标区域`() {
+        // bitmap 像素坐标 (100,200)-(300,400)，页高 800，dpi=72（缩放系数 1）。
+        // Y 轴翻转：minY(PDF) = 页高 - bottom(像素) = 800-400=400；
+        //          maxY(PDF) = 页高 - top(像素) = 800-200=600。
+        val region = LayoutRegion(label = "table", score = 0.9f, left = 100f, top = 200f, right = 300f, bottom = 400f)
+        val result = PdfTextExtractor.cvRegionToTableRegion(
+            region,
+            bitmapWidth = 1000,
+            bitmapHeight = 1000,
+            pageHeightPt = 800f,
+            dpi = 72f,
+        )
+        assertEquals(TableRegion(minX = 100f, minY = 400f, maxX = 300f, maxY = 600f), result)
+    }
+
+    @Test
+    fun `区域几乎占满全页时返回null不采纳`() {
+        // 宽高都覆盖到 96%（超过 0.95 阈值），两个维度都要满足才拒绝。
+        val region = LayoutRegion(label = "table", score = 0.9f, left = 10f, top = 10f, right = 970f, bottom = 970f)
+        val result = PdfTextExtractor.cvRegionToTableRegion(
+            region,
+            bitmapWidth = 1000,
+            bitmapHeight = 1000,
+            pageHeightPt = 800f,
+            dpi = 72f,
+        )
+        assertEquals(null, result)
+    }
+
+    @Test
+    fun `只有单个维度接近占满全页时不拒绝，因为两个维度都要满足才算占满`() {
+        // 宽度覆盖 96%，但高度只覆盖 50%——不该被当成"整页误判"拒绝，这是一条
+        // 横跨全页宽度的正常表格（比如财务报表），不是设计稿式的整页背景。
+        val region = LayoutRegion(label = "table", score = 0.9f, left = 10f, top = 10f, right = 970f, bottom = 410f)
+        val result = PdfTextExtractor.cvRegionToTableRegion(
+            region,
+            bitmapWidth = 1000,
+            bitmapHeight = 1000,
+            pageHeightPt = 800f,
+            dpi = 72f,
+        )
+        assertTrue("宽度接近占满但高度不是，不应该被拒绝", result != null)
+    }
+
+    @Test
+    fun `dpi不是72时CV区域换算按比例缩放`() {
+        // dpi=144 时缩放系数是 2，像素坐标要先除以 2 才是 pt。
+        val region = LayoutRegion(label = "table", score = 0.9f, left = 200f, top = 400f, right = 600f, bottom = 800f)
+        val result = PdfTextExtractor.cvRegionToTableRegion(
+            region,
+            bitmapWidth = 2000,
+            bitmapHeight = 2000,
+            pageHeightPt = 800f,
+            dpi = 144f,
+        )
+        // minX=left/2=100, maxX=right/2=300；
+        // minY=页高-bottom/2=800-400=400, maxY=页高-top/2=800-200=600。
+        assertEquals(TableRegion(minX = 100f, minY = 400f, maxX = 300f, maxY = 600f), result)
     }
 
     @Test

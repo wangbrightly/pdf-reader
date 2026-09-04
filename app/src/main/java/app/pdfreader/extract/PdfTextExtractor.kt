@@ -1479,6 +1479,35 @@ object PdfTextExtractor {
         return lineYDirAdj in topYDirAdj..bottomYDirAdj
     }
 
+    /**
+     * v0.3.0 路线 B（见 [Session.tryLayoutDetectorRescue] KDoc）：把 [LayoutDetector]
+     * 输出的 [LayoutRegion]（bitmap 像素坐标，左上角原点，Y 向下）换算成
+     * [TableRegion]（PDF 坐标，左下角原点，Y 向上）——跟 [tableCropRect]/
+     * [isWithinTableBand] 同一套 `scale = dpi / 72`、"用页高减一下"的转换公式，
+     * 不是这里现推的。区域几乎占满全页（[TABLE_REGION_FULL_PAGE_REJECT_RATIO]，
+     * 跟几何检测那边判断"疑似整页误判"同一个阈值）时返回 `null`——这种情况不是
+     * 一个"可以裁一块图、旁边保留正文"的真表格，见 `loadPageLockedPhaseA` 里
+     * `tableRegionCoversFullPage` 那段 KDoc 同一类判断。
+     */
+    internal fun cvRegionToTableRegion(
+        region: LayoutRegion,
+        bitmapWidth: Int,
+        bitmapHeight: Int,
+        pageHeightPt: Float,
+        dpi: Float,
+    ): TableRegion? {
+        val coversFullPage = (region.right - region.left) / bitmapWidth >= TABLE_REGION_FULL_PAGE_REJECT_RATIO &&
+            (region.bottom - region.top) / bitmapHeight >= TABLE_REGION_FULL_PAGE_REJECT_RATIO
+        if (coversFullPage) return null
+        val scale = dpi / 72f
+        return TableRegion(
+            minX = region.left / scale,
+            minY = pageHeightPt - region.bottom / scale,
+            maxX = region.right / scale,
+            maxY = pageHeightPt - region.top / scale,
+        )
+    }
+
     /** [isSegmentOnPage] 允许线段端点超出页面边界一点点的容差（pt）。 */
     private const val PAGE_BOUNDS_TOLERANCE_PT = 1f
 
@@ -3111,7 +3140,11 @@ object PdfTextExtractor {
      * [loadPage] 内部调 [RunningFooterFilter.pageNoiseIndices] 直接查表——见
      * [RunningFooterFilter] 类注释"样本学习 + 按页应用"一节的完整设计理由和已知局限。
      */
-    class Session private constructor(private val document: PDDocument, private val file: File) : java.io.Closeable {
+    class Session private constructor(
+        private val document: PDDocument,
+        private val file: File,
+        private val layoutDetector: LayoutDetector?,
+    ) : java.io.Closeable {
         val pageCount: Int = document.numberOfPages
 
         /**
@@ -3475,6 +3508,62 @@ object PdfTextExtractor {
             }
         }.getOrNull()
 
+        /**
+         * v0.3.0 路线 B（见 `V0.3-DECISION.md`）：[hasScatteredLayout]/
+         * [hasLabelColumnWithSideContent] 触发整页栅格化之前，先问一次
+         * [LayoutDetector] 这一页是不是其实有个 [TableGridDetector] 漏检的表格
+         * （无内部网格线/纯空白对齐——这两种表格几何规则测不出来，但表格本身
+         * "每行多个单元格"这个形状恰好会误触发这两条"同一 Y 多条文字"类的信号，
+         * 见两者各自 KDoc）。范围刻意收紧——**只处理"表格被误判成整页栅格化"
+         * 这一种局限**，不处理"表格完全没触发任何信号、被静默按普通文字拆散
+         * 重排"那一种（已知局限清单里独立的一条，这次不动），2026-09-04 跟用户
+         * 确认过这个范围。
+         *
+         * 只在还没有任何 [TableRegion]（[currentTableRegion] 为 `null`）时才
+         * 尝试——整个裁剪机制（[tableCropRect]/[ImagePlacement.afterParagraphIndexForRegion]）
+         * 从设计上就只支持一页一个表格区域，跟已有的几何检测分支同一个架构
+         * 限制，不是这次新引入的。
+         *
+         * 找到候选区域后必须验证它真的解决了问题——传入的 [stillTriggers] 用
+         * 排除掉候选区域之后的行重新跑一遍原来触发栅格化的那个判断，**只有
+         * 不再触发才采纳**，避免"表格是找到了，但页面剩下的部分本来就还有别的
+         * 问题"这种情况被误判成"已经解决"。任何一步失败（模型没加载成功、
+         * 渲染失败、没有过阈值的 `table`、区域几乎占满全页、排除区域后信号
+         * 依然触发）都返回 `null`——调用方据此维持今天的行为（整页栅格化），
+         * 这条路径设计上只能让结果变好，不能变差。
+         *
+         * 用 [renderPageWithAndroidPdfRenderer]（pdfium）渲一次图喂给模型，
+         * 检测完立刻回收——跟下面真正裁剪时（`tableRegion != null` 分支）
+         * 用 PdfBox 自己的 `PDFRenderer` 是两次独立的渲染，没有复用同一张图。
+         * 这份代价只发生在已经准备要整页栅格化兜底的稀有页面上，不影响正常
+         * 翻页路径（见 [LayoutDetector] 类 KDoc"耗时"一节，单页推理约 305ms，
+         * 不能对每一页都跑）。
+         */
+        private fun tryLayoutDetectorRescue(
+            pageNo: Int,
+            pageHeight: Float,
+            currentTableRegion: TableRegion?,
+            currentNonTableLines: List<Line>,
+            stillTriggers: (List<Line>) -> Boolean,
+        ): TableRegion? {
+            if (currentTableRegion != null) return null
+            val detector = layoutDetector ?: return null
+            val bitmap = renderPageWithAndroidPdfRenderer(pageNo) ?: return null
+            val bitmapWidth = bitmap.width
+            val bitmapHeight = bitmap.height
+            val best = runCatching { detector.detect(bitmap) }.getOrDefault(emptyList())
+                .filter { it.label == "table" }
+                .maxByOrNull { it.score }
+            bitmap.recycle()
+            if (best == null) return null
+
+            val candidateRegion = cvRegionToTableRegion(best, bitmapWidth, bitmapHeight, pageHeight, TABLE_PAGE_RENDER_DPI)
+                ?: return null
+            val candidateNonTableLines = currentNonTableLines.filterNot { isWithinTableBand(it.y, candidateRegion, pageHeight) }
+            if (stillTriggers(candidateNonTableLines)) return null
+            return candidateRegion
+        }
+
         private fun loadPageLockedPhaseA(pageNo: Int): PageLoadPhaseA {
             // 2026-08-20 临时诊断日志：追查真机反馈"这本书打开后翻某些页要好几秒"——
             // 拆开量每一步耗时，看是矢量扫描/表格检测慢，还是文字抽取本身慢，定位完
@@ -3623,7 +3712,9 @@ object PdfTextExtractor {
                 renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
                 return PageLoadPhaseA.Complete(PageContent(blocks))
             }
-            val tableRegion = rawTableRegion
+            // v0.3.0 路线 B：`var` 不是 `val`——[tryLayoutDetectorRescue] 成功时会把
+            // CV 找到的表格区域赋进来，见下面两处调用点。
+            var tableRegion = rawTableRegion
             val hasImages = scanResult.second
             val tAfterTableDetect = System.currentTimeMillis()
             if (tAfterTableDetect - tPageStart > 300) {
@@ -3650,7 +3741,9 @@ object PdfTextExtractor {
                         "占满全页图片=$scanHasFullPageImage",
                 )
             }
-            val nonTableLines = if (tableRegion != null) {
+            // v0.3.0 路线 B：同上，`var`——两处 CV 救援成功时会重新算一遍，排除掉
+            // 新采纳的表格区域。
+            var nonTableLines = if (tableRegion != null) {
                 onPageLines.filterNot { isWithinTableBand(it.y, tableRegion, pageHeight) }
             } else {
                 onPageLines
@@ -3662,17 +3755,37 @@ object PdfTextExtractor {
             // 排除表格之后仍然散乱的页面才整页栅格化，普通表格继续走下面精确裁剪
             // 的路径不受影响。
             if (hasScatteredLayout(nonTableLines)) {
-                val blocks = mutableListOf<DisplayBlock>()
-                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
-                return PageLoadPhaseA.Complete(PageContent(blocks))
+                // v0.3.0 路线 B：先问一次 CV 是不是漏检的表格造成的误触发，见
+                // [tryLayoutDetectorRescue] KDoc。救援成功就采纳新区域、重新算
+                // nonTableLines，落入下面正常流程（最终会走 tableRegion != null
+                // 那条精确裁剪分支）；失败维持原有的整页栅格化。
+                val rescued = tryLayoutDetectorRescue(pageNo, pageHeight, tableRegion, nonTableLines) { hasScatteredLayout(it) }
+                if (rescued != null) {
+                    tableRegion = rescued
+                    nonTableLines = nonTableLines.filterNot { isWithinTableBand(it.y, rescued, pageHeight) }
+                } else {
+                    val blocks = mutableListOf<DisplayBlock>()
+                    renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                    return PageLoadPhaseA.Complete(PageContent(blocks))
+                }
             }
 
             // 见 hasLabelColumnWithSideContent KDoc——跟 hasScatteredLayout 同一个
             // 理由，放在表格区域检测之后、只查 nonTableLines。
             if (hasLabelColumnWithSideContent(nonTableLines)) {
-                val blocks = mutableListOf<DisplayBlock>()
-                renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
-                return PageLoadPhaseA.Complete(PageContent(blocks))
+                // v0.3.0 路线 B：同上一条，`tryLayoutDetectorRescue` 内部已经会在
+                // tableRegion 非空（上面 hasScatteredLayout 那次已经救援成功）时
+                // 直接返回 null——一页只支持一个表格区域，不会覆盖掉上一次救援
+                // 的结果，见该函数 KDoc。
+                val rescued = tryLayoutDetectorRescue(pageNo, pageHeight, tableRegion, nonTableLines) { hasLabelColumnWithSideContent(it) }
+                if (rescued != null) {
+                    tableRegion = rescued
+                    nonTableLines = nonTableLines.filterNot { isWithinTableBand(it.y, rescued, pageHeight) }
+                } else {
+                    val blocks = mutableListOf<DisplayBlock>()
+                    renderPageWithAndroidPdfRenderer(pageNo)?.let { blocks.add(DisplayBlock.Image(it)) }
+                    return PageLoadPhaseA.Complete(PageContent(blocks))
+                }
             }
 
             val rawParagraphs = linesToParagraphs(nonTableLines)
@@ -3780,6 +3893,7 @@ object PdfTextExtractor {
 
         override fun close() {
             document.close()
+            layoutDetector?.close()
         }
 
         companion object {
@@ -3804,7 +3918,12 @@ object PdfTextExtractor {
                 // 设置。如实记录：`PDDocument.load` 本身的耗时目前没找到有效的优化
                 // 手段，留给以后有需要再查（见 NOTES.md 对应条目）。
                 val document = PDDocument.load(file)
-                val session = Session(document, file)
+                // v0.3.0 路线 B（见 [Session.tryLayoutDetectorRescue] KDoc）：加载失败
+                // （比如这台设备的 ABI 不支持 native 库）时 [LayoutDetector.open] 返回
+                // `null`，这里不 fallback 到别的方案、也不报错——[tryLayoutDetectorRescue]
+                // 已经把 `null` 当成"这条路径用不了，维持现有行为"处理。
+                val layoutDetector = LayoutDetector.open(context)
+                val session = Session(document, file, layoutDetector)
                 // 见 footerLearnedTitles/outline 字段 KDoc——两个都放后台跑，不阻塞
                 // Session.open() 本身返回，这样调用方（MainActivity.loadPdf）能尽快
                 // 显示内容。
