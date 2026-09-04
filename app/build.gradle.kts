@@ -105,4 +105,11 @@ dependencies {
     // 测试框架（这份测试不碰任何 View，用不上）。
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
+
+    // v0.3.0 路线 B 可行性探针（见 V0.3-DECISION.md）：CV 版面检测（PP-DocLayout-M）
+    // 能不能在目标机型（骁龙 8+ Gen 1）上跑得够快、bbox 精度够不够用，先用一次
+    // instrumented test 验证再决定要不要投入正式实现。只放在 androidTest 范围，
+    // 探针通过之前不进 main 依赖（不影响正式发布的 APK 体积）。
+    // MIT 许可证，aar 约 26.5MB（Maven Central，2026-09-04 核实）。
+    androidTestImplementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
 }
