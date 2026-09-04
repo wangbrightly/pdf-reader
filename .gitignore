@@ -22,5 +22,3 @@ build/
 # 第三方 APK 反编译产物（版权归对方，只临时用于技术调研，不留存）
 .research/
 
-# v0.3.0 路线 B 探针用的 ONNX 模型（22MB+，可重新下载，不入库，见 V0.3-DECISION.md）
-app/src/androidTest/assets/*.onnx

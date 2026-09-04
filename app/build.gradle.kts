@@ -68,6 +68,14 @@ dependencies {
     // 构建+真机解码，POC 通过再决定是否正式接入、要不要换 1.1.0。
     implementation("io.github.michaldvorak-gemalto:jp2-android:1.0.5")
 
+    // v0.3.0 路线 B（见 V0.3-DECISION.md）：CV 版面检测，PP-DocLayout-M（Apache-2.0，
+    // 百度 PaddleOCR/PaddleX 生态，社区转换的 ONNX 版本，见 LayoutDetector.kt 顶部
+    // KDoc 完整 provenance）。2026-09-04 真机探针验证过可行（骁龙 8+ Gen 1 单页推理
+    // 约 305ms，对表格测出 94.3% 置信度），从探针阶段的 androidTestImplementation
+    // 转正为 implementation——探针用的模型文件也从 androidTest/assets 挪到了
+    // main/assets（要打进正式 APK）。MIT 许可证，aar 约 26.5MB。
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
+
     testImplementation("junit:junit:4.13.2")
 
     // 只在测试范围（不打进 APK）——用来交叉验证 [Jbig2GenericRegionDecoder]（自己
@@ -105,11 +113,4 @@ dependencies {
     // 测试框架（这份测试不碰任何 View，用不上）。
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
-
-    // v0.3.0 路线 B 可行性探针（见 V0.3-DECISION.md）：CV 版面检测（PP-DocLayout-M）
-    // 能不能在目标机型（骁龙 8+ Gen 1）上跑得够快、bbox 精度够不够用，先用一次
-    // instrumented test 验证再决定要不要投入正式实现。只放在 androidTest 范围，
-    // 探针通过之前不进 main 依赖（不影响正式发布的 APK 体积）。
-    // MIT 许可证，aar 约 26.5MB（Maven Central，2026-09-04 核实）。
-    androidTestImplementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
 }
