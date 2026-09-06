@@ -181,6 +181,136 @@ class PdfTextExtractorTest {
         assertEquals("对1.5GHz 带高速锁定PLL 合成器锁定前的情况进行瞬态分析，", merged[0].text)
     }
 
+    // ---- absorbSuperscriptSubscriptRuns：2026-09-07 借鉴 mj_pdf 的上标/下标识别，范围收窄到纯数字 ----
+
+    /**
+     * 合成场景：正文"电阻值为R"后紧跟一个物理位置更高、字号更小的纯数字"2"
+     * （模拟上标，比如"R²"）。y=97 比正文 y=100 小 3——见
+     * [PdfTextExtractor.absorbSuperscriptSubscriptRuns] KDoc"y 符号方向"一节的
+     * 实测结论，y 更小＝物理位置更高＝上标。
+     */
+    @Test
+    fun `y更小字号更小的紧邻纯数字游程判定为上标并转换成Unicode上标字符`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("电阻值为R", 100f, 1, fontSize = 12f, startX = 100f, endX = 160f, pageWidth = 595f),
+            PdfTextExtractor.Line("2", 97f, 1, fontSize = 8f, startX = 160.5f, endX = 165f, pageWidth = 595f),
+        )
+
+        val result = PdfTextExtractor.absorbSuperscriptSubscriptRuns(lines)
+
+        assertEquals("上标应该被吸收进上一行，不产出独立的 Line", 1, result.size)
+        assertEquals("电阻值为R²", result[0].text)
+        assertEquals("吸收后 endX 应该更新成上标游程的 endX，方便后续文字续接", 165f, result[0].endX)
+    }
+
+    /**
+     * 合成场景：正文"H"后紧跟一个物理位置更低、字号更小的纯数字"2"（模拟下标，
+     * 比如"H₂"）。y=103 比正文 y=100 大 3——y 更大＝物理位置更低＝下标。
+     */
+    @Test
+    fun `y更大字号更小的紧邻纯数字游程判定为下标并转换成Unicode下标字符`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("H", 100f, 1, fontSize = 12f, startX = 100f, endX = 108f, pageWidth = 595f),
+            PdfTextExtractor.Line("2", 103f, 1, fontSize = 8f, startX = 108.5f, endX = 113f, pageWidth = 595f),
+        )
+
+        val result = PdfTextExtractor.absorbSuperscriptSubscriptRuns(lines)
+
+        assertEquals(1, result.size)
+        assertEquals("H₂", result[0].text)
+    }
+
+    /**
+     * 非数字的上下标（英文序数词"4th"里的"th"）不处理——见
+     * [PdfTextExtractor.absorbSuperscriptSubscriptRuns] KDoc"已知局限"一节：
+     * Unicode 没有完整的字母上标字符集，宁可保持原样也不硬凑视觉相似字符。
+     */
+    @Test
+    fun `非数字的小字号偏移游程不转换保持独立的Line`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("4", 100f, 1, fontSize = 12f, startX = 100f, endX = 106f, pageWidth = 595f),
+            PdfTextExtractor.Line("th", 97f, 1, fontSize = 8f, startX = 106.5f, endX = 114f, pageWidth = 595f),
+        )
+
+        val result = PdfTextExtractor.absorbSuperscriptSubscriptRuns(lines)
+
+        assertEquals("非数字游程不该被吸收，应该保持两条独立的 Line", 2, result.size)
+        assertEquals("4", result[0].text)
+        assertEquals("th", result[1].text)
+    }
+
+    /**
+     * 反例：y 偏移几乎为 0（[PdfTextExtractor] 里 `mergeSameLineRuns` 判断"同一行"
+     * 的场景，中英文混排字体切换），不该被误判成上下标——这两个函数的判定范围
+     * 必须互斥，交给 [PdfTextExtractor.mergeSameLineRuns] 自己的逻辑处理。
+     */
+    @Test
+    fun `y偏移几乎为0的正常同行字体切换不会被误判成上下标`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("对", 154.83661f, 1, fontSize = 12f, startX = 100f, endX = 108f, pageWidth = 595f),
+            PdfTextExtractor.Line("1.5GHz", 154.83661f, 1, fontSize = 12f, startX = 108.5f, endX = 140f, pageWidth = 595f),
+        )
+
+        val result = PdfTextExtractor.absorbSuperscriptSubscriptRuns(lines)
+
+        assertEquals("y 几乎相同的正常段内切换不属于这个函数的判定范围", 2, result.size)
+    }
+
+    /**
+     * 反例：垂直偏移过大（超过正文字号的 [PdfTextExtractor] 内部阈值倍数），
+     * 更可能是真的另起一行（比如巧合出现在紧邻位置的短标签），不该被强行吸收。
+     */
+    @Test
+    fun `垂直偏移过大时不判定为上下标`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("正文", 100f, 1, fontSize = 12f, startX = 100f, endX = 120f, pageWidth = 595f),
+            PdfTextExtractor.Line("5", 80f, 1, fontSize = 8f, startX = 120.5f, endX = 125f, pageWidth = 595f),
+        )
+
+        val result = PdfTextExtractor.absorbSuperscriptSubscriptRuns(lines)
+
+        assertEquals("偏移过大应该当成另起一行，不吸收", 2, result.size)
+    }
+
+    /**
+     * 反例：x 距离太远（比如巧合出现在下一栏、恰好数字+小字号+有点垂直偏移的
+     * 内容），不该被跨栏吸收。
+     */
+    @Test
+    fun `x距离太远时不判定为上下标`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("正文", 100f, 1, fontSize = 12f, startX = 100f, endX = 120f, pageWidth = 595f),
+            PdfTextExtractor.Line("5", 97f, 1, fontSize = 8f, startX = 300f, endX = 305f, pageWidth = 595f),
+        )
+
+        val result = PdfTextExtractor.absorbSuperscriptSubscriptRuns(lines)
+
+        assertEquals("x 距离太远应该当成独立内容，不吸收", 2, result.size)
+    }
+
+    /**
+     * 端到端组合：上标数字之后紧跟回到正文基线的正常文字（比如"R² 是电阻"），
+     * 验证 [PdfTextExtractor.absorbSuperscriptSubscriptRuns] 更新的 endX 能让
+     * [PdfTextExtractor.mergeSameLineRuns] 正常把后续文字接上，不会被上标的 y
+     * 偏移打断——见 [PdfTextExtractor.absorbSuperscriptSubscriptRuns] KDoc 里
+     * "吸收后把上一行的 endX 更新成……" 这一段设计意图。
+     */
+    @Test
+    fun `上标后紧跟的正文能被mergeSameLineRuns正常接上不被y偏移打断`() {
+        val lines = listOf(
+            PdfTextExtractor.Line("R", 100f, 1, fontSize = 12f, startX = 100f, endX = 108f, pageWidth = 595f),
+            PdfTextExtractor.Line("2", 97f, 1, fontSize = 8f, startX = 108.5f, endX = 113f, pageWidth = 595f),
+            PdfTextExtractor.Line("是电阻", 100f, 1, fontSize = 12f, startX = 113.5f, endX = 150f, pageWidth = 595f),
+        )
+
+        val merged = PdfTextExtractor.mergeSameLineRuns(PdfTextExtractor.absorbSuperscriptSubscriptRuns(lines))
+
+        // appendLine 的 CJK 边界规则：'²'（非 CJK）和'是'（CJK）中间不加空格，
+        // 见 [PdfTextExtractor.appendLine]。
+        assertEquals("上标加后续正文最终应该合并成一行", 1, merged.size)
+        assertEquals("R²是电阻", merged[0].text)
+    }
+
     // ---- hasColumnGap：2026-08-28 真机反馈（"图片和文字分开了"，用户拍板不重排、识别到就整页栅格化）----
 
     /**
@@ -508,10 +638,14 @@ class PdfTextExtractorTest {
     /**
      * [PdfTextExtractor.classifyHeadings] 的单元测试——用户明确选择的策略："字号
      * 明显偏大 或 字体本身加粗，两个信号满足一个就算标题"（见该函数 KDoc）。
+     *
+     * 2026-09-06：返回值从 Boolean 升级成分级 Int（0=不是标题，1/2/3=级别，1 最大），
+     * 下面几条历史测试的断言从 true/false 改成对应的级别数值，判断逻辑本身没变。
      */
     @Test
     fun `字号明显大于本页中位数时判定为标题`() {
         val paragraphs = listOf(
+            // 24/12=2.0，超过 H1 门槛 1.7，判定 H1（级别 1）。
             PdfTextExtractor.Paragraph("标题", page = 1, topY = 0f, fontSize = 24f, isBold = false),
             PdfTextExtractor.Paragraph("正文一", page = 1, topY = 30f, fontSize = 12f, isBold = false),
             PdfTextExtractor.Paragraph("正文二", page = 1, topY = 60f, fontSize = 12f, isBold = false),
@@ -519,11 +653,35 @@ class PdfTextExtractorTest {
 
         val result = PdfTextExtractor.classifyHeadings(paragraphs)
 
-        assertEquals(listOf(true, false, false), result)
+        assertEquals(listOf(1, 0, 0), result)
     }
 
     @Test
-    fun `字号跟正文差不多但标了加粗时也判定为标题`() {
+    fun `字号比例落在三档分级门槛之间时各自归到对应级别`() {
+        val paragraphs = listOf(
+            // 12*1.7=20.4，21 超过 H1 门槛，级别 1。
+            PdfTextExtractor.Paragraph("一级标题", page = 1, topY = 0f, fontSize = 21f, isBold = false),
+            // 12*1.4=16.8，17 超过 H2 门槛但不到 H1，级别 2。
+            PdfTextExtractor.Paragraph("二级标题", page = 1, topY = 30f, fontSize = 17f, isBold = false),
+            // 12*1.15=13.8，14 超过 H3 门槛但不到 H2，级别 3。
+            PdfTextExtractor.Paragraph("三级标题", page = 1, topY = 60f, fontSize = 14f, isBold = false),
+            // 正文段落故意占多数（4 段 vs 3 段标题）——中位数基准取的是全部段落
+            // 字号排序后正中间那个值，标题段落一多，中位数会被推离真实的"正文该
+            // 多大"，这条测试如果只放 2 段正文会让中位数变成 14 而不是 12，见
+            // 这次改动踩过的坑（第一版这里只放了 2 段正文，测试红了才发现）。
+            PdfTextExtractor.Paragraph("正文一", page = 1, topY = 90f, fontSize = 12f, isBold = false),
+            PdfTextExtractor.Paragraph("正文二", page = 1, topY = 120f, fontSize = 12f, isBold = false),
+            PdfTextExtractor.Paragraph("正文三", page = 1, topY = 150f, fontSize = 12f, isBold = false),
+            PdfTextExtractor.Paragraph("正文四", page = 1, topY = 180f, fontSize = 12f, isBold = false),
+        )
+
+        val result = PdfTextExtractor.classifyHeadings(paragraphs)
+
+        assertEquals(listOf(1, 2, 3, 0, 0, 0, 0), result)
+    }
+
+    @Test
+    fun `字号跟正文差不多但标了加粗时归到最小一级`() {
         val paragraphs = listOf(
             PdfTextExtractor.Paragraph("加粗小标题", page = 1, topY = 0f, fontSize = 12f, isBold = true),
             PdfTextExtractor.Paragraph("正文一", page = 1, topY = 30f, fontSize = 12f, isBold = false),
@@ -532,7 +690,7 @@ class PdfTextExtractorTest {
 
         val result = PdfTextExtractor.classifyHeadings(paragraphs)
 
-        assertEquals(listOf(true, false, false), result)
+        assertEquals(listOf(3, 0, 0), result)
     }
 
     @Test
@@ -546,7 +704,7 @@ class PdfTextExtractorTest {
 
         val result = PdfTextExtractor.classifyHeadings(paragraphs)
 
-        assertEquals(listOf(false, false, false), result)
+        assertEquals(listOf(0, 0, 0), result)
     }
 
     @Test
@@ -554,7 +712,7 @@ class PdfTextExtractorTest {
         val bold = listOf(PdfTextExtractor.Paragraph("独占一页的加粗文字", page = 1, topY = 0f, fontSize = 12f, isBold = true))
         val notBold = listOf(PdfTextExtractor.Paragraph("独占一页的普通文字", page = 1, topY = 0f, fontSize = 12f, isBold = false))
 
-        assertEquals(listOf(true), PdfTextExtractor.classifyHeadings(bold))
-        assertEquals(listOf(false), PdfTextExtractor.classifyHeadings(notBold))
+        assertEquals(listOf(3), PdfTextExtractor.classifyHeadings(bold))
+        assertEquals(listOf(0), PdfTextExtractor.classifyHeadings(notBold))
     }
 }

@@ -45,11 +45,13 @@ import java.util.concurrent.atomic.AtomicLong
  * 不适合让 `Adapter` 自己持有一份可能过期的设置快照。[blockSpacingDpProvider] 同理，
  * 段距现在是设置面板里可拖动的值（见 `ReaderSettings.blockSpacingDp`），每次绑定
  * 都要读最新值，不能在构造时存成快照。[createParagraphView] 的第二个参数
- * （2026-08-20 新增）是 [DisplayBlock.Text.isHeading]，是否加粗由调用方决定。
+ * （2026-08-20 新增，2026-09-06 从 Boolean 升级成分级 Int）是
+ * [DisplayBlock.Text.headingLevel]，具体字号/字重由调用方决定；第三个参数
+ * （2026-09-06 新增）是 [DisplayBlock.Text.isCode]，是否用等宽字体展示。
  */
 class PdfPageAdapter(
     private val session: PdfTextExtractor.Session,
-    private val createParagraphView: (String, Boolean) -> View,
+    private val createParagraphView: (String, Int, Boolean) -> View,
     private val createImageView: (Bitmap) -> View,
     private val blockSpacingDpProvider: () -> Int,
 ) : RecyclerView.Adapter<PdfPageAdapter.PageViewHolder>() {
@@ -289,7 +291,7 @@ class PdfPageAdapter(
         val spacingDp = blockSpacingDpProvider()
         blocks.forEach { block ->
             val view = when (block) {
-                is DisplayBlock.Text -> createParagraphView(block.text, block.isHeading)
+                is DisplayBlock.Text -> createParagraphView(block.text, block.headingLevel, block.isCode)
                 is DisplayBlock.Image -> createImageView(block.bitmap)
             }
             if (container.childCount > 0) {
@@ -367,7 +369,7 @@ class PdfPageAdapter(
         val spacingDp = blockSpacingDpProvider()
         content.blocks.forEachIndexed { index, block ->
             val view = when (block) {
-                is DisplayBlock.Text -> createParagraphView(block.text, block.isHeading)
+                is DisplayBlock.Text -> createParagraphView(block.text, block.headingLevel, block.isCode)
                 is DisplayBlock.Image -> createImageView(block.bitmap)
             }
             if (index > 0) {

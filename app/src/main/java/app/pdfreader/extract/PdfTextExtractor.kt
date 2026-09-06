@@ -286,8 +286,27 @@ object PdfTextExtractor {
     /** 见 [Session.footerLearnedTitles] KDoc——页脚水印"标题类重复"检测的样本页数上限。 */
     private const val FOOTER_SAMPLE_PAGE_COUNT = 150
 
-    /** 见 [classifyHeadings] KDoc——字号超过本页中位数的这个倍数才算"明显偏大"。 */
-    private const val HEADING_FONT_SIZE_RATIO = 1.15f
+    /**
+     * 见 [classifyHeadings] KDoc"标题分级"一节——字号超过本页中位数的这个倍数才算
+     * "明显偏大"，判定为标题（不分级的情况下的历史唯一阈值）。2026-09-06 分级时
+     * 保留这个数值不变、定为 H3（最小一级）的下限——这个值是这个项目从上线时就在
+     * 用、真机验证过不会误判的门槛，分级不重新校准这一级，避免打破已经验证过的
+     * 行为。H2/H1 是新增的更高门槛，见下面两个常量，**没有真机大样本数据支撑**，
+     * 是在这个既有门槛基础上的合理外推（参考 mj_pdf 的 H1/H2/H3 三级比例阈值
+     * 1.35/1.18/1.08 这个"越往上级差越大"的分布规律，但没有照抄具体数值——那是
+     * 针对它自己的文档语料校准的，跟这个项目的字号分布未必一致），如果真机使用中
+     * 发现分级效果不合理，应该用真实文档的字号数据重新校准，不要凭感觉微调数值。
+     */
+    private const val HEADING_FONT_SIZE_RATIO_H3 = 1.15f
+
+    /** 见 [HEADING_FONT_SIZE_RATIO_H3] KDoc——H2 门槛，未经真机数据校准的外推值。 */
+    private const val HEADING_FONT_SIZE_RATIO_H2 = 1.4f
+
+    /** 见 [HEADING_FONT_SIZE_RATIO_H3] KDoc——H1（最大级）门槛，未经真机数据校准的外推值。 */
+    private const val HEADING_FONT_SIZE_RATIO_H1 = 1.7f
+
+    /** 见 [isMonospaceTextPosition] KDoc——字体描述符标志位缺失时的字体名兜底信号。 */
+    private val MONOSPACE_FONT_NAME_HINTS = listOf("Courier", "Mono", "Consolas")
 
     /**
      * 见 [linesToParagraphs] KDoc"紧凑列表识别"一节——一行文字的右边界不到页宽的
@@ -311,6 +330,33 @@ object PdfTextExtractor {
 
     /** 见 [mergeSameLineRuns] KDoc"2026-08-28 真机反馈修复"一节——同一视觉行内正常字体切换间隙实测 1.86~3.72pt，两栏标题间距实测约 203pt，阈值取在两者之间偏正常间隙一侧。 */
     private const val LINE_MERGE_MAX_X_GAP_PT = 20f
+
+    /**
+     * 见 [absorbSuperscriptSubscriptRuns] KDoc"检测条件"一节——上标/下标字号相对
+     * 正文的比例上限，参考 mj_pdf `SCRIPT_SIZE_FACTOR=0.85f` 这个量级，**没有本
+     * 项目真机数据支撑**，是外推值。
+     */
+    private const val SUPERSCRIPT_FONT_SIZE_RATIO = 0.85f
+
+    /**
+     * 见 [absorbSuperscriptSubscriptRuns] KDoc——判定"有真实的上下标垂直偏移"的
+     * 下限，必须明显大于 [mergeSameLineRuns] 判断"同一行"用的 0.01f 误差容忍度，
+     * 两者之间要留出清晰的分界，不能互相咬合。
+     */
+    private const val MIN_SCRIPT_Y_OFFSET_PT = 1f
+
+    /**
+     * 见 [absorbSuperscriptSubscriptRuns] KDoc——垂直偏移相对正文字号的比例上限，
+     * 超过这个量级更可能是真的另起一行（比如目录短标签），不该被强行吸收成
+     * 上下标。同样没有真机数据支撑，是合理外推值。
+     */
+    private const val SUPERSCRIPT_MAX_Y_OFFSET_FONT_SIZE_RATIO = 0.6f
+
+    /** 见 [absorbSuperscriptSubscriptRuns] KDoc——Unicode 上标数字 0-9，按位置对应数值，用于替换判定为上标的纯数字游程。 */
+    private const val SUPERSCRIPT_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹"
+
+    /** 见 [absorbSuperscriptSubscriptRuns] KDoc——Unicode 下标数字 0-9，按位置对应数值，用于替换判定为下标的纯数字游程。 */
+    private const val SUBSCRIPT_DIGITS = "₀₁₂₃₄₅₆₇₈₉"
 
     /** 见 [hasColumnGap] KDoc——真机两栏版式的栏间距实测约 33.47pt，同一页里巧合的小缺口（比如孤立的页码）实测约 13.6pt，阈值取在两者之间。 */
     private const val MIN_COLUMN_GAP_PT = 20f
@@ -1770,6 +1816,12 @@ object PdfTextExtractor {
      * 是这个段落里各行 [Line.fontSize]/[Line.isBold] 的汇总——[fontSize] 取段内最大
      * 字号，[isBold] 只要段内有一行加粗就算（见 [linesToParagraphs] 汇总逻辑），跟
      * "任一信号命中就算标题"是同一个宽松精神。
+     *
+     * [isCode]（2026-09-06 新增，给"代码块识别"用）**不是**"任一命中"这个宽松精神——
+     * 段内判定为等宽字体（见 [Line.isMonospace]）的行数要过半才算，见
+     * [linesToParagraphs] KDoc"代码块识别"一节。代码块通常整段都是等宽字体，用
+     * 比 [isBold] 更严格的聚合条件更符合实际情况，也能避免正文段落偶尔用等宽
+     * 字体排一两个数字/代码片段就被整段误判成代码块。
      */
     internal data class Paragraph(
         val text: String,
@@ -1777,6 +1829,7 @@ object PdfTextExtractor {
         val topY: Float,
         val fontSize: Float = 0f,
         val isBold: Boolean = false,
+        val isCode: Boolean = false,
     )
 
     /**
@@ -1828,6 +1881,7 @@ object PdfTextExtractor {
         var currentStartX = lines[0].startX
         var currentEndX = lines[0].endX
         var currentPageWidth = lines[0].pageWidth
+        var currentMonospace = lines[0].isMonospace
         for (i in 1 until lines.size) {
             val sameLine = lines[i].page == currentPage && abs(lines[i].y - currentY) < 0.01f &&
                 lines[i].startX - currentEndX <= LINE_MERGE_MAX_X_GAP_PT
@@ -1835,6 +1889,10 @@ object PdfTextExtractor {
                 appendLine(currentText, lines[i].text)
                 currentFontSize = maxOf(currentFontSize, lines[i].fontSize)
                 currentBold = currentBold || lines[i].isBold
+                // 见 [Paragraph.isCode] KDoc——这里跟 isBold 同一个"任一命中"精神
+                // （一条视觉行内哪怕只有一小段切到了等宽字体，这一整条合并后的 Line
+                // 就算等宽），更严格的"多数"聚合放在 [linesToParagraphs] 段落层面。
+                currentMonospace = currentMonospace || lines[i].isMonospace
                 // 同一条视觉行的几个片段合并后，真实覆盖范围是"最左片段的左边界"到
                 // "最右片段的右边界"——见 Line.startX/endX KDoc。
                 currentStartX = minOf(currentStartX, lines[i].startX)
@@ -1843,7 +1901,7 @@ object PdfTextExtractor {
                 merged.add(
                     Line(
                         currentText.toString(), currentY, currentPage, currentFontSize, currentBold,
-                        currentStartX, currentEndX, currentPageWidth,
+                        currentStartX, currentEndX, currentPageWidth, currentMonospace,
                     ),
                 )
                 currentText = StringBuilder(lines[i].text)
@@ -1854,12 +1912,13 @@ object PdfTextExtractor {
                 currentStartX = lines[i].startX
                 currentEndX = lines[i].endX
                 currentPageWidth = lines[i].pageWidth
+                currentMonospace = lines[i].isMonospace
             }
         }
         merged.add(
             Line(
                 currentText.toString(), currentY, currentPage, currentFontSize, currentBold,
-                currentStartX, currentEndX, currentPageWidth,
+                currentStartX, currentEndX, currentPageWidth, currentMonospace,
             ),
         )
         return merged
@@ -1960,11 +2019,115 @@ object PdfTextExtractor {
      * 边界（那个边界检查时 `lines[i-1]` 是上一项的内容，不是符号，不受影响），
      * 不该跟"自己的内容"之间产生边界。
      */
+    /**
+     * ## 代码块识别（2026-09-06 新增，借鉴 mj_pdf 用等宽字体占比判断代码块的思路）
+     *
+     * 一个段落是不是代码块，看它合并前（[mergeSameLineRuns] 之后、切分成段落之前）
+     * 的**行数**里有多少行整行判定为等宽字体（[Line.isMonospace]），过半才算——
+     * 用"行"做统计单位而不是"字符"，是因为代码块通常是连续好几行整行都是等宽
+     * 字体，用行数统计比用字符数统计更贴近"这一整段是不是代码"这个问题本身，
+     * 也比 [isBold]（字符级"过半"）多一层聚合，因为字号/加粗一行错判影响有限，
+     * 代码块渲染成等宽字体是块级的视觉切换，误判一整段的代价更大，理应用更严格
+     * 的聚合条件。
+     */
+    /**
+     * ## 上标/下标识别（2026-09-07 新增，借鉴 mj_pdf 用字号+基线偏移识别上下标的
+     * 思路，范围收窄到纯数字——Unicode 没有完整的字母上标/下标字符集，硬凑视觉上
+     * 不像的字符风险更大，见下面"已知局限"）。
+     *
+     * ### y 符号方向：实测确认，不是照抄 mj_pdf 用 PDFium 的经验
+     *
+     * 一次性诊断测试（`SuperscriptSignDiagnosticTest`，确认结论后已删除，结论
+     * 固化在这里）验证过：这个项目的 [Line.y]（取自 `TextPosition.yDirAdj`）
+     * 原点在页面左上、往下增大——物理位置更高的文字 [Line.y] 数值更小，物理
+     * 位置更低的文字 [Line.y] 数值更大。构造 PDF 用户空间坐标（Y 轴向上为正）
+     * 画三行：正文基线画在 y=150；模拟上标的"1"画在 y=156（比正文高 6pt）；
+     * 模拟下标的"2"画在 y=144（比正文低 6pt）。抽取结果：正文 [Line.y]=50.0，
+     * "1"（上标）[Line.y]=44.0（比正文**小** 6），"2"（下标）[Line.y]=56.0
+     * （比正文**大** 6）——跟 mj_pdf 用 PDFium 那套坐标系方向一致，但这是这个
+     * 项目自己实测出来的，不是假设两者一致就直接照搬。
+     *
+     * ### 检测条件
+     *
+     * 一个 [Line] 判定为"该被吸收成上一个 [Line] 的上标/下标游程"，要同时满足：
+     * 1. 跟上一个 [Line] 同页；
+     * 2. [Line.startX] 离上一个 [Line.endX] 很近（复用 [LINE_MERGE_MAX_X_GAP_PT]——
+     *    这本来就是"同一条视觉行内因样式切换被拆开"的场景，跟 [mergeSameLineRuns]
+     *    要处理的问题同源，只是这里额外多了 y 偏移）；
+     * 3. [Line.fontSize] 明显小于上一个 [Line.fontSize]（< [SUPERSCRIPT_FONT_SIZE_RATIO]
+     *    倍）；
+     * 4. y 偏移量在"看起来是上下标"而不是"另起一行"的范围内——大于
+     *    [MIN_SCRIPT_Y_OFFSET_PT]（必须明显超过 [mergeSameLineRuns] 判断"同一行"
+     *    用的 0.01f 误差容忍度），但不超过上一行字号的
+     *    [SUPERSCRIPT_MAX_Y_OFFSET_FONT_SIZE_RATIO] 倍（超过这个量级更可能是真的
+     *    另起一行，比如目录短标签，不该被强行吸收）；
+     * 5. 这个 [Line.text] 去除首尾空白后**全部**由 ASCII 数字 0-9 组成（长度不限，
+     *    但不含小数点/字母/其它符号——命中就整体转换，不命中就完全不处理，退回
+     *    现状"独立成行，可能被当正常换行拼接"的行为，不做部分转换）。
+     *
+     * 命中后把这几个数字按 y 偏移方向转换成 Unicode 上标（[SUPERSCRIPT_DIGITS]）
+     * 或下标（[SUBSCRIPT_DIGITS]）对应字符，直接追加到上一行的 `text` 末尾，
+     * **不产出独立的 [Line]**——纯字符替换，下游 [mergeSameLineRuns]/
+     * [linesToParagraphs]/`Reflow` 全部当普通文字处理，不需要认识"这是上标"这个
+     * 概念，也完全不用碰 `Reflow.kt`。吸收后把"上一行"的 [Line.endX] 更新成这个
+     * 上下标游程的 [Line.endX]——这样如果上下标后面还有正常文字紧接着继续（比如
+     * "text¹ continues"），那段文字回到正文基线，[mergeSameLineRuns] 会因为 x
+     * 位置紧邻而正常把它接上，不会被上下标的 y 偏移打断。
+     *
+     * ### 已知局限
+     *
+     * - 非数字的上标/下标（英文序数词"4th"里的"th"、变量指数"xⁿ"这类）不处理——
+     *   Unicode 没有完整覆盖 26 个字母的上标/下标字符集（只有 ⁿ/ⁱ 等极少数字母
+     *   有官方上标码位，下标字母几乎没有），硬凑视觉相似字符风险比"不处理、原样
+     *   输出"更大，遇到这类情况会保持现状（独立成行，可能被正常换行拼接，不会
+     *   丢内容，只是没有视觉区分）。
+     * - 一个巧合的、紧邻上一行、垂直有轻微偏移、字号又刚好小一档的纯数字独立
+     *   行（理论上可能存在，但没有真机样本），会被误吸收成上标/下标——跟这个
+     *   类的其它几何启发式一样，接受这个风险，没有反向校验机制。
+     * - 上面几个阈值常量都没有本项目真机数据支撑，是参考 mj_pdf 量级外推的值，
+     *   真机使用中如果误判/漏判明显，应该用真实文档重新校准。
+     */
+    internal fun absorbSuperscriptSubscriptRuns(lines: List<Line>): List<Line> {
+        if (lines.isEmpty()) return lines
+        val result = mutableListOf(lines[0])
+        for (i in 1 until lines.size) {
+            val prev = result.last()
+            val candidate = lines[i]
+            val converted = convertedScriptDigitsOrNull(prev, candidate)
+            if (converted != null) {
+                result[result.lastIndex] = prev.copy(text = prev.text + converted, endX = candidate.endX)
+            } else {
+                result.add(candidate)
+            }
+        }
+        return result
+    }
+
+    /**
+     * 见 [absorbSuperscriptSubscriptRuns] KDoc"检测条件"一节。返回值非 `null`
+     * 时是已经转换好的 Unicode 上标/下标字符串，调用方直接拼接；`null` 表示
+     * [candidate] 不满足吸收条件，原样保留成独立的 [Line]。
+     */
+    private fun convertedScriptDigitsOrNull(prev: Line, candidate: Line): String? {
+        if (candidate.page != prev.page) return null
+        if (candidate.startX - prev.endX > LINE_MERGE_MAX_X_GAP_PT) return null
+        if (prev.fontSize <= 0f || candidate.fontSize <= 0f) return null
+        if (candidate.fontSize >= prev.fontSize * SUPERSCRIPT_FONT_SIZE_RATIO) return null
+        val yOffset = candidate.y - prev.y
+        if (abs(yOffset) < MIN_SCRIPT_Y_OFFSET_PT) return null
+        if (abs(yOffset) > prev.fontSize * SUPERSCRIPT_MAX_Y_OFFSET_FONT_SIZE_RATIO) return null
+        val digits = candidate.text.trim()
+        if (digits.isEmpty() || digits.any { it !in '0'..'9' }) return null
+        // y 更小＝物理位置更高＝上标；见函数组 KDoc"y 符号方向"一节的实测结论。
+        val table = if (yOffset < 0f) SUPERSCRIPT_DIGITS else SUBSCRIPT_DIGITS
+        return digits.map { table[it - '0'] }.joinToString("")
+    }
+
     internal fun linesToParagraphs(rawLines: List<Line>): List<Paragraph> {
-        val lines = mergeSameLineRuns(rawLines)
+        val lines = mergeSameLineRuns(absorbSuperscriptSubscriptRuns(rawLines))
         if (lines.isEmpty()) return emptyList()
         if (lines.size == 1) {
-            return listOf(Paragraph(lines[0].text, lines[0].page, lines[0].y, lines[0].fontSize, lines[0].isBold))
+            return listOf(Paragraph(lines[0].text, lines[0].page, lines[0].y, lines[0].fontSize, lines[0].isBold, lines[0].isMonospace))
         }
 
         val gaps = (1 until lines.size).map { lines[it].y - lines[it - 1].y }
@@ -1976,11 +2139,15 @@ object PdfTextExtractor {
         val topYs = mutableListOf<Float>()
         val fontSizes = mutableListOf<Float>()
         val bolds = mutableListOf<Boolean>()
+        val monospaceLineCounts = mutableListOf<Int>()
+        val totalLineCounts = mutableListOf<Int>()
         texts.add(StringBuilder(lines[0].text))
         pages.add(lines[0].page)
         topYs.add(lines[0].y)
         fontSizes.add(lines[0].fontSize)
         bolds.add(lines[0].isBold)
+        monospaceLineCounts.add(if (lines[0].isMonospace) 1 else 0)
+        totalLineCounts.add(1)
 
         for (i in 1 until lines.size) {
             val gap = lines[i].y - lines[i - 1].y
@@ -2015,34 +2182,71 @@ object PdfTextExtractor {
                 topYs.add(lines[i].y)
                 fontSizes.add(lines[i].fontSize)
                 bolds.add(lines[i].isBold)
+                monospaceLineCounts.add(if (lines[i].isMonospace) 1 else 0)
+                totalLineCounts.add(1)
             } else {
                 appendLine(texts.last(), lines[i].text)
                 fontSizes[fontSizes.lastIndex] = maxOf(fontSizes.last(), lines[i].fontSize)
                 bolds[bolds.lastIndex] = bolds.last() || lines[i].isBold
+                monospaceLineCounts[monospaceLineCounts.lastIndex] += if (lines[i].isMonospace) 1 else 0
+                totalLineCounts[totalLineCounts.lastIndex] += 1
             }
         }
         return texts.indices.map {
-            Paragraph(normalizeCjkSpacing(texts[it].toString()), pages[it], topYs[it], fontSizes[it], bolds[it])
+            Paragraph(
+                normalizeCjkSpacing(texts[it].toString()), pages[it], topYs[it], fontSizes[it], bolds[it],
+                isCode = monospaceLineCounts[it] * 2 > totalLineCounts[it],
+            )
         }
     }
 
     /**
-     * 判断本页每个段落是不是标题——用户明确选择的策略："字号明显比本页正文字号大"
-     * 或者"字体本身标了加粗"，两个信号满足一个就算标题（不是要求同时满足）。
+     * 判断本页每个段落是不是标题、是第几级——用户明确选择的策略："字号明显比本页
+     * 正文字号大"或者"字体本身标了加粗"，两个信号满足一个就算标题（不是要求同时
+     * 满足）。返回值 0=不是标题，1/2/3=标题级别（1 最大、3 最小），供渲染层决定
+     * 字号/字重的分级样式。
+     *
+     * ## 标题分级（2026-09-06 新增，借鉴 mj_pdf 的 H1/H2/H3 字号比例分级思路）
+     *
+     * 之前这个函数只返回布尔值（是不是标题），渲染层因此只能"加粗，不分大小"——
+     * 见 `MainActivity.createParagraphTextView` KDoc 记录的历史决定："用户第一次
+     * 提了'粗体且大一号'，后来自己订正成只要粗体"。**这次分级重新引入了字号差异**，
+     * 是因为这次是用户在明确选定"要标题分级"这个新范围下提的要求，跟当年"就加粗，
+     * 不放大"那次讨论的是完全不同的问题（那时候还没有分级这个概念，只有"加不加粗"
+     * 一个开关）——如果分级后字号还是完全不变，H1/H2/H3 三级会长得一模一样，分级
+     * 就没有意义了。**这不是对旧决定的推翻，是旧决定没有覆盖到的新场景**，如实记录
+     * 在这里，真机用起来如果觉得不对，找回当年"只要粗体"那条讨论重新权衡。
      *
      * 字号基准用本页所有段落字号的中位数（不是平均数——极端值不会像平均数那样把
      * 基准拖偏，比如一页里偶尔有一段特别大的标题，不该让"正文该多大"这个基准跟着
-     * 被拉高）；[HEADING_FONT_SIZE_RATIO] 定"明显偏大"的门槛。只有一个段落时没有
-     * 别的段落可比，基准就是它自己，字号信号必然不触发（`ratio` 恒为 1），这种情况
-     * 下只能靠加粗信号判断——是"没有对比基准"这个前提下的合理退化，不是遗漏。
+     * 被拉高）；[HEADING_FONT_SIZE_RATIO_H1]/[HEADING_FONT_SIZE_RATIO_H2]/
+     * [HEADING_FONT_SIZE_RATIO_H3] 从高到低定三级"明显偏大"的门槛，取满足的最高
+     * 一级。字号信号没有任何一级达标、但整段加粗时，归到最小一级（H3）而不是不算
+     * 标题——沿用原来"加粗也算标题"这条宽松判断，只是分级体系下加粗单独命中时
+     * 给最保守的样式，不无凭据地升到更高级。只有一个段落时没有别的段落可比，基准
+     * 就是它自己，字号信号必然不触发（`ratio` 恒为 1），这种情况下只能靠加粗信号
+     * 判断——是"没有对比基准"这个前提下的合理退化，不是遗漏。
+     *
+     * [Paragraph.isCode] 的段落直接返回 0（不算标题），哪怕字号凑巧偏大或整段
+     * 加粗——参考 mj_pdf `StructuredTextFormatter.format()` 里代码块优先于标题
+     * 判断的做法。代码块的字号/字重通常是等宽字体本身的排版特征，不是作者想
+     * 表达"这是标题"，两者语义不同，不该被这里的启发式误判。
      */
-    internal fun classifyHeadings(paragraphs: List<Paragraph>): List<Boolean> {
+    internal fun classifyHeadings(paragraphs: List<Paragraph>): List<Int> {
         if (paragraphs.isEmpty()) return emptyList()
         val sortedSizes = paragraphs.map { it.fontSize }.filter { it > 0f }.sorted()
         val baseline = if (sortedSizes.isNotEmpty()) sortedSizes[sortedSizes.size / 2] else 0f
         return paragraphs.map { paragraph ->
-            val sizeSignal = baseline > 0f && paragraph.fontSize > baseline * HEADING_FONT_SIZE_RATIO
-            sizeSignal || paragraph.isBold
+            if (paragraph.isCode) return@map 0
+            val ratio = if (baseline > 0f) paragraph.fontSize / baseline else 1f
+            val sizeLevel = when {
+                baseline <= 0f -> 0
+                ratio >= HEADING_FONT_SIZE_RATIO_H1 -> 1
+                ratio >= HEADING_FONT_SIZE_RATIO_H2 -> 2
+                ratio >= HEADING_FONT_SIZE_RATIO_H3 -> 3
+                else -> 0
+            }
+            if (sizeLevel > 0) sizeLevel else if (paragraph.isBold) 3 else 0
         }
     }
 
@@ -2255,6 +2459,11 @@ object PdfTextExtractor {
      * 排过序但留点余量更稳妥）和这一页的宽度。默认值 0f 同样只是给旧测试调用点
      * 一个安全默认。
      */
+    /**
+     * [isMonospace]（2026-09-06 新增，给"代码块识别"用，见 [isMonospaceTextPosition]
+     * KDoc）：跟 [isBold] 同一个判定精神——这一行内超过一半的 `TextPosition` 判定
+     * 为等宽字体才算，默认值 `false` 同样只是给旧测试调用点一个安全默认。
+     */
     internal data class Line(
         val text: String,
         val y: Float,
@@ -2264,6 +2473,7 @@ object PdfTextExtractor {
         val startX: Float = 0f,
         val endX: Float = 0f,
         val pageWidth: Float = 0f,
+        val isMonospace: Boolean = false,
     )
 
     /**
@@ -2301,13 +2511,15 @@ object PdfTextExtractor {
             val fontSize = textPositions.maxOfOrNull { it.fontSizeInPt } ?: 0f
             val boldCount = textPositions.count { isBoldTextPosition(it) }
             val isBold = textPositions.isNotEmpty() && boldCount * 2 > textPositions.size
+            val monospaceCount = textPositions.count { isMonospaceTextPosition(it) }
+            val isMonospace = textPositions.isNotEmpty() && monospaceCount * 2 > textPositions.size
             // 见 [linesToParagraphs] KDoc"紧凑列表识别"一节——取整行内所有 TextPosition
             // 的最小/最大 x（不是只看首尾两个，`sortByPosition` 排过序但留一点余量更
             // 稳妥），得到这一行真实覆盖的水平范围，用于跟"一整行该有多宽"做比较。
             val startX = textPositions.minOfOrNull { it.xDirAdj } ?: 0f
             val endX = textPositions.maxOfOrNull { it.xDirAdj + it.widthDirAdj } ?: 0f
             val pageWidth = textPositions.firstOrNull()?.pageWidth ?: 0f
-            lines.add(Line(fixRadicalVariants(text), y, currentPageNo, fontSize, isBold, startX, endX, pageWidth))
+            lines.add(Line(fixRadicalVariants(text), y, currentPageNo, fontSize, isBold, startX, endX, pageWidth, isMonospace))
         }
     }
 
@@ -2371,6 +2583,24 @@ object PdfTextExtractor {
         val descriptor = textPosition.font?.fontDescriptor ?: return false
         if (descriptor.isForceBold) return true
         return descriptor.fontName?.contains("Bold", ignoreCase = true) == true
+    }
+
+    /**
+     * 单个字符是否判定为等宽字体（代码块识别用，跟 [isBoldTextPosition] 同一个
+     * "两个来源都查"精神）：
+     * 1. 字体描述符的 `isFixedPitch()` 标志——PDFBox-Android 这个版本的
+     *    `PDFontDescriptor` 确实有这个方法（跟 `isForceBold()` 同一个类，反解压
+     *    `pdfbox-android-2.0.27.0.aar` 用 `javap` 直接确认过方法签名存在，不是
+     *    凭记忆假设），语义上最准确，但同样不是所有等宽字体都会设置这个标志位。
+     * 2. 字体名包含"Courier"/"Mono"/"Consolas"（不分大小写，常见等宽字体命名
+     *    惯例）——标志位缺失时的兜底信号。
+     * 两者任一为真就判定这个字符是等宽字体。
+     */
+    private fun isMonospaceTextPosition(textPosition: TextPosition): Boolean {
+        val descriptor = textPosition.font?.fontDescriptor ?: return false
+        if (descriptor.isFixedPitch) return true
+        val fontName = descriptor.fontName ?: return false
+        return MONOSPACE_FONT_NAME_HINTS.any { fontName.contains(it, ignoreCase = true) }
     }
 
     /**
@@ -3819,7 +4049,7 @@ object PdfTextExtractor {
                 )
                 if (afterIndex == -1) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
                 filtered.forEachIndexed { index, paragraph ->
-                    blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
+                    blocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index], paragraph.isCode))
                     if (index == afterIndex) cropped?.let { blocks.add(DisplayBlock.Image(it)) }
                 }
                 return PageLoadPhaseA.Complete(PageContent(blocks))
@@ -3869,7 +4099,7 @@ object PdfTextExtractor {
             val textBlockTopYs = mutableListOf<Float>()
             if (!scanFullPageImageDecoded) {
                 filtered.forEachIndexed { index, paragraph ->
-                    textBlocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index]))
+                    textBlocks.add(DisplayBlock.Text(paragraph.text, filteredHeadingFlags[index], paragraph.isCode))
                     textBlockTopYs.add(paragraph.topY)
                 }
             }

@@ -45,13 +45,24 @@ sealed interface PdfLoadState {
  * 不再是这里要表达的一种展示块类型（`loadPage` 只会产出已经加载好的内容，见该方法
  * KDoc）。
  *
- * 2026-08-20 同日再加：[Text.isHeading]——用户要求"标题要加粗"，判断依据是这段文字
- * 在原文档里的字号是否明显大于本页正文字号、或者字体本身标了加粗，两个信号满足
- * 其中一个就算标题（用户明确选择），具体计算见
+ * 2026-08-20 同日再加：[Text.headingLevel]——用户要求"标题要加粗"，判断依据是这段
+ * 文字在原文档里的字号是否明显大于本页正文字号、或者字体本身标了加粗，两个信号
+ * 满足其中一个就算标题（用户明确选择），具体计算见
  * [app.pdfreader.extract.PdfTextExtractor.classifyHeadings]。
+ *
+ * 2026-09-06：原来的 `isHeading: Boolean` 升级成 [Text.headingLevel]（0=正文，
+ * 1/2/3=标题级别，1 最大）——借鉴 mj_pdf 的 H1/H2/H3 分级思路，级别越高渲染层
+ * 给的字号越大，不再是"只要是标题就统一加粗、大小不变"，具体渲染逻辑见
+ * `MainActivity.createParagraphTextView`。
+ *
+ * 同日再加 [Text.isCode]——段落是否判定为代码块（等宽字体占多数，见
+ * [app.pdfreader.extract.PdfTextExtractor.Paragraph.isCode]），渲染层用等宽
+ * `Typeface` 展示。[headingLevel] 和 [isCode] 不会同时非零/true——
+ * [app.pdfreader.extract.PdfTextExtractor.classifyHeadings] 对 `isCode` 的
+ * 段落恒定返回 0，这是抽取层保证的不变量，渲染层不需要重复判断优先级。
  */
 sealed interface DisplayBlock {
-    data class Text(val text: String, val isHeading: Boolean = false) : DisplayBlock
+    data class Text(val text: String, val headingLevel: Int = 0, val isCode: Boolean = false) : DisplayBlock
     data class Image(val bitmap: Bitmap) : DisplayBlock
 }
 

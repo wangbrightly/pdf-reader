@@ -1150,13 +1150,32 @@ class MainActivity : AppCompatActivity() {
      * 间距一样"这条——用户没有要求这个值本身可调，先给固定值，如果以后觉得不够/
      * 太多再考虑加一个字距拉杆。
      *
-     * 2026-08-20 新增 [isHeading]：用户要求"标题要加粗"——是不是标题由抽取层判断
+     * 2026-08-20 新增 [headingLevel]：用户要求"标题要加粗"——是不是标题由抽取层判断
      * （见 [PdfTextExtractor.classifyHeadings] KDoc，字号明显偏大或字体本身加粗，
-     * 两个信号任一命中），这里只负责按判断结果切换字重，不重复判断逻辑。只加粗，
-     * 不放大字号——用户第一次提了"粗体且大一号"，后来自己订正成只要粗体，照最后
-     * 一次的说法做。
+     * 两个信号任一命中），这里只负责按判断结果切换字重，不重复判断逻辑。**当时**
+     * 只加粗、不放大字号——用户第一次提了"粗体且大一号"，后来自己订正成只要粗体。
+     *
+     * **2026-09-06：标题分级后重新引入字号差异**，见 [PdfTextExtractor
+     * .classifyHeadings] KDoc"标题分级"一节完整说明——这次是用户明确要"借鉴
+     * mj_pdf 的 H1/H2/H3 分级"这个新范围下提的要求，不是重新推翻当年"只要粗体"
+     * 那次讨论；如果分级后字号完全不变，三级会长得一样，分级失去意义。
+     * [HEADING_SIZE_RATIO_H1]/[HEADING_SIZE_RATIO_H2]/[HEADING_SIZE_RATIO_H3]
+     * 是渲染层自己的放大倍数（相对用户当前设置的正文字号），**跟抽取层
+     * [PdfTextExtractor] 里判断"字号是不是明显偏大"用的三档比例常量是两回事**——
+     * 抽取层的比例是"原文档字号 vs 原文档正文字号"，用来判断这段文字原本是几级
+     * 标题；这里的比例是"渲染出来的标题字号 vs 用户当前设置的正文字号"，两者
+     * 概念不同、数值也没有必须相等的理由，只是这次实现里 H3 恰好都取了 1.15
+     * （巧合，不是刻意保持一致）。
+     *
+     * 2026-09-06 新增 [isCode]：代码块（[PdfTextExtractor.Paragraph.isCode]，
+     * 等宽字体占多数）用 `Typeface.MONOSPACE` 展示，不复用 2026-08-18 那次"正文
+     * 改用系统默认字体"的决定——那次是因为**全篇正文**用等宽字体显示会让 CJK
+     * 字符和空格的间距显得不协调，代码块通常是西文为主的独立小段落，不是这个
+     * 问题的适用场景，用等宽字体反而是代码该有的样子。[headingLevel] 和 [isCode]
+     * 不会同时非零/true（见 [DisplayBlock.Text] KDoc 的不变量说明），不需要在
+     * 这里判断谁优先。
      */
-    private fun createParagraphTextView(text: String, isHeading: Boolean): TextView =
+    private fun createParagraphTextView(text: String, headingLevel: Int, isCode: Boolean): TextView =
         TextView(this).apply {
             this.text = text
             setTextIsSelectable(true)
@@ -1164,10 +1183,16 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, currentSettings.fontSizeSp.toFloat())
+            val sizeRatio = when (headingLevel) {
+                1 -> HEADING_SIZE_RATIO_H1
+                2 -> HEADING_SIZE_RATIO_H2
+                3 -> HEADING_SIZE_RATIO_H3
+                else -> 1f
+            }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, currentSettings.fontSizeSp.toFloat() * sizeRatio)
             setLineSpacing(0f, currentSettings.lineSpacingMultiplier)
             letterSpacing = PARAGRAPH_LETTER_SPACING_EM
-            setTypeface(typeface, if (isHeading) Typeface.BOLD else Typeface.NORMAL)
+            setTypeface(if (isCode) Typeface.MONOSPACE else typeface, if (headingLevel > 0) Typeface.BOLD else Typeface.NORMAL)
         }
 
     private companion object {
@@ -1175,6 +1200,11 @@ class MainActivity : AppCompatActivity() {
 
         /** 见 [createParagraphTextView] 上方注释"中文标点符号本身显得太挤"一节。 */
         const val PARAGRAPH_LETTER_SPACING_EM = 0.05f
+
+        /** 见 [createParagraphTextView] KDoc"标题分级后重新引入字号差异"一节。 */
+        const val HEADING_SIZE_RATIO_H1 = 1.5f
+        const val HEADING_SIZE_RATIO_H2 = 1.3f
+        const val HEADING_SIZE_RATIO_H3 = 1.15f
 
         /** 见类注释"配置变化重建后恢复文档"一节。 */
         const val KEY_CURRENT_URI = "currentUri"
