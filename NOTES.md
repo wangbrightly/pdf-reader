@@ -3237,3 +3237,10 @@ TDD：7 条测试——上标/下标各一条正例、非数字游程不转换�
 `/tmp/pdfverify/bf.pdf` 已经因为系统清理 `/tmp` 消失，不是仓库内
 fixture。下次会话设备连上后，找一份带脚注上标的真实文档在真机上
 肉眼核对一次，是这次修复的验证优先级最高的待办。
+
+**2026-09-07 真机复核**：设备重连后，从 App 自己的缓存里找回了那本真实测试书
+（`Beyond Feelings 9th edition.pdf`，257 页，`run-as app.pdfreader` 从
+`cache/opened-*.pdf` 拉回来的），用目录跳转到"The Influence of Ideas"章节，
+真机截图确认修复生效："The Influence of Ideas⁶"标题、正文"inescapably.⁷"、
+"does not follow.")⁸"三处脚注编号全部正确显示成 Unicode 上标，不再跟正文
+混成普通大小数字。这次修复的真机验证已完成。
