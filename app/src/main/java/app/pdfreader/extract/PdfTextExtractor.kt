@@ -2123,6 +2123,94 @@ object PdfTextExtractor {
         return digits.map { table[it - '0'] }.joinToString("")
     }
 
+    /**
+     * ## 行内上标/下标（2026-09-07 新增，修复"上标/下标在真实文档一次都没触发"的架构 bug）
+     *
+     * [absorbSuperscriptSubscriptRuns] 按**相邻两个 [Line]** 比较——但真机诊断（120 页
+     * 真实英文学术书 + 用 Text Rise `Ts` 操作符复现的合成 PDF，一次性诊断
+     * `SuperscriptRiseDiagnosticTest`/`TextPositionDumpTest`，确认结论后已删除）
+     * 证实：真实排版软件生成"正文+脚注上标"用的是 Text Rise，不是挪到新的一行——
+     * `Ts` 只在渲染时偏移基线，不移动文本行起点，PdfBox 的 `writeString` 是按自己
+     * 内部的"视觉行"分组调用的，不会因为 Text Rise 拆行，于是"Body" + 上标"6" +
+     * 后续正文"continues"全部落进**同一次 `writeString` 回调**，`textPositions`
+     * 混着两种字号/y。原实现直接用"第一个字符的 y"、"最大字号"代表整行——上标
+     * 数字被悄悄拍扁成普通大小混进文字里，[absorbSuperscriptSubscriptRuns] 永远
+     * 等不到"两个相邻 Line"这个前提，架构上不可能触发。
+     *
+     * ### 实现
+     *
+     * 下沉到 `writeString` 内部直接扫 [TextPosition] 列表：
+     * 1. 先找"主字号"——出现次数最多的字号（按 [TextPosition] 个数，不是取最大值；
+     *    取最大值在真机数据里恰好因为正文通常比上标大而蒙对，但语义上是错的，
+     *    遇到"这行大部分是放大的标题字号，中间夹了几个更大的图标字符"这类场景
+     *    会算错。次数相同时取较大的字号，跟旧的"取最大值"行为在最常见的"整行
+     *    只有一种字号"场景下完全一致，不引入回归）。
+     * 2. 先只按几何特征（不看字符内容）圈出连续的"抬升游程"——字号明显小于主
+     *    字号（< [SUPERSCRIPT_FONT_SIZE_RATIO] 倍）、y 偏移方向一致且落在"看起来
+     *    是上下标"的范围内（[MIN_SCRIPT_Y_OFFSET_PT] ~ 主字号 ×
+     *    [SUPERSCRIPT_MAX_Y_OFFSET_FONT_SIZE_RATIO]，跟 [absorbSuperscriptSubscriptRuns]
+     *    同一套阈值，只是应用在字符游程而不是整行）。圈定游程之后再检查这一整段
+     *    文字**是否全部由 ASCII 数字组成**——是就整体转换成 Unicode 上标/下标；
+     *    只要混进一个非数字字符（脚注符号"*"常跟编号连在一起）就整个游程原样
+     *    保留，不做部分转换——跟 [absorbSuperscriptSubscriptRuns] 同一条"宁可漏判、
+     *    不可半转换"的保守原则：转换一半（比如"*⁶"，星号正常大小、数字却变成上标）
+     *    比完全不转换更容易让人看不懂原文在说什么。
+     * 3. `text.length != textPositions.size`（连字符/CID 特殊映射导致，实测正常
+     *    含空格的整行不会触发，但没有覆盖所有字体/编码组合）时放弃这次优化、
+     *    原样返回——错过一次可能的转换，好过在对不齐的下标上瞎猜。
+     *
+     * 返回替换后的整行文字，加上代表这一行的 y/字号（取自主字号那个 [TextPosition]，
+     * 不再是"第一个字符"/"最大值"）。
+     *
+     * 两层机制并存不冲突：这个函数处理"同一次 writeString 回调内"（Text Rise 生成
+     * 的真实文档）；[absorbSuperscriptSubscriptRuns] 继续处理"PdfBox 恰好按坐标拆成
+     * 了两个相邻 Line"的情况（比如用 `newLineAtOffset` 生成的 PDF）。
+     */
+    internal fun absorbInlineScriptDigits(text: String, textPositions: List<TextPosition>): Triple<String, Float, Float> {
+        val fallbackY = textPositions.first().yDirAdj
+        val fallbackFontSize = textPositions.maxOf { it.fontSizeInPt }
+        if (text.length != textPositions.size) return Triple(text, fallbackY, fallbackFontSize)
+
+        val dominantFontSize = textPositions.groupingBy { it.fontSizeInPt }.eachCount().entries
+            .sortedWith(compareByDescending<Map.Entry<Float, Int>> { it.value }.thenByDescending { it.key })
+            .first().key
+        val dominantY = textPositions.first { it.fontSizeInPt == dominantFontSize }.yDirAdj
+
+        // 只看几何特征（字号+y偏移），不看字符内容——判断"这个字符是不是落在某个
+        // 抬升游程里"，游程整体是否全数字放到圈定边界之后再检查。
+        fun isRaised(index: Int, expectedSign: Float): Boolean {
+            val tp = textPositions[index]
+            if (tp.fontSizeInPt >= dominantFontSize * SUPERSCRIPT_FONT_SIZE_RATIO) return false
+            val yOffset = tp.yDirAdj - dominantY
+            if (sign(yOffset) != expectedSign) return false
+            val absOffset = abs(yOffset)
+            return absOffset >= MIN_SCRIPT_Y_OFFSET_PT && absOffset <= dominantFontSize * SUPERSCRIPT_MAX_Y_OFFSET_FONT_SIZE_RATIO
+        }
+
+        val result = StringBuilder()
+        var i = 0
+        while (i < text.length) {
+            val yOffset = textPositions[i].yDirAdj - dominantY
+            val ySign = sign(yOffset)
+            if (ySign == 0f || !isRaised(i, ySign)) {
+                result.append(text[i])
+                i++
+                continue
+            }
+            var j = i
+            while (j < text.length && isRaised(j, ySign)) j++
+            val run = text.substring(i, j)
+            if (run.all { it in '0'..'9' }) {
+                val table = if (ySign < 0f) SUPERSCRIPT_DIGITS else SUBSCRIPT_DIGITS
+                run.forEach { result.append(table[it - '0']) }
+            } else {
+                result.append(run)
+            }
+            i = j
+        }
+        return Triple(result.toString(), dominantY, dominantFontSize)
+    }
+
     internal fun linesToParagraphs(rawLines: List<Line>): List<Paragraph> {
         val lines = mergeSameLineRuns(absorbSuperscriptSubscriptRuns(rawLines))
         if (lines.isEmpty()) return emptyList()
@@ -2507,8 +2595,8 @@ object PdfTextExtractor {
             // 图标字体，键盘字母键位对应的是箭头/项目符号这类图标，不是真的字母，
             // ToUnicode 映射出来的"文字"完全没有语义，整段跳过不收进 lines。
             if (textPositions.isNotEmpty() && textPositions.all { isDecorativeSymbolFont(it.font.name) }) return
-            val y = textPositions.firstOrNull()?.yDirAdj ?: return
-            val fontSize = textPositions.maxOfOrNull { it.fontSizeInPt } ?: 0f
+            if (textPositions.isEmpty()) return
+            val (convertedText, y, fontSize) = absorbInlineScriptDigits(text, textPositions)
             val boldCount = textPositions.count { isBoldTextPosition(it) }
             val isBold = textPositions.isNotEmpty() && boldCount * 2 > textPositions.size
             val monospaceCount = textPositions.count { isMonospaceTextPosition(it) }
@@ -2519,7 +2607,7 @@ object PdfTextExtractor {
             val startX = textPositions.minOfOrNull { it.xDirAdj } ?: 0f
             val endX = textPositions.maxOfOrNull { it.xDirAdj + it.widthDirAdj } ?: 0f
             val pageWidth = textPositions.firstOrNull()?.pageWidth ?: 0f
-            lines.add(Line(fixRadicalVariants(text), y, currentPageNo, fontSize, isBold, startX, endX, pageWidth, isMonospace))
+            lines.add(Line(fixRadicalVariants(convertedText), y, currentPageNo, fontSize, isBold, startX, endX, pageWidth, isMonospace))
         }
     }
 

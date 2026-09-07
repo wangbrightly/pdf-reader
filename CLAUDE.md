@@ -100,9 +100,9 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 
 - **标题分级 H1/H2/H3**：`classifyHeadings` 从 `List<Boolean>` 升级成 `List<Int>`（0=正文,1/2/3=级别）。抽取层判断"原文档字号是否偏大"的三档比例 `HEADING_FONT_SIZE_RATIO_H1/H2/H3`=1.7/1.4/1.15（H3 沿用升级前唯一门槛,真机验证过;H1/H2 是参考 mj_pdf 分布规律外推的值,**没有真机数据支撑**)。渲染层放大字号用的是另一套独立比例 `HEADING_SIZE_RATIO_H1/H2/H3`=1.5/1.3/1.15（相对用户当前设置的正文字号，**跟抽取层的比例是两个不同概念，数值没有必须相等的理由**）。
 - **代码块识别**：`isMonospaceTextPosition`（跟 `isBoldTextPosition` 同一个"标志位+字体名兜底"精神，`isFixedPitch()` 已用 `javap` 反解压确认存在）→ `Line.isMonospace` → `Paragraph.isCode`（**段内过半行**整行等宽才算，用行数不用字符数，比字符级"过半"多一层聚合）。渲染用 `Typeface.MONOSPACE`；`classifyHeadings` 对 `isCode` 段落恒定返回 0，两者互斥。
-- **上标/下标（纯数字）**：`absorbSuperscriptSubscriptRuns` 在 `mergeSameLineRuns` 之前吸收紧邻、字号明显更小、有明显但不过大垂直偏移、内容全是 ASCII 数字的游程，转换成 Unicode 上标/下标字符直接拼进上一行文字，不产出独立 `Line`——纯字符替换，完全不用碰 `Reflow.kt`（对比 mj_pdf 用真正的 Android Span，这个项目的 Reflow 只认纯 `String`，走 Span 路线代价更高，范围收窄到纯数字是权衡后的简化）。**y 偏移符号方向是这个项目自己实测确认的**（`Line.y` 原点在页面左上、往下增大，物理位置更高的文字数值更小），不是照抄 mj_pdf 用 PDFium 坐标系的经验。非数字上下标（"4th"里的"th"、"xⁿ"）不处理，见 NOTES #69"已知局限"。
+- **上标/下标（纯数字）**：**真正生效的是 `absorbInlineScriptDigits`（2026-09-07 修复，见 NOTES #70），不是 `absorbSuperscriptSubscriptRuns`**——后者比较相邻两个 `Line`，但真实排版软件生成上标/下标用的是 PDF `Ts`（Text Rise）操作符，只偏移渲染基线、不移动文本行起点，PdfBox 的 `writeString` 不会因此拆行，"正文+上标+后续正文"整个落在**同一次 `writeString` 回调**里，根本不存在"两个相邻 Line"这个前提，`absorbSuperscriptSubscriptRuns` 架构上永远不会触发（真机拿 120 页真实学术书验证时零触发才发现）。`absorbInlineScriptDigits` 下沉到 `writeString` 内部直接扫 `TextPosition`：先找"出现次数最多的字号"代表这一行主字号（不是取最大值——两者在"整行只有一种字号"的常见场景结果相同，但语义上前者才对），圈连续的"抬升游程"（字号明显更小+y 偏移在范围内，跟 `absorbSuperscriptSubscriptRuns` 共用同一套阈值常量 `SUPERSCRIPT_FONT_SIZE_RATIO`/`MIN_SCRIPT_Y_OFFSET_PT`/`SUPERSCRIPT_MAX_Y_OFFSET_FONT_SIZE_RATIO`），游程整体全是 ASCII 数字才转换，混了非数字字符整个游程原样保留（不做部分转换）。两层机制并存：`absorbInlineScriptDigits` 处理"同一次 writeString 回调内"（真实文档的常见情况）；`absorbSuperscriptSubscriptRuns` 留着处理"PdfBox 恰好按坐标拆成两个相邻 Line"的理论情况，不冲突。**y 偏移符号方向是这个项目自己实测确认的**（`Line.y` 原点在页面左上、往下增大，物理位置更高的文字数值更小），不是照抄 mj_pdf 用 PDFium 坐标系的经验。非数字上下标（"4th"里的"th"、"xⁿ"）不处理。构造测试 fixture 必须用 `PDPageContentStream.setTextRise`，不能用 `newLineAtOffset` 挪 y 模拟——后者会被 PdfBox 自己的换行判定拆成独立 `Line`，测的是 `absorbSuperscriptSubscriptRuns` 那条几乎不会真正触发的路径，不是真实文档实际经过的路径。
 
-**这三个功能目前都还没有真机验证**（开发时 `adb devices` 一直是空的，设备没连接）——只确认了 315 条单元测试全绿 + `gradle assembleDebug` 成功产出 APK。下次会话设备已连接时，第一优先级是拿真实文档肉眼核对：标题字号分级是否合理、代码块等宽字体排版观感、上标下标数字是否清晰可辨——三个功能里所有非 H3/非唯一门槛的阈值常量都是外推值，真机效果不理想应该用真实文档数据重新校准，不要凭感觉微调。
+**标题分级/代码块目前还没有真机验证**（开发时 `adb devices` 一直是空的，设备没连接；上标/下标那次真机验证倒是做了，就是它暴露了上面这个架构 bug）。下次会话设备已连接时，第一优先级是拿真实文档肉眼核对：标题字号分级是否合理、代码块等宽字体排版观感——非 H3/非唯一门槛的阈值常量都是外推值，真机效果不理想应该用真实文档数据重新校准，不要凭感觉微调。上标/下标修复后同样还没有真机复核过实际显示效果（有单元测试覆盖但没有真实脚注文档肉眼核对），也排进这次真机验证清单。
 
 ## 已知局限（如实告知过用户）
 
@@ -114,7 +114,7 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 - 同一段说明文字引用的插图如果原书排版把插图印在下一页（图文本来就跨页），逐页独立处理的架构接不上，会出现"读到一堆提到图的文字、翻页后突然冒出一整块图片"——用户 2026-09-03 已知情况后拍板不投入开发，接受为局限
 - 扫描版 PDF（没有文字层）无法重排/调字号，需要 OCR，用户 2026-08-18 决定暂缓（见 NOTES #10）
 - 大文件（126MB+）`PDDocument.load` 本身耗时几秒到十几秒，试过换成临时文件缓冲但反而更慢，已回退，没找到有效优化手段（见 NOTES #23）
-- 标题分级/代码块/上标下标（2026-09-06/07 新增，见上一节）：非 H3 的字号比例阈值和上下标的所有阈值常量都没有真机数据支撑；上下标只处理纯数字，非数字上下标保持原样不转换；三个功能都还没有真机肉眼验证过实际显示效果
+- 标题分级/代码块/上标下标（2026-09-06/07 新增，见上一节）：非 H3 的字号比例阈值和上下标的所有阈值常量都没有真机数据支撑；上下标只处理纯数字，非数字上下标保持原样不转换；上标/下标 2026-09-07 修过一次架构 bug（见 NOTES #70，真正生效的是 `absorbInlineScriptDigits`）；三个功能目前都还没有真机肉眼验证过实际显示效果
 
 真机型号是小米 mondrian，装机验证是这个项目的日常工作方式（几乎每次改动都真机复测），不是没做过。
 

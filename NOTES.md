@@ -3174,3 +3174,66 @@ TDD：7 条测试——上标/下标各一条正例、非数字游程不转换�
 合理、代码块等宽字体排版观感、上标下标数字是否清晰可辨）都还没有
 拿真实文档在真机上肉眼核对过，下次会话如果设备已连接，这是第一
 优先级的验证项。
+
+## 70. 已修：上标/下标架构 bug——真实排版软件用 Text Rise，根本不会拆成独立 Line
+
+上一条（#69）的上标/下标功能在真机拿一本 120 页真实英文学术书验证时，
+一次都没触发。追查过程本身分好几步（诊断文件一次性用完即删，结论固化
+在这里和代码注释里）：
+
+1. `RealDocFeatureScanTest` 扫全书 120 页，标题分级/代码块两个功能都
+   正常触发，唯独上标/下标零触发。
+2. `RawLineDumpTest` 打印疑似有脚注编号的几页原始 `Line` 数据，发现
+   "The Influence of Ideas6"这种编号数字**跟前面的正文字合并在同一个
+   `Line.text` 里**，不是独立的一行——`absorbSuperscriptSubscriptRuns`
+   （#69 的实现）比较的是**相邻两个 Line**，这里从一开始就没有"两个
+   相邻 Line"这个前提，函数架构上不可能触发。
+3. `TextPositionDumpTest` 下沉一层确认：这些行对应的 `writeString`
+   回调里，`textPositions` 混着两种字号——PdfBox 是按自己的"视觉行"
+   分组调用 `writeString` 的，正文+上标落进了**同一次回调**。
+4. 造合成 PDF 复现验证机制：先用 `newLineAtOffset` 挪 6pt 模拟上标
+   （`SuperscriptGroupingDiagnosticTest`），PdfBox 自己按 y 坐标判定
+   成了两个独立 `Line`（`GROUP_LINE_COUNT=2`）——**没能复现**真机现象。
+   换用 `setTextRise`（PDF 规范里 `Ts` 操作符，真实排版软件生成上标/
+   下标的标准做法，只偏移渲染基线、不移动文本行起点）重构
+   （`SuperscriptRiseDiagnosticTest`）——完全复现：一次 `writeString`
+   回调，`text="Body6continues"`，`textPositions` 里"6"字号 7pt/y=46，
+   前后"Body"/"continues"字号 12pt/y=50。这才是真实文档的生成方式，
+   `newLineAtOffset` 从一开始就是错的合成方法。
+5. 另外用 `TextPositionAlignmentDiagnosticTest` 确认了修法要依赖的前提：
+   含空格的正常一行文字，`writeString` 的 `text.length` 跟
+   `textPositions.size` 是对齐的（35=35）——修法可以按下标一一对应
+   字符和 `TextPosition`，不对齐的极端情况（连字符/CID 特殊映射）用
+   长度校验兜底跳过。
+
+**修法**：新增 `absorbInlineScriptDigits`，下沉到 `writeString` 内部
+直接扫 `TextPosition` 列表——先按"出现次数最多的字号"（不是原来的
+"最大值"）找这一行的主字号/主 y，再圈连续的"抬升游程"（字号明显小于
+主字号+y 偏移在上下标该有的范围内，跟 `absorbSuperscriptSubscriptRuns`
+同一套阈值常量），游程整体全是 ASCII 数字才转换成 Unicode 上标/下标，
+混了非数字字符就整个游程原样保留（跟 #69 同一条"宁可漏判、不可半
+转换"的保守原则——转换一半比完全不转换更让人看不懂，例子见反例测试
+"抬升游程混了非数字字符时整个游程不转换"）。两层机制并存：这个函数
+处理"同一次 writeString 回调内"（真实文档的常见情况）；
+`absorbSuperscriptSubscriptRuns` 继续处理"PdfBox 恰好按坐标拆成两个
+相邻 Line"的情况（理论上仍可能出现，不删）。
+
+**TDD**：`PdfTextExtractorInlineScriptDigitTest` 4 条——上标/下标各
+一条正例（都用 `setTextRise` 构造）、抬升游程混非数字字符不转换、
+没有 Text Rise 的普通数字不受影响。**红绿verification 有个方法论
+瑕疵**：写测试后台跑 gradle 编译确认"红"的过程中，中途手动改了源码
+实现——gradle 编译时读的是文件当前内容，等编译任务真正执行到的时候
+已经是改过的版本，那次"红"的验证其实验证到的是改完之后的状态，不是
+真正修复前的失败态。补救："红"的结论改成逻辑推断（改之前 `writeString`
+完全没有上标转换代码，"6"必然原样输出，断言必然失败，这个推断不需要
+怀疑）+全量测试补跑验证没有回归；下次别在等后台编译结果的间隙同步
+改同一个文件，两件事分开做。
+
+全量单元测试从 315 条增加到 325 条（4 条新增 + 6 条来自上面诊断过程
+读进 test-results 统计的一次性诊断，诊断完成后已删除，不进仓库），
+45 个测试类零失败。**这次修复没有做真机验证**——`adb devices` 时断
+时连（今天设备连过一次又断开），且这次修复的验证方式（真实 PDF 里
+脚注上标是否显示成上标）需要一份带脚注编号的真实文档，之前用的
+`/tmp/pdfverify/bf.pdf` 已经因为系统清理 `/tmp` 消失，不是仓库内
+fixture。下次会话设备连上后，找一份带脚注上标的真实文档在真机上
+肉眼核对一次，是这次修复的验证优先级最高的待办。
