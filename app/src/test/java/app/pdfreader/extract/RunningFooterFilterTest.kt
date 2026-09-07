@@ -89,6 +89,46 @@ class RunningFooterFilterTest {
         assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(emptyList()))
     }
 
+    // ---- 排版软件的版心水印（2026-09-07 补，见类 KDoc 对应小节）----
+
+    @Test
+    fun `qxd排版软件版心水印判定为水印`() {
+        // 真机数据：Beyond Feelings 9th edition.pdf（QuarkXPress 排版教材）每页都有
+        // 这行标记，页码每页不同，标题类重复率检测抓不到，靠精确正则单独识别。
+        val lines = listOf(PageTextLine("rug38189_ch01_003-015.qxd 1/3/11 4:33 PM Page 6", page = 6))
+        assertEquals(setOf(0), RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
+    fun `qxd版心水印的页码是小写罗马数字（前页码）也判定为水印`() {
+        val lines = listOf(PageTextLine("rug38189_FM_i-xii.qxd 1/3/11 4:32 PM Page ix", page = 9))
+        assertEquals(setOf(0), RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
+    fun `qxd版心水印不需要同页有其它水印特征就能识别`() {
+        val lines = listOf(
+            PageTextLine("rug38189_ch02_016-031.qxd 1/3/11 4:34 PM Page 19", page = 19),
+            PageTextLine("这一页自己完全正常的正文内容。", page = 19),
+        )
+        assertEquals(setOf(0), RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
+    fun `正文里提到Page字样但不是完整版心水印格式不判定为水印`() {
+        val lines = listOf(PageTextLine("详见 Page 42 的说明。", page = 1))
+        assertEquals(emptySet<Int>(), RunningFooterFilter.noiseIndices(lines))
+    }
+
+    @Test
+    fun `pageNoiseIndices里qxd版心水印不需要学习也能按页判断`() {
+        val pageLines = listOf(
+            PageTextLine("rug38189_ch01_003-015.qxd 1/3/11 4:33 PM Page 6", page = 6),
+            PageTextLine("这一页自己的正文内容。", page = 6),
+        )
+        assertEquals(setOf(0), RunningFooterFilter.pageNoiseIndices(pageLines, emptySet()))
+    }
+
     // ---- 标题行（2026-08-19 补）：见 RunningFooterFilter 类 KDoc"标题行"一节 ----
 
     @Test

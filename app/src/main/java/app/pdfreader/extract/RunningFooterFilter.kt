@@ -32,6 +32,16 @@ data class PageTextLine(val text: String, val page: Int)
  *   无条件过滤，而是加了个上下文条件：只有当**同一页**上还存在纯网址或纯日期时间
  *   这两种更确定的水印特征时，才把它一起当水印过滤——这样"孤立出现的分数"不会被
  *   误伤，只有真的跟网址/日期同一页出现的"页码计数"才会被判定为水印的一部分。
+ * - 排版软件的"版心水印"一行（[QXD_PRINT_SLUG_LINE]，2026-09-07 真机反馈补，见
+ *   `Beyond Feelings 9th edition.pdf`——一本用 QuarkXPress 排的教材）：形如
+ *   `rug38189_ch01_003-015.qxd 1/3/11 4:33 PM Page 6`——排版软件自动打在每页
+ *   版心的"源文件名 + 定稿日期时间 + 页码"标记，跟前面几种"打印到 PDF"水印
+ *   同源但格式不同，不是"文字重复"（页码每页都不一样，[titleLikeNoiseIndices]
+ *   的重复率信号抓不到）。`.qxd` 后缀 + 日期 + 时间 + "Page" 这个组合本身极度
+ *   不可能出现在正文里，不需要额外的上下文门槛，直接精确匹配整行；页码部分
+ *   用 `\S+` 而不是只认数字——前页码（front matter）常用小写罗马数字（"Page v"/
+ *   "Page xii"），书末索引可能是"Page A-1"这类带字母的附录页码，不需要为每种
+ *   都单独列举。
  *
  * ## 标题行（2026-08-19 补）：靠"重复率"而不是靠格式，门槛拉高换安全
  *
@@ -84,6 +94,9 @@ object RunningFooterFilter {
     private val DATE_TIME_ONLY = Regex("""^\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}(:\d{2})?$""")
     private val URL_WITH_TRAILING_COUNTER = Regex("""^https?://\S+\s+\d+/\d+$""")
     private val PAGE_COUNTER_ONLY = Regex("""^\d+/\d+$""")
+    private val QXD_PRINT_SLUG_LINE = Regex(
+        """^\S+\.qxd\s+\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}\s?[AaPp][Mm]\s+Page\s+\S+$""",
+    )
 
     /** 见类注释"标题行"一节。 */
     private const val MAX_TITLE_LIKE_LENGTH = 60
@@ -115,7 +128,7 @@ object RunningFooterFilter {
         return regexNoiseIndices(pageLines) + titleIndices
     }
 
-    /** [URL_ONLY]/[DATE_TIME_ONLY]/[URL_WITH_TRAILING_COUNTER]/[PAGE_COUNTER_ONLY] 这四条判断，见类注释。 */
+    /** [URL_ONLY]/[DATE_TIME_ONLY]/[URL_WITH_TRAILING_COUNTER]/[PAGE_COUNTER_ONLY]/[QXD_PRINT_SLUG_LINE] 这五条判断，见类注释。 */
     private fun regexNoiseIndices(lines: List<PageTextLine>): Set<Int> {
         val urlOrDateIndices = lines.indices.filter { index ->
             val text = lines[index].text.trim()
@@ -126,7 +139,10 @@ object RunningFooterFilter {
             val text = lines[index].text.trim()
             PAGE_COUNTER_ONLY.matches(text) && lines[index].page in pagesWithUrlOrDate
         }
-        return (urlOrDateIndices + counterIndices).toSet()
+        // 见类注释"排版软件的版心水印"一节——不需要上下文条件，`.qxd`+日期+时间+
+        // "Page" 这个组合本身已经足够精确，跟 URL_ONLY/DATE_TIME_ONLY 同一档。
+        val qxdSlugIndices = lines.indices.filter { index -> QXD_PRINT_SLUG_LINE.matches(lines[index].text.trim()) }
+        return (urlOrDateIndices + counterIndices + qxdSlugIndices).toSet()
     }
 
     /** 见类注释"标题行"一节：靠"短文字 + 高比例重复出现在不同页"识别运行标题/页眉。 */
