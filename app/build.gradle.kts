@@ -10,8 +10,8 @@ android {
         applicationId = "app.pdfreader"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
 
         // 2026-08-26 新增：[Jpeg2000Decoder] 依赖 native .so，Robolectric（纯桌面
         // JVM，无法加载 Android ABI 的 ELF 二进制）测不了，必须用 instrumentation
