@@ -4,9 +4,13 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.Typeface
+import android.graphics.fonts.Font
+import android.graphics.fonts.FontFamily
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.util.Log
 import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -215,6 +219,35 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pageScrubberThumb: View
     private lateinit var pageScrubberLabel: TextView
 
+    /**
+     * 中文衬线字体（宋体），取不到时为 null。
+     *
+     * 2026-09-16 报纸正文配色方案要求正文用衬线体。主题里的
+     * `android:fontFamily="serif"`（themes.xml）只让拉丁字母变了衬线，中文仍是
+     * 黑体——真机排查确认根因是 MIUI 应用了主题字体（`ro.miui.ui.font.theme_apply`
+     * 为 true、`/data/system/theme/fonts/` 下有整套替换字体），把 AOSP `fonts.xml`
+     * 里"中文宋体作为 serif 后备字体"（`fallbackFor="serif"`）那条链路盖掉了，
+     * 不是安卓本身做不到这件事。
+     *
+     * 绕开字族名，直接按路径读设备上**已有**的中文宋体文件——不往 APK 里塞字体，
+     * 零体积成本（这个 APK 已经 110MB，塞一套中文字体还要再涨十几 MB）。用 AOSP
+     * 自带的 `NotoSerifCJK-Regular.ttc`，它是"字体集合"，必须显式取第
+     * [NOTO_SERIF_CJK_SC_INDEX] 个子字体才是简体字形（第 0 个是日文变体，一部分
+     * 汉字写法跟简体不同），而取子字体的 API 要 Android 10 起，更低版本宁可不用
+     * 也不给用户错的字形。
+     *
+     * **踩过的坑**：这台小米手机 `/product/fonts/` 下有个 `MiSerifSCVF.ttf`，
+     * 名字带"Serif"和"SC"，一度被当成首选——实测它只有 234KB，**根本不含中文
+     * 字形**（拉到电脑上用 PIL 渲染"手册模式高温"整行空白，而 26MB 的
+     * NotoSerifCJK 正常渲染出宋体）。用它的后果很隐蔽：日志显示"字体加载成功"、
+     * 英文确实变衬线，中文却因为字体里查不到字形而静默退回系统黑体，光看截图
+     * 会误以为是别的原因。字体文件不能只看文件名，要验证它到底包含哪些字。
+     *
+     * 读不到时返回 null，调用方保持改动前的现状（拉丁衬线 + 中文黑体），
+     * 不崩溃也不静默换成别的字体。
+     */
+    private val cjkSerifTypeface: Typeface? by lazy { loadCjkSerifTypeface() }
+
     /** 见 [setupPageScrubber] KDoc"避免拖拽和自动同步互相打架"一节。 */
     private var isDraggingPageScrubber = false
 
@@ -332,6 +365,16 @@ class MainActivity : AppCompatActivity() {
         pageScrubberTrack = findViewById(R.id.pageScrubberTrack)
         pageScrubberThumb = findViewById(R.id.pageScrubberThumb)
         pageScrubberLabel = findViewById(R.id.pageScrubberLabel)
+
+        // 工具栏这几处也统一成中文宋体，否则同一行里中英文一个黑体一个衬线体
+        // （"打开 PDF"最明显），见 [cjkSerifTypeface] KDoc。粗体是 XML 里定的，
+        // 换字体时要把原来的字形样式带上，不然滑杆标签会丢掉加粗。
+        cjkSerifTypeface?.let { serif ->
+            listOf<TextView>(
+                fileNameLabel, fontSizeLabel, lineSpacingLabel, paddingLabel,
+                blockSpacingLabel, pageScrubberLabel, openButton, tocButton, toggleSettingsButton,
+            ).forEach { it.setTypeface(serif, it.typeface?.style ?: Typeface.NORMAL) }
+        }
 
         currentSettings = ReaderSettingsPreferences.load(applicationContext)
         applySettingsToView(currentSettings)
@@ -1175,6 +1218,24 @@ class MainActivity : AppCompatActivity() {
      * 不会同时非零/true（见 [DisplayBlock.Text] KDoc 的不变量说明），不需要在
      * 这里判断谁优先。
      */
+    /** 见 [cjkSerifTypeface] KDoc——候选路径的来历、顺序理由和降级约定都在那里。 */
+    private fun loadCjkSerifTypeface(): Typeface? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val notoSerifCjk = File("/system/fonts/NotoSerifCJK-Regular.ttc")
+            if (notoSerifCjk.canRead()) {
+                runCatching {
+                    val font = Font.Builder(notoSerifCjk).setTtcIndex(NOTO_SERIF_CJK_SC_INDEX).build()
+                    Typeface.CustomFallbackBuilder(FontFamily.Builder(font).build()).build()
+                }.getOrNull()?.let {
+                    Log.i(TAG_FONT, "中文衬线字体已加载: ${notoSerifCjk.path} (ttcIndex=$NOTO_SERIF_CJK_SC_INDEX)")
+                    return it
+                }
+            }
+        }
+        Log.i(TAG_FONT, "没有可用的中文衬线字体，维持系统默认")
+        return null
+    }
+
     private fun createParagraphTextView(text: String, headingLevel: Int, isCode: Boolean): TextView =
         TextView(this).apply {
             this.text = text
@@ -1192,7 +1253,10 @@ class MainActivity : AppCompatActivity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, currentSettings.fontSizeSp.toFloat() * sizeRatio)
             setLineSpacing(0f, currentSettings.lineSpacingMultiplier)
             letterSpacing = PARAGRAPH_LETTER_SPACING_EM
-            setTypeface(if (isCode) Typeface.MONOSPACE else typeface, if (headingLevel > 0) Typeface.BOLD else Typeface.NORMAL)
+            setTypeface(
+                if (isCode) Typeface.MONOSPACE else cjkSerifTypeface ?: typeface,
+                if (headingLevel > 0) Typeface.BOLD else Typeface.NORMAL,
+            )
         }
 
     private companion object {
@@ -1212,5 +1276,15 @@ class MainActivity : AppCompatActivity() {
         /** 见 [setupCenterTapToggleScrubber] KDoc——点击屏幕中央这块矩形区域（宽高各自 25%~75%）才切换翻页手柄显隐，不是点哪都算。 */
         const val CENTER_TAP_ZONE_START = 0.25f
         const val CENTER_TAP_ZONE_END = 0.75f
+
+        /**
+         * `NotoSerifCJK-Regular.ttc` 里简体中文那套字形的序号，见
+         * [cjkSerifTypeface] KDoc。真机读 `/system/etc/fonts.xml` 确认的
+         * （`lang="zh-Hans"` 那个 family 用的就是 index 2），不是猜的。
+         */
+        const val NOTO_SERIF_CJK_SC_INDEX = 2
+
+        /** 字体加载探针的 logcat 标签，见 [loadCjkSerifTypeface]。 */
+        const val TAG_FONT = "PdfReaderFont"
     }
 }

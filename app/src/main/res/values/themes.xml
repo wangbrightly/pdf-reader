@@ -25,7 +25,19 @@
         `values-night/colors.xml` KDoc。`forceDarkAllowed=false` 继续保留——
         我们自己已经手动做对了颜色，不需要系统再叠加一层猜测性质的启发式反色。
     -->
+    <!--
+        2026-09-16 报纸正文方案：纸色窗口背景（@color/bg_paper，浅/深色两份值见
+        values(-night)/colors.xml）+ 衬线字体。
+
+        这里的 `fontFamily="serif"` **只管得了拉丁字母**——真机截图确认中文仍是
+        黑体，根因是 MIUI 主题字体盖掉了系统 fonts.xml 里"中文宋体作为 serif
+        后备字体"那条链路。中文宋体是在代码里按文件路径单独加载并设上去的，见
+        MainActivity.cjkSerifTypeface。这一行保留，负责正文之外那些没有被代码
+        显式设置字体的文字（对话框、Toast 等）至少拉丁部分保持衬线风格。
+    -->
     <style name="Theme.PdfReader" parent="Theme.AppCompat.DayNight.NoActionBar">
         <item name="android:forceDarkAllowed" tools:targetApi="q">false</item>
+        <item name="android:windowBackground">@color/bg_paper</item>
+        <item name="android:fontFamily">serif</item>
     </style>
 </resources>

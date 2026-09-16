@@ -11,8 +11,20 @@
         深色/浅色模式共用同一个色值，不单独建 values-night——颜色本身饱和度和明度
         都适中，两种主题背景下对比度都够，没有必要为这一个颜色单独维护一份深色版本。
     -->
-    <color name="button_primary_bg">#3D5A80</color>
+    <!--
+        2026-09-16 用户在 Claude Design 里设计了"报纸正文"配色方案（1a 变体），
+        从 Design 项目自己的 styles.css 拿到精确色值（不是肉眼估色），下面几个
+        颜色对应设计系统 token 里的 accent 700 档、第二强调色 700 档、accent
+        500 档、neutral 800 档。滑杆 drawable 文件名（_purple/_coral/_teal 后缀）
+        是这次改之前起的，改完颜色值后名字和实际颜色对不上了（比如
+        accent_line_spacing 现在是玫红不是紫色），懒得为了改名字重新过一遍所有
+        引用，看到文件名别被误导。
+    -->
+    <color name="button_primary_bg">#006786</color>
     <color name="button_primary_text">#FFFFFF</color>
+
+    <!-- 2026-09-16 报纸正文方案的纸色背景，深色模式覆盖见 values-night/colors.xml。 -->
+    <color name="bg_paper">#F3F2F2</color>
 
     <!--
         2026-08-26 用户参照一张游戏音量滑杆截图反馈"滑杆圆点太素，想要旋钮质感"——
@@ -44,7 +56,7 @@
         seekbar_thumb_knob_*.xml），不是本该避免的重复——是这个具体约束下最简单
         能用的办法。
     -->
-    <color name="accent_line_spacing">#7C5CBF</color>
-    <color name="accent_padding">#D9607E</color>
-    <color name="accent_block_spacing">#2A9D8F</color>
+    <color name="accent_line_spacing">#AA0B56</color>
+    <color name="accent_padding">#38A6CF</color>
+    <color name="accent_block_spacing">#444141</color>
 </resources>
