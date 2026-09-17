@@ -67,4 +67,11 @@
         要么刺眼要么看不见。
     -->
     <color name="annotation_highlight">#CBEEFF</color>
+
+    <!--
+        笔记的底色，用设计系统第二支强调色的浅档（accent-2 200）。跟高亮的青色分开，
+        呼应设计稿里"高亮走青、批注走洋红"的分工，扫一眼就能分清哪句只是标出来、
+        哪句自己写过话。同样需要深色变体，见 values-night。
+    -->
+    <color name="annotation_note">#FFDEE6</color>
 </resources>

@@ -1,10 +1,11 @@
 package app.pdfreader.annotation
 
 /**
- * 批注的种类。第一批只做高亮；下划线/笔记/书签是后续增量，到时候再加值——
- * 存储格式里 [TextAnnotation.kind] 落的是枚举名字符串，加新值不影响已存的数据。
+ * 批注的种类。书签（页级、不挂在具体文字上）是后续增量，到时候再加值——存储格式里
+ * [TextAnnotation.kind] 落的是枚举名字符串，加新值不影响已存的数据，读到认不出的
+ * 种类整条跳过（见 [AnnotationStore]）。
  */
-enum class AnnotationKind { HIGHLIGHT }
+enum class AnnotationKind { HIGHLIGHT, UNDERLINE, NOTE }
 
 /**
  * 批注钉在文字上的位置。
@@ -36,4 +37,12 @@ data class TextAnnotation(
     val kind: AnnotationKind,
     val anchor: TextAnchor,
     val createdAt: Long,
+    /**
+     * 笔记正文，只有 [AnnotationKind.NOTE] 才有，高亮/下划线是 null。
+     *
+     * 存储格式里是可选字段：增量 2 存下来的老数据没有这个键，读出来就是 null，
+     * 不能因为缺字段就读不出整条批注——批注是用户自己攒的数据，往后加字段时
+     * 老数据必须照常打得开。
+     */
+    val note: String? = null,
 )

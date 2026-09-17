@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.BackgroundColorSpan
+import android.text.style.UnderlineSpan
 import android.provider.OpenableColumns
 import android.util.Log
 import android.util.TypedValue
@@ -23,6 +24,7 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -1285,20 +1287,26 @@ class MainActivity : AppCompatActivity() {
                 if (block.isCode) Typeface.MONOSPACE else cjkSerifTypeface ?: typeface,
                 if (block.headingLevel > 0) Typeface.BOLD else Typeface.NORMAL,
             )
-            applyHighlights(this, block.text, page, paragraphIndex, paragraphsOnPage)
+            applyAnnotationSpans(this, block.text, page, paragraphIndex, paragraphsOnPage)
             customSelectionActionModeCallback =
-                highlightSelectionCallback(this, block.text, page, paragraphIndex, paragraphsOnPage)
+                annotationSelectionCallback(this, block.text, page, paragraphIndex, paragraphsOnPage)
         }
 
     /**
-     * 把这一段当前该显示的高亮画上去。
+     * 把这一段当前该显示的批注样式画上去。
      *
      * 每次都从 [currentAnnotations] 现算，不缓存——段落 View 会随字号/边距变化重建
-     * （见 [applySettingsToView]），缓存一份"这段有哪些高亮"反而要跟着失效。
+     * （见 [applySettingsToView]），缓存一份"这段有哪些批注"反而要跟着失效。
      * 解析走 [AnchorResolver]：存的字符偏移对不上时它会按原话在整页范围内重新搜，
      * 完全找不到就 [AnchorResolution.Lost]，那条批注这次就不画（数据还在，不丢）。
+     *
+     * 三种样式：高亮=青色底、笔记=洋红底、下划线=系统下划线。前两个用设计系统里
+     * 两支强调色（青=accent、洋红=accent-2）区分，跟设计稿里"高亮走青、批注走洋红"
+     * 的分工一致。下划线用系统自带的 `UnderlineSpan`，颜色跟着正文字色走——安卓
+     * 公开 API 里没有"带颜色的下划线"这种 Span，真要做成设计稿那种洋红下划线得自己
+     * 写绘制逻辑，这次不做。
      */
-    private fun applyHighlights(
+    private fun applyAnnotationSpans(
         view: TextView,
         text: String,
         page: Int,
@@ -1317,25 +1325,27 @@ class MainActivity : AppCompatActivity() {
             if (resolution !is AnchorResolution.Resolved) return@forEach
             if (resolution.paragraphIndex != paragraphIndex) return@forEach
             if (resolution.endOffset > text.length) return@forEach
-            spannable.setSpan(
-                BackgroundColorSpan(ContextCompat.getColor(this, R.color.annotation_highlight)),
-                resolution.startOffset,
-                resolution.endOffset,
-                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
-            )
+            val span: Any = when (annotation.kind) {
+                AnnotationKind.HIGHLIGHT ->
+                    BackgroundColorSpan(ContextCompat.getColor(this, R.color.annotation_highlight))
+                AnnotationKind.NOTE ->
+                    BackgroundColorSpan(ContextCompat.getColor(this, R.color.annotation_note))
+                AnnotationKind.UNDERLINE -> UnderlineSpan()
+            }
+            spannable.setSpan(span, resolution.startOffset, resolution.endOffset, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             painted = true
         }
         view.text = if (painted) spannable else text
     }
 
     /**
-     * 给系统自带的选中菜单（复制/全选那一条）加一个"高亮"。
+     * 给系统自带的选中菜单（复制/全选那一条）加上"高亮/下划线/笔记"。
      *
      * 用系统的 `ActionMode` 而不是照设计稿自己做一条底部横栏：交互行为跟别的 App
      * 一致、不用自己接管选中事件和显隐时机，出 bug 的面小得多。视觉上是系统那种
      * 浮动小条，跟设计稿的底部衬线文字条不一样，这是用户拍板接受的取舍。
      */
-    private fun highlightSelectionCallback(
+    private fun annotationSelectionCallback(
         view: TextView,
         text: String,
         page: Int,
@@ -1343,23 +1353,42 @@ class MainActivity : AppCompatActivity() {
         paragraphsOnPage: List<String>,
     ) = object : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
-            // 必须显式 SHOW_AS_ACTION_ALWAYS：不加的话真机上这一项会被折叠进右边的
+            // 必须显式 SHOW_AS_ACTION_ALWAYS：不加的话真机上这几项会被折叠进右边的
             // "⋮"二级菜单，要点两次才够得着（MIUI 自己往这条工具栏塞了"问小爱""翻译"，
             // 主栏位置本来就紧张）——真机截图确认过，不是照文档推测的。
-            menu.add(Menu.NONE, MENU_ID_HIGHLIGHT, Menu.FIRST, R.string.annotation_highlight)
-                .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            listOf(
+                MENU_ID_HIGHLIGHT to R.string.annotation_highlight,
+                MENU_ID_UNDERLINE to R.string.annotation_underline,
+                MENU_ID_NOTE to R.string.annotation_note,
+            ).forEachIndexed { order, (id, titleRes) ->
+                menu.add(Menu.NONE, id, Menu.FIRST + order, titleRes)
+                    .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            }
             return true
         }
 
         override fun onPrepareActionMode(mode: ActionMode, menu: Menu) = false
 
         override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
-            if (item.itemId != MENU_ID_HIGHLIGHT) return false
+            val kind = when (item.itemId) {
+                MENU_ID_HIGHLIGHT -> AnnotationKind.HIGHLIGHT
+                MENU_ID_UNDERLINE -> AnnotationKind.UNDERLINE
+                MENU_ID_NOTE -> AnnotationKind.NOTE
+                else -> return false
+            }
             val start = view.selectionStart.coerceAtLeast(0)
             val end = view.selectionEnd.coerceAtMost(text.length)
             if (start < end) {
-                addHighlight(TextAnchor(page, paragraphIndex, start, end, text.substring(start, end)))
-                applyHighlights(view, text, page, paragraphIndex, paragraphsOnPage)
+                val anchor = TextAnchor(page, paragraphIndex, start, end, text.substring(start, end))
+                val repaint = { applyAnnotationSpans(view, text, page, paragraphIndex, paragraphsOnPage) }
+                if (kind == AnnotationKind.NOTE) {
+                    // 笔记要先问用户写什么，弹窗是异步的——写完才落盘、才重画，
+                    // 用户取消就什么都不留下（不能先存一条空笔记再等他补）。
+                    promptForNote { noteText -> addAnnotation(kind, anchor, noteText); repaint() }
+                } else {
+                    addAnnotation(kind, anchor, note = null)
+                    repaint()
+                }
             }
             mode.finish()
             return true
@@ -1368,17 +1397,38 @@ class MainActivity : AppCompatActivity() {
         override fun onDestroyActionMode(mode: ActionMode) = Unit
     }
 
-    /** 新增一条高亮并落盘。没有打开文档（[currentFileKey] 为 null）时什么都不做。 */
-    private fun addHighlight(anchor: TextAnchor) {
+    /** 新增一条批注并落盘。没有打开文档（[currentFileKey] 为 null）时什么都不做。 */
+    private fun addAnnotation(kind: AnnotationKind, anchor: TextAnchor, note: String?) {
         val fileKey = currentFileKey ?: return
         val annotation = TextAnnotation(
             id = UUID.randomUUID().toString(),
-            kind = AnnotationKind.HIGHLIGHT,
+            kind = kind,
             anchor = anchor,
             createdAt = System.currentTimeMillis(),
+            note = note,
         )
         currentAnnotations = currentAnnotations + annotation
         AnnotationStore.save(applicationContext, fileKey, currentAnnotations)
+    }
+
+    /**
+     * 弹输入框问用户笔记写什么，点确定才回调（取消什么都不做）。
+     *
+     * 输入框留空也算有效——用户可能只是想把这句标成"待回头细看"，强制他写点什么
+     * 没有道理。空笔记跟高亮的区别只是颜色不同，这是可接受的。
+     */
+    private fun promptForNote(onConfirmed: (String) -> Unit) {
+        val input = EditText(this).apply {
+            setHint(R.string.annotation_note_hint)
+            setSingleLine(false)
+            maxLines = NOTE_INPUT_MAX_LINES
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.annotation_note)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ -> onConfirmed(input.text.toString()) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     private companion object {
@@ -1409,7 +1459,12 @@ class MainActivity : AppCompatActivity() {
         /** 字体加载探针的 logcat 标签，见 [loadCjkSerifTypeface]。 */
         const val TAG_FONT = "PdfReaderFont"
 
-        /** 选中菜单里"高亮"那一项的 id，见 [highlightSelectionCallback]。 */
+        /** 选中菜单里三项批注的 id，见 [annotationSelectionCallback]。 */
         const val MENU_ID_HIGHLIGHT = 1
+        const val MENU_ID_UNDERLINE = 2
+        const val MENU_ID_NOTE = 3
+
+        /** 笔记输入框最多显示几行，超过就内部滚动，见 [promptForNote]。 */
+        const val NOTE_INPUT_MAX_LINES = 6
     }
 }

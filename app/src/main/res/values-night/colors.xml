@@ -50,4 +50,7 @@
         一带），底色比页面背景亮一点、又比正文文字暗得多，高亮看得出来、字也读得出来。
     -->
     <color name="annotation_highlight">#1F4A5E</color>
+
+    <!-- 笔记底色的深色变体，同 annotation_highlight 的理由，取洋红那支的深档。 -->
+    <color name="annotation_note">#5A1F35</color>
 </resources>

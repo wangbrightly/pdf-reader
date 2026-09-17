@@ -17,4 +17,7 @@
     <string name="toc_button">目录</string>
     <string name="toc_dialog_title">目录</string>
     <string name="annotation_highlight">高亮</string>
+    <string name="annotation_underline">下划线</string>
+    <string name="annotation_note">笔记</string>
+    <string name="annotation_note_hint">写点什么…</string>
 </resources>

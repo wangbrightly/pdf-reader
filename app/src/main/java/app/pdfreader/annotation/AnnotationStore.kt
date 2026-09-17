@@ -57,6 +57,7 @@ object AnnotationStore {
                     put("startOffset", annotation.anchor.startOffset)
                     put("endOffset", annotation.anchor.endOffset)
                     put("quotedText", annotation.anchor.quotedText)
+                    annotation.note?.let { put("note", it) }
                 },
             )
         }
@@ -82,6 +83,8 @@ object AnnotationStore {
                     quotedText = item.getString("quotedText"),
                 ),
                 createdAt = item.getLong("createdAt"),
+                // 老数据没有这个键（见 TextAnnotation.note KDoc），缺了就是 null。
+                note = if (item.has("note")) item.getString("note") else null,
             )
         }
     }
