@@ -1353,17 +1353,23 @@ class MainActivity : AppCompatActivity() {
         paragraphsOnPage: List<String>,
     ) = object : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
-            // 必须显式 SHOW_AS_ACTION_ALWAYS：不加的话真机上这几项会被折叠进右边的
-            // "⋮"二级菜单，要点两次才够得着（MIUI 自己往这条工具栏塞了"问小爱""翻译"，
-            // 主栏位置本来就紧张）——真机截图确认过，不是照文档推测的。
-            listOf(
-                MENU_ID_HIGHLIGHT to R.string.annotation_highlight,
-                MENU_ID_UNDERLINE to R.string.annotation_underline,
-                MENU_ID_NOTE to R.string.annotation_note,
-            ).forEachIndexed { order, (id, titleRes) ->
-                menu.add(Menu.NONE, id, Menu.FIRST + order, titleRes)
-                    .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
-            }
+            // 必须显式 SHOW_AS_ACTION_ALWAYS，不加的话会被折叠进右边的"⋮"，要点两次
+            // 才够得着——真机截图确认过，不是照文档推测的。
+            //
+            // 但主栏塞不下全部三项：MIUI 自己占了"问小爱"，加上系统的"全选"，真机
+            // 实测这条工具栏**按项数封顶在 4 项左右**（把"下划线"缩成"划线"省出宽度
+            // 也没能多塞一项，说明卡的不是宽度），三项全 ALWAYS 会把"笔记"和系统
+            // "复制"一起挤进二级菜单。
+            //
+            // 取舍：让"高亮"和"笔记"进主栏，"下划线"退到二级菜单。高亮最常用；笔记是
+            // 投入最大的动作（还要写字），卡在两次点击后面最不合理；下划线只是高亮的
+            // 样式变体，退一步代价最小。
+            menu.add(Menu.NONE, MENU_ID_HIGHLIGHT, Menu.FIRST, R.string.annotation_highlight)
+                .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            menu.add(Menu.NONE, MENU_ID_NOTE, Menu.FIRST + 1, R.string.annotation_note)
+                .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+            menu.add(Menu.NONE, MENU_ID_UNDERLINE, Menu.FIRST + 2, R.string.annotation_underline)
+                .setShowAsAction(MenuItem.SHOW_AS_ACTION_IF_ROOM)
             return true
         }
 
