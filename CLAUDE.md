@@ -88,6 +88,12 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 
 ## UI 视觉规范
 
+**2026-09-16 换成"报纸正文"方案**（用户在 Claude Design 里做的设计稿，三个方向里选的 1a），色值是从设计项目自己的 `styles.css` 读的精确 token，不是照截图估的：主按钮/"字号"滑杆 `#006786`、"行距" `#AA0B56`、"边距" `#38A6CF`、"段距" `#444141`、窗口背景 `#F3F2F2`（米白纸色）。下面这段关于"藏青蓝"的描述是换色之前写的，颜色值已过时，但"每根滑杆一个独立强调色、4 份独立 drawable 文件"这套机制不变（drawable 文件名的 `_purple`/`_coral`/`_teal` 后缀现在跟实际颜色对不上了，别被文件名误导）。
+
+**中文衬线体不能靠 `fontFamily="serif"`**（NOTES #72）：这台机器的 MIUI 应用了主题字体（`ro.miui.ui.font.theme_apply=true`），把 AOSP `fonts.xml` 里中文宋体 `fallbackFor="serif"` 那条后备链路盖掉了，主题里那行 `serif` 只管得了拉丁字母。中文宋体在 `MainActivity.cjkSerifTypeface` 里按路径加载 `/system/fonts/NotoSerifCJK-Regular.ttc`，**必须 `ttcIndex=2`** 才是简体字形（第 0 个是日文变体）。**别改用 `/product/fonts/MiSerifSCVF.ttf`**——名字带 Serif 和 SC、日志也报加载成功，但它只有 234KB 根本不含中文字形，中文会静默退回黑体。
+
+**设计稿只画了浅色版**：里面每个"中性色/接近背景色"的元素都要单独过一遍深色模式，这类颜色不会报错、只会安静消失（"段距"滑杆已经栽过一次，见 NOTES #72）。
+
 配色统一在 `colors.xml`（藏青蓝 `button_primary_bg` 是"字号"滑杆/主操作按钮的强调色；"行距"/"边距"/"段距"三个滑杆另有独立强调色 `accent_line_spacing`/`accent_padding`/`accent_block_spacing`，参照游戏音量滑杆截图"每条滑杆自己一个颜色"的设计，见 NOTES #46）。滑杆/翻页手柄的"旋钮"造型（实心圆+白色描边+抓握纹理）用 `VectorDrawable` 写死 `pathData`，不要用 `layer-list` 叠 `<shape>`——后者的 `<item>` 定位是"到边界的内边距"语义，摆不出"几条等间距线居中排列"这种效果；`VectorDrawable` 也不支持运行时传参染色（`tint` 会把多色 vector 里的白色描边一起染掉），4 种强调色对应 4 份独立的 thumb/track drawable 文件（`_purple`/`_coral`/`_teal` 后缀），见 NOTES #45/#46。
 
 **沉浸模式**（`MainActivity.updateChromeVisibility`）：点击屏幕中央区域（`CENTER_TAP_ZONE_START`~`END`）统一控制 `topButtonRow`（目录/打开 PDF/设置）、`fileNameLabel`、`settingsPanel`（4 个滑杆）、`pageScrubberThumb` 四样东西的显隐，`chromeRevealedByTap` + `settingsPanelExpanded` 两个独立状态的交集决定 `settingsPanel` 最终是否可见——**改这块前先读该函数 KDoc**，`topButtonRow` 在没有文档时（`currentSession == null`）有强制常驻显示的例外，不然用户点不到"打开 PDF"入口。
@@ -103,6 +109,18 @@ PdfBox-Android 和安卓原生 `BitmapFactory` 都解不出这台设备上的 CM
 - **上标/下标（纯数字）**：**真正生效的是 `absorbInlineScriptDigits`（2026-09-07 修复，见 NOTES #70），不是 `absorbSuperscriptSubscriptRuns`**——后者比较相邻两个 `Line`，但真实排版软件生成上标/下标用的是 PDF `Ts`（Text Rise）操作符，只偏移渲染基线、不移动文本行起点，PdfBox 的 `writeString` 不会因此拆行，"正文+上标+后续正文"整个落在**同一次 `writeString` 回调**里，根本不存在"两个相邻 Line"这个前提，`absorbSuperscriptSubscriptRuns` 架构上永远不会触发（真机拿 120 页真实学术书验证时零触发才发现）。`absorbInlineScriptDigits` 下沉到 `writeString` 内部直接扫 `TextPosition`：先找"出现次数最多的字号"代表这一行主字号（不是取最大值——两者在"整行只有一种字号"的常见场景结果相同，但语义上前者才对），圈连续的"抬升游程"（字号明显更小+y 偏移在范围内，跟 `absorbSuperscriptSubscriptRuns` 共用同一套阈值常量 `SUPERSCRIPT_FONT_SIZE_RATIO`/`MIN_SCRIPT_Y_OFFSET_PT`/`SUPERSCRIPT_MAX_Y_OFFSET_FONT_SIZE_RATIO`），游程整体全是 ASCII 数字才转换，混了非数字字符整个游程原样保留（不做部分转换）。两层机制并存：`absorbInlineScriptDigits` 处理"同一次 writeString 回调内"（真实文档的常见情况）；`absorbSuperscriptSubscriptRuns` 留着处理"PdfBox 恰好按坐标拆成两个相邻 Line"的理论情况，不冲突。**y 偏移符号方向是这个项目自己实测确认的**（`Line.y` 原点在页面左上、往下增大，物理位置更高的文字数值更小），不是照抄 mj_pdf 用 PDFium 坐标系的经验。非数字上下标（"4th"里的"th"、"xⁿ"）不处理。构造测试 fixture 必须用 `PDPageContentStream.setTextRise`，不能用 `newLineAtOffset` 挪 y 模拟——后者会被 PdfBox 自己的换行判定拆成独立 `Line`，测的是 `absorbSuperscriptSubscriptRuns` 那条几乎不会真正触发的路径，不是真实文档实际经过的路径。
 
 **标题分级/代码块目前还没有真机验证**（开发时 `adb devices` 一直是空的，设备没连接；上标/下标那次真机验证倒是做了，就是它暴露了上面这个架构 bug）。下次会话设备已连接时，第一优先级是拿真实文档肉眼核对：标题字号分级是否合理、代码块等宽字体排版观感——非 H3/非唯一门槛的阈值常量都是外推值，真机效果不理想应该用真实文档数据重新校准，不要凭感觉微调。上标/下标修复后同样还没有真机复核过实际显示效果（有单元测试覆盖但没有真实脚注文档肉眼核对），也排进这次真机验证清单。
+
+## 批注系统（2026-09-16 起，完整设计见 NOTES #73）
+
+分 6 个增量，目前完成前 2 个（数据层、高亮闭环），下划线/笔记、书签、列表跳转、导出待做。代码在 `app/pdfreader/annotation/`。
+
+**锚点不是纸面坐标**——这个 App 重排显示、不显示原版页面，纸面坐标在重排后没有意义。锚点记的是"第几页、页内第几段、段内第几个字到第几个字"，**并同时存一份原话**（`TextAnchor.quotedText`）。`AnchorResolver` 三级策略：偏移对得上直接用 → 对不上按原话在整页范围内重搜（多处命中取离原段落序号最近的）→ 都搜不到就 `Lost`，**不猜位置**（宁可不显示，也不把高亮画到用户没标过的文字上）。保险是必需的：段落切分/上下标处理这些抽取逻辑还在演进（#59/#65/#70 都改过），一改老批注偏移就错位。
+
+**页内段落序号只数文字块、图片不占号**，要跟 `AnchorResolver` 看到的 `paragraphsOnPage` 口径严格一致，改 `PdfPageAdapter` 的渲染循环时注意别把图片也算进序号。
+
+存储是 `filesDir/annotations/<文件标识>.json`，文件标识沿用 `ReadingProgressKey` 那套内容 SHA-256。读取时任何异常都当作"没有批注"——批注坏了不能连累用户打不开书。
+
+**已知局限**：整页栅格化的页面（表格/复杂分栏，见 #54/#58/#61）没有可选中的文字，做不了高亮/下划线/笔记，只能加页级书签。架构决定的，不是实现遗漏。
 
 ## 已知局限（如实告知过用户）
 
