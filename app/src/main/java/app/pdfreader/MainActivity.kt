@@ -1343,7 +1343,11 @@ class MainActivity : AppCompatActivity() {
         paragraphsOnPage: List<String>,
     ) = object : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+            // 必须显式 SHOW_AS_ACTION_ALWAYS：不加的话真机上这一项会被折叠进右边的
+            // "⋮"二级菜单，要点两次才够得着（MIUI 自己往这条工具栏塞了"问小爱""翻译"，
+            // 主栏位置本来就紧张）——真机截图确认过，不是照文档推测的。
             menu.add(Menu.NONE, MENU_ID_HIGHLIGHT, Menu.FIRST, R.string.annotation_highlight)
+                .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
             return true
         }
 
