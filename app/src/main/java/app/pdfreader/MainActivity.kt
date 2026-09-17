@@ -23,10 +23,13 @@ import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewGroup
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
@@ -217,6 +220,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var topButtonRow: View
     private lateinit var openButton: Button
     private lateinit var tocButton: Button
+    private lateinit var annotationsButton: Button
     private lateinit var toggleSettingsButton: Button
     private lateinit var settingsPanel: View
     private lateinit var progressBar: ProgressBar
@@ -373,6 +377,7 @@ class MainActivity : AppCompatActivity() {
         topButtonRow = findViewById(R.id.topButtonRow)
         openButton = findViewById(R.id.openButton)
         tocButton = findViewById(R.id.tocButton)
+        annotationsButton = findViewById(R.id.annotationsButton)
         toggleSettingsButton = findViewById(R.id.toggleSettingsButton)
         settingsPanel = findViewById(R.id.settingsPanel)
         progressBar = findViewById(R.id.progressBar)
@@ -397,7 +402,8 @@ class MainActivity : AppCompatActivity() {
         cjkSerifTypeface?.let { serif ->
             listOf<TextView>(
                 fileNameLabel, fontSizeLabel, lineSpacingLabel, paddingLabel,
-                blockSpacingLabel, pageScrubberLabel, openButton, tocButton, toggleSettingsButton,
+                blockSpacingLabel, pageScrubberLabel, openButton, tocButton, annotationsButton,
+                toggleSettingsButton,
             ).forEach { it.setTypeface(serif, it.typeface?.style ?: Typeface.NORMAL) }
         }
 
@@ -412,6 +418,7 @@ class MainActivity : AppCompatActivity() {
             openDocumentLauncher.launch(arrayOf("application/pdf"))
         }
         tocButton.setOnClickListener { showOutlineDialog() }
+        annotationsButton.setOnClickListener { showAnnotationsDialog() }
         toggleSettingsButton.setOnClickListener { toggleSettingsPanel() }
         // 用户反馈"设置菜单默认不展开"——冷启动、还没打开任何 PDF 时也应该是收起状态。
         // 只在 savedInstanceState == null（真正的冷启动，不是配置变化触发的重建）时
@@ -506,7 +513,12 @@ class MainActivity : AppCompatActivity() {
                 // （myGeneration 判断跟别处一致），避免用户中途换了文件之后旧文档的
                 // 回调还在瞎更新按钮状态。
                 val session = PdfTextExtractor.Session.open(applicationContext, file) {
-                    if (myGeneration == loadGeneration) runOnUiThread { syncTocButtonEnabled() }
+                    if (myGeneration == loadGeneration) {
+                        runOnUiThread {
+                            syncTocButtonEnabled()
+                            syncAnnotationsButtonEnabled()
+                        }
+                    }
                 }
                 android.util.Log.d(
                     "PdfReaderDebug",
@@ -1018,6 +1030,11 @@ class MainActivity : AppCompatActivity() {
         tocButton.isEnabled = currentSession?.outline?.isNotEmpty() == true
     }
 
+    /** [annotationsButton] 同理——这份文档一条批注都没有时灰掉，不隐藏。 */
+    private fun syncAnnotationsButtonEnabled() {
+        annotationsButton.isEnabled = currentAnnotations.isNotEmpty()
+    }
+
     /**
      * 弹出目录列表（`AlertDialog.setItems`——系统自带、自动可滚动，不需要引入新的
      * UI 库/自定义 Adapter）。层级用缩进表示：每深一级前面加一个全角空格，比半角
@@ -1415,6 +1432,101 @@ class MainActivity : AppCompatActivity() {
         )
         currentAnnotations = currentAnnotations + annotation
         AnnotationStore.save(applicationContext, fileKey, currentAnnotations)
+        syncAnnotationsButtonEnabled()
+    }
+
+    /**
+     * 弹出这份文档的全部批注，点一条跳到那一页，长按删除。
+     *
+     * **列表故意不做锚点解析**（[AnchorResolver]）：解析要拿到那一页当前抽出来的
+     * 全部段落，等于为了列个清单把每一页都加载一遍。列表直接显示锚点里存的原话
+     * （[TextAnchor.quotedText]）——这也正是存那份原话的第二个用处：哪怕抽取算法
+     * 变了、正文里那条高亮画不出来了（[AnchorResolution.Lost]），这里照样看得到
+     * 当初标的是哪句话。
+     *
+     * 按"页码 → 段落 → 段内位置"排序，也就是**按阅读顺序**排，不按创建时间——
+     * 回头翻批注时想的是"这本书我在哪几处做过标记"，不是"我上周三标了什么"。
+     *
+     * 删除放在长按上（安卓列表删除的常规手势），点击留给最高频的跳转。这是目前
+     * **唯一**能删掉一条批注的入口，标错了必须有地方撤销。
+     */
+    private fun showAnnotationsDialog() {
+        val sorted = currentAnnotations.sortedWith(
+            compareBy({ it.anchor.page }, { it.anchor.paragraphIndex }, { it.anchor.startOffset }),
+        )
+        if (sorted.isEmpty()) return
+        val listView = ListView(this)
+        listView.adapter = object : ArrayAdapter<TextAnnotation>(
+            this,
+            android.R.layout.simple_list_item_2,
+            android.R.id.text1,
+            sorted,
+        ) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val view = super.getView(position, convertView, parent)
+                val annotation = sorted[position]
+                view.findViewById<TextView>(android.R.id.text1).text = annotation.anchor.quotedText
+                view.findViewById<TextView>(android.R.id.text2).text = annotationSubtitle(annotation)
+                return view
+            }
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.annotations_dialog_title)
+            .setView(listView)
+            .show()
+        listView.setOnItemClickListener { _, _, position, _ ->
+            scrollToPage(sorted[position].anchor.page)
+            dialog.dismiss()
+        }
+        listView.setOnItemLongClickListener { _, _, position, _ ->
+            confirmDeleteAnnotation(sorted[position]) { dialog.dismiss() }
+            true
+        }
+    }
+
+    /** 列表第二行："第 N 页 · 种类"，笔记再把正文拼上（空笔记就只显示种类）。 */
+    private fun annotationSubtitle(annotation: TextAnnotation): String {
+        val kindLabel = getString(
+            when (annotation.kind) {
+                AnnotationKind.HIGHLIGHT -> R.string.annotation_highlight
+                AnnotationKind.UNDERLINE -> R.string.annotation_underline
+                AnnotationKind.NOTE -> R.string.annotation_note
+            },
+        )
+        val note = annotation.note
+        return if (annotation.kind == AnnotationKind.NOTE && !note.isNullOrBlank()) {
+            getString(R.string.annotation_list_subtitle_note, annotation.anchor.page, note)
+        } else {
+            getString(R.string.annotation_list_subtitle, annotation.anchor.page, kindLabel)
+        }
+    }
+
+    /** 跳到某一页，跟 [scrollToOutlineEntry] 同一套无动画直接跳转，理由见那里。 */
+    private fun scrollToPage(page: Int) {
+        val session = currentSession ?: return
+        recyclerView.scrollToPosition((page - 1).coerceIn(0, (session.pageCount - 1).coerceAtLeast(0)))
+    }
+
+    /**
+     * 删除前先确认——批注是用户自己攒的东西，长按误触删掉没处找回（没有回收站）。
+     * 确认框里带上原话，让用户看清要删的是哪一条。
+     */
+    private fun confirmDeleteAnnotation(annotation: TextAnnotation, onDeleted: () -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.annotation_delete_title)
+            .setMessage(annotation.anchor.quotedText)
+            .setPositiveButton(R.string.annotation_delete_confirm) { _, _ ->
+                val fileKey = currentFileKey ?: return@setPositiveButton
+                currentAnnotations = currentAnnotations.filterNot { it.id == annotation.id }
+                AnnotationStore.save(applicationContext, fileKey, currentAnnotations)
+                syncAnnotationsButtonEnabled()
+                // 已经画在屏幕上的那些段落不会自己知道批注少了一条，整个重新绑定一次
+                // （页内容有缓存，重新绑定不会重新解析 PDF）。
+                recyclerView.adapter?.notifyDataSetChanged()
+                onDeleted()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     /**

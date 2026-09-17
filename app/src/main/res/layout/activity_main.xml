@@ -121,6 +121,26 @@
             android:text="@string/toc_button"
             android:textSize="14sp" />
 
+        <!--
+            2026-09-16 批注列表入口。跟 tocButton 一样属于"内容导航"类操作（点一条
+            跳到那一页），所以并排放在左边、共用 bg_button_secondary 次要按钮样式；
+            同样用"没有就禁用"而不是隐藏，理由见 MainActivity 类注释"目录"一节：
+            按钮位置固定不随文档切换而跳动，灰掉本身就说明"这份文档还没有批注"。
+        -->
+        <Button
+            android:id="@+id/annotationsButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:background="@drawable/bg_button_secondary"
+            android:enabled="false"
+            android:minHeight="52dp"
+            android:minWidth="0dp"
+            android:paddingHorizontal="16dp"
+            android:stateListAnimator="@null"
+            android:text="@string/annotations_button"
+            android:textSize="14sp" />
+
         <Button
             android:id="@+id/openButton"
             android:layout_width="0dp"

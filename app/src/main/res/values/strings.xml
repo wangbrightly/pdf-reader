@@ -20,4 +20,11 @@
     <string name="annotation_underline">下划线</string>
     <string name="annotation_note">笔记</string>
     <string name="annotation_note_hint">写点什么…</string>
+    <string name="annotations_button">批注</string>
+    <string name="annotations_dialog_title">批注</string>
+    <!-- 列表第二行：第几页 + 种类，笔记再拼上正文，见 MainActivity.annotationSubtitle。 -->
+    <string name="annotation_list_subtitle">第 %1$d 页 · %2$s</string>
+    <string name="annotation_list_subtitle_note">第 %1$d 页 · 笔记：%2$s</string>
+    <string name="annotation_delete_title">删除这条批注？</string>
+    <string name="annotation_delete_confirm">删除</string>
 </resources>
