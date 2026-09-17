@@ -46,6 +46,7 @@ import androidx.recyclerview.widget.RecyclerView
 import app.pdfreader.annotation.AnchorResolution
 import app.pdfreader.annotation.AnchorResolver
 import app.pdfreader.annotation.AnnotationKind
+import app.pdfreader.annotation.AnnotationExporter
 import app.pdfreader.annotation.AnnotationStore
 import app.pdfreader.annotation.TextAnchor
 import app.pdfreader.annotation.TextAnnotation
@@ -1030,9 +1031,14 @@ class MainActivity : AppCompatActivity() {
         tocButton.isEnabled = currentSession?.outline?.isNotEmpty() == true
     }
 
-    /** [annotationsButton] 同理——这份文档一条批注都没有时灰掉，不隐藏。 */
+    /**
+     * [annotationsButton] 只要打开了文档就可点——它不只是"看已有批注"，还是"给这一页
+     * 加书签"和"导出"的入口（见 [showAnnotationsDialog]），一条批注都没有时也得进得去，
+     * 不然第一个书签永远加不上。这点跟 [tocButton] 不同：目录有没有是文档自带的属性，
+     * 没有就是真的没得看。
+     */
     private fun syncAnnotationsButtonEnabled() {
-        annotationsButton.isEnabled = currentAnnotations.isNotEmpty()
+        annotationsButton.isEnabled = currentSession != null
     }
 
     /**
@@ -1348,6 +1354,9 @@ class MainActivity : AppCompatActivity() {
                 AnnotationKind.NOTE ->
                     BackgroundColorSpan(ContextCompat.getColor(this, R.color.annotation_note))
                 AnnotationKind.UNDERLINE -> UnderlineSpan()
+                // 书签是页级的，不挂在具体文字上，正文里不画任何东西（它的锚点
+                // 除了页码之外都是占位值），见 AnnotationKind KDoc。
+                AnnotationKind.BOOKMARK -> return@forEach
             }
             spannable.setSpan(span, resolution.startOffset, resolution.endOffset, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             painted = true
@@ -1451,10 +1460,23 @@ class MainActivity : AppCompatActivity() {
      * **唯一**能删掉一条批注的入口，标错了必须有地方撤销。
      */
     private fun showAnnotationsDialog() {
+        val currentPage = currentVisiblePage() ?: return
         val sorted = currentAnnotations.sortedWith(
             compareBy({ it.anchor.page }, { it.anchor.paragraphIndex }, { it.anchor.startOffset }),
         )
-        if (sorted.isEmpty()) return
+        if (sorted.isEmpty()) {
+            // 空列表也要能进来——"给这一页加书签"这个入口在这个弹窗里，按钮一直
+            // 可点、弹窗一直打得开，不然一条批注都没有时就永远加不了第一个书签。
+            AlertDialog.Builder(this)
+                .setTitle(R.string.annotations_dialog_title)
+                .setMessage(R.string.annotations_empty)
+                .setPositiveButton(getString(R.string.annotation_add_bookmark, currentPage)) { _, _ ->
+                    addBookmark(currentPage)
+                }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
+            return
+        }
         val listView = ListView(this)
         listView.adapter = object : ArrayAdapter<TextAnnotation>(
             this,
@@ -1465,7 +1487,7 @@ class MainActivity : AppCompatActivity() {
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val view = super.getView(position, convertView, parent)
                 val annotation = sorted[position]
-                view.findViewById<TextView>(android.R.id.text1).text = annotation.anchor.quotedText
+                view.findViewById<TextView>(android.R.id.text1).text = annotationTitle(annotation)
                 view.findViewById<TextView>(android.R.id.text2).text = annotationSubtitle(annotation)
                 return view
             }
@@ -1473,6 +1495,10 @@ class MainActivity : AppCompatActivity() {
         val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.annotations_dialog_title)
             .setView(listView)
+            .setPositiveButton(getString(R.string.annotation_add_bookmark, currentPage)) { _, _ ->
+                addBookmark(currentPage)
+            }
+            .setNeutralButton(R.string.annotation_export) { _, _ -> exportAnnotations() }
             .show()
         listView.setOnItemClickListener { _, _, position, _ ->
             scrollToPage(sorted[position].anchor.page)
@@ -1484,6 +1510,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 列表第一行：原话；书签没有原话，改成显示"第 N 页"，不然那一行是空的。 */
+    private fun annotationTitle(annotation: TextAnnotation): String =
+        annotation.anchor.quotedText.ifEmpty { getString(R.string.annotation_page_only, annotation.anchor.page) }
+
     /** 列表第二行："第 N 页 · 种类"，笔记再把正文拼上（空笔记就只显示种类）。 */
     private fun annotationSubtitle(annotation: TextAnnotation): String {
         val kindLabel = getString(
@@ -1491,6 +1521,7 @@ class MainActivity : AppCompatActivity() {
                 AnnotationKind.HIGHLIGHT -> R.string.annotation_highlight
                 AnnotationKind.UNDERLINE -> R.string.annotation_underline
                 AnnotationKind.NOTE -> R.string.annotation_note
+                AnnotationKind.BOOKMARK -> R.string.annotation_bookmark
             },
         )
         val note = annotation.note
@@ -1527,6 +1558,45 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
+    }
+
+    /** 当前屏幕上第一条可见内容属于第几页（1-based），没打开文档时 null。 */
+    private fun currentVisiblePage(): Int? {
+        val pageCount = currentSession?.pageCount ?: return null
+        val position = layoutManager.findFirstVisibleItemPosition()
+        if (position == RecyclerView.NO_POSITION) return null
+        return (position + 1).coerceIn(1, pageCount)
+    }
+
+    /**
+     * 给某一页加书签。书签不挂在文字上，[TextAnchor] 除页码外都是占位值
+     * （见 [AnnotationKind] KDoc）——整页栅格化的页面（表格/复杂分栏）没有可选中的
+     * 文字，高亮/下划线/笔记都用不了，书签是那种页面上唯一能用的批注方式。
+     *
+     * 同一页重复加书签会得到重复条目，没有去重——去重要么悄悄吞掉用户的操作（他
+     * 会以为没生效），要么弹提示打断阅读，都比多一条能随手删掉的记录更烦人。
+     */
+    private fun addBookmark(page: Int) {
+        addAnnotation(AnnotationKind.BOOKMARK, TextAnchor(page, 0, 0, 0, ""), note = null)
+        Toast.makeText(this, getString(R.string.annotation_bookmark_added, page), Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * 把这份文档的批注导成 Markdown，走系统分享（发到笔记软件/邮件/聊天窗口都行）。
+     *
+     * 用分享而不是"存成文件"：存文件要么落进 App 私有目录（用户在文件管理器里根本
+     * 找不到），要么得申请存储权限、配 FileProvider，为一个纯文本产物不值当。分享
+     * 出去之后存哪儿由用户自己决定。
+     */
+    private fun exportAnnotations() {
+        val documentName = fileNameLabel.text?.toString().orEmpty().ifEmpty { getString(R.string.app_name) }
+        val markdown = AnnotationExporter.toMarkdown(documentName, currentAnnotations)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, documentName)
+            putExtra(Intent.EXTRA_TEXT, markdown)
+        }
+        startActivity(Intent.createChooser(intent, getString(R.string.annotation_export)))
     }
 
     /**

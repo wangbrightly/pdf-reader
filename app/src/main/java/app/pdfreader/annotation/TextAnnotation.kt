@@ -1,11 +1,15 @@
 package app.pdfreader.annotation
 
 /**
- * 批注的种类。书签（页级、不挂在具体文字上）是后续增量，到时候再加值——存储格式里
- * [TextAnnotation.kind] 落的是枚举名字符串，加新值不影响已存的数据，读到认不出的
- * 种类整条跳过（见 [AnnotationStore]）。
+ * 批注的种类。[BOOKMARK] 是页级的，不挂在具体文字上——它的 [TextAnnotation.anchor]
+ * 只有 [TextAnchor.page] 有意义，其余字段是占位（[TextAnchor.quotedText] 为空串），
+ * 渲染时不画任何 Span。整页栅格化的页面（表格/复杂分栏）没有可选中的文字，做不了
+ * 高亮/下划线/笔记，书签是那种页面上唯一能用的批注方式。
+ *
+ * 存储格式里 [TextAnnotation.kind] 落的是枚举名字符串，加新值不影响已存的数据，
+ * 读到认不出的种类整条跳过（见 [AnnotationStore]）。
  */
-enum class AnnotationKind { HIGHLIGHT, UNDERLINE, NOTE }
+enum class AnnotationKind { HIGHLIGHT, UNDERLINE, NOTE, BOOKMARK }
 
 /**
  * 批注钉在文字上的位置。

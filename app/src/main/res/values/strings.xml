@@ -27,4 +27,10 @@
     <string name="annotation_list_subtitle_note">第 %1$d 页 · 笔记：%2$s</string>
     <string name="annotation_delete_title">删除这条批注？</string>
     <string name="annotation_delete_confirm">删除</string>
+    <string name="annotation_bookmark">书签</string>
+    <string name="annotation_page_only">第 %1$d 页</string>
+    <string name="annotation_add_bookmark">给第 %1$d 页加书签</string>
+    <string name="annotation_bookmark_added">已给第 %1$d 页加书签</string>
+    <string name="annotation_export">导出</string>
+    <string name="annotations_empty">这份文档还没有批注。选中正文文字可以加高亮、下划线、笔记。</string>
 </resources>
