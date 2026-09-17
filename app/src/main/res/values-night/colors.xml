@@ -43,4 +43,11 @@
         画在自己的纯色块上，深浅背景下都看得清（真机同一张截图确认）。
     -->
     <color name="accent_block_spacing">#BAB6B6</color>
+
+    <!--
+        深色模式的批注高亮底色。不能直接用浅色模式那个 #CBEEFF——浅蓝底配深色模式
+        的浅色正文字，字会糊在底色里看不清。取设计系统同一支青色的深档（accent 800
+        一带），底色比页面背景亮一点、又比正文文字暗得多，高亮看得出来、字也读得出来。
+    -->
+    <color name="annotation_highlight">#1F4A5E</color>
 </resources>

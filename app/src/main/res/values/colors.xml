@@ -59,4 +59,12 @@
     <color name="accent_line_spacing">#AA0B56</color>
     <color name="accent_padding">#38A6CF</color>
     <color name="accent_block_spacing">#444141</color>
+
+    <!--
+        2026-09-16 批注高亮的底色。设计稿用的是 accent 200 档（#CBEEFF 浅蓝）——
+        注意这是**给浅色纸背景挑的**，深色模式必须另配一套（values-night/colors.xml），
+        同一天"段距"滑杆已经在这个坑上栽过一次：设计稿不画深色版本，照搬过去
+        要么刺眼要么看不见。
+    -->
+    <color name="annotation_highlight">#CBEEFF</color>
 </resources>

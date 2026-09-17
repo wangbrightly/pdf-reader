@@ -16,4 +16,5 @@
     <string name="settings_toggle_show">设置</string>
     <string name="toc_button">目录</string>
     <string name="toc_dialog_title">目录</string>
+    <string name="annotation_highlight">高亮</string>
 </resources>

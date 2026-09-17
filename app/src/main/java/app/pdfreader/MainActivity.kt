@@ -9,10 +9,16 @@ import android.graphics.fonts.FontFamily
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.BackgroundColorSpan
 import android.provider.OpenableColumns
 import android.util.Log
 import android.util.TypedValue
 import android.view.GestureDetector
+import android.view.ActionMode
+import android.view.Menu
+import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -26,11 +32,18 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.os.BundleCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import app.pdfreader.annotation.AnchorResolution
+import app.pdfreader.annotation.AnchorResolver
+import app.pdfreader.annotation.AnnotationKind
+import app.pdfreader.annotation.AnnotationStore
+import app.pdfreader.annotation.TextAnchor
+import app.pdfreader.annotation.TextAnnotation
 import app.pdfreader.extract.OutlineEntry
 import app.pdfreader.extract.PdfTextExtractor
 import app.pdfreader.progress.LastOpenedFileStore
@@ -40,10 +53,12 @@ import app.pdfreader.settings.ReaderSettings
 import app.pdfreader.settings.ReaderSettingsPreferences
 import app.pdfreader.ui.IntentUriResolver
 import app.pdfreader.ui.PdfLoadReducer
+import app.pdfreader.ui.DisplayBlock
 import app.pdfreader.ui.PdfLoadState
 import app.pdfreader.ui.PdfPageAdapter
 import java.io.File
 import java.io.FileNotFoundException
+import java.util.UUID
 import kotlin.concurrent.thread
 import kotlin.math.roundToInt
 
@@ -305,6 +320,14 @@ class MainActivity : AppCompatActivity() {
     private var currentFileKey: String? = null
 
     /**
+     * 当前文档的全部批注，[loadPdf] 里按 [currentFileKey] 一次性读进来。
+     *
+     * 常驻内存而不是每页现读：段落 View 随字号/边距变化频繁重建，每次重建都去读
+     * 文件太浪费；一份文档的批注量级是几十到几百条，放内存没有负担。
+     */
+    private var currentAnnotations: List<TextAnnotation> = emptyList()
+
+    /**
      * 内容渲染完成后要滚动到的页码（1-based）。[loadPdf] 里从 [ReadingProgressStore]
      * 读出来，见类注释"阅读进度"一节。消费一次（在 [restoreScrollPositionIfNeeded]
      * 里）就清空，避免下一次渲染误用旧值。
@@ -503,6 +526,7 @@ class MainActivity : AppCompatActivity() {
                 currentCacheFile = file
                 val fileKey = ReadingProgressKey.fromFile(file)
                 currentFileKey = fileKey
+                currentAnnotations = AnnotationStore.load(applicationContext, fileKey)
                 val savedPage = ReadingProgressStore.loadPage(applicationContext, fileKey)
                 pendingScrollPage = (savedPage ?: 1).coerceIn(1, session.pageCount)
                 session.pageCount
@@ -1236,15 +1260,19 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    private fun createParagraphTextView(text: String, headingLevel: Int, isCode: Boolean): TextView =
+    private fun createParagraphTextView(
+        block: DisplayBlock.Text,
+        page: Int,
+        paragraphIndex: Int,
+        paragraphsOnPage: List<String>,
+    ): TextView =
         TextView(this).apply {
-            this.text = text
             setTextIsSelectable(true)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
-            val sizeRatio = when (headingLevel) {
+            val sizeRatio = when (block.headingLevel) {
                 1 -> HEADING_SIZE_RATIO_H1
                 2 -> HEADING_SIZE_RATIO_H2
                 3 -> HEADING_SIZE_RATIO_H3
@@ -1254,10 +1282,100 @@ class MainActivity : AppCompatActivity() {
             setLineSpacing(0f, currentSettings.lineSpacingMultiplier)
             letterSpacing = PARAGRAPH_LETTER_SPACING_EM
             setTypeface(
-                if (isCode) Typeface.MONOSPACE else cjkSerifTypeface ?: typeface,
-                if (headingLevel > 0) Typeface.BOLD else Typeface.NORMAL,
+                if (block.isCode) Typeface.MONOSPACE else cjkSerifTypeface ?: typeface,
+                if (block.headingLevel > 0) Typeface.BOLD else Typeface.NORMAL,
             )
+            applyHighlights(this, block.text, page, paragraphIndex, paragraphsOnPage)
+            customSelectionActionModeCallback =
+                highlightSelectionCallback(this, block.text, page, paragraphIndex, paragraphsOnPage)
         }
+
+    /**
+     * 把这一段当前该显示的高亮画上去。
+     *
+     * 每次都从 [currentAnnotations] 现算，不缓存——段落 View 会随字号/边距变化重建
+     * （见 [applySettingsToView]），缓存一份"这段有哪些高亮"反而要跟着失效。
+     * 解析走 [AnchorResolver]：存的字符偏移对不上时它会按原话在整页范围内重新搜，
+     * 完全找不到就 [AnchorResolution.Lost]，那条批注这次就不画（数据还在，不丢）。
+     */
+    private fun applyHighlights(
+        view: TextView,
+        text: String,
+        page: Int,
+        paragraphIndex: Int,
+        paragraphsOnPage: List<String>,
+    ) {
+        val onThisPage = currentAnnotations.filter { it.anchor.page == page }
+        if (onThisPage.isEmpty()) {
+            view.text = text
+            return
+        }
+        val spannable = SpannableString(text)
+        var painted = false
+        onThisPage.forEach { annotation ->
+            val resolution = AnchorResolver.resolve(annotation.anchor, paragraphsOnPage)
+            if (resolution !is AnchorResolution.Resolved) return@forEach
+            if (resolution.paragraphIndex != paragraphIndex) return@forEach
+            if (resolution.endOffset > text.length) return@forEach
+            spannable.setSpan(
+                BackgroundColorSpan(ContextCompat.getColor(this, R.color.annotation_highlight)),
+                resolution.startOffset,
+                resolution.endOffset,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            painted = true
+        }
+        view.text = if (painted) spannable else text
+    }
+
+    /**
+     * 给系统自带的选中菜单（复制/全选那一条）加一个"高亮"。
+     *
+     * 用系统的 `ActionMode` 而不是照设计稿自己做一条底部横栏：交互行为跟别的 App
+     * 一致、不用自己接管选中事件和显隐时机，出 bug 的面小得多。视觉上是系统那种
+     * 浮动小条，跟设计稿的底部衬线文字条不一样，这是用户拍板接受的取舍。
+     */
+    private fun highlightSelectionCallback(
+        view: TextView,
+        text: String,
+        page: Int,
+        paragraphIndex: Int,
+        paragraphsOnPage: List<String>,
+    ) = object : ActionMode.Callback {
+        override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+            menu.add(Menu.NONE, MENU_ID_HIGHLIGHT, Menu.FIRST, R.string.annotation_highlight)
+            return true
+        }
+
+        override fun onPrepareActionMode(mode: ActionMode, menu: Menu) = false
+
+        override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+            if (item.itemId != MENU_ID_HIGHLIGHT) return false
+            val start = view.selectionStart.coerceAtLeast(0)
+            val end = view.selectionEnd.coerceAtMost(text.length)
+            if (start < end) {
+                addHighlight(TextAnchor(page, paragraphIndex, start, end, text.substring(start, end)))
+                applyHighlights(view, text, page, paragraphIndex, paragraphsOnPage)
+            }
+            mode.finish()
+            return true
+        }
+
+        override fun onDestroyActionMode(mode: ActionMode) = Unit
+    }
+
+    /** 新增一条高亮并落盘。没有打开文档（[currentFileKey] 为 null）时什么都不做。 */
+    private fun addHighlight(anchor: TextAnchor) {
+        val fileKey = currentFileKey ?: return
+        val annotation = TextAnnotation(
+            id = UUID.randomUUID().toString(),
+            kind = AnnotationKind.HIGHLIGHT,
+            anchor = anchor,
+            createdAt = System.currentTimeMillis(),
+        )
+        currentAnnotations = currentAnnotations + annotation
+        AnnotationStore.save(applicationContext, fileKey, currentAnnotations)
+    }
 
     private companion object {
         const val MAX_ZOOM_MULTIPLIER = 4f
@@ -1286,5 +1404,8 @@ class MainActivity : AppCompatActivity() {
 
         /** 字体加载探针的 logcat 标签，见 [loadCjkSerifTypeface]。 */
         const val TAG_FONT = "PdfReaderFont"
+
+        /** 选中菜单里"高亮"那一项的 id，见 [highlightSelectionCallback]。 */
+        const val MENU_ID_HIGHLIGHT = 1
     }
 }

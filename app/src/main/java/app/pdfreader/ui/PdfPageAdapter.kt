@@ -44,14 +44,18 @@ import java.util.concurrent.atomic.AtomicLong
  * 个工厂函数依赖当前的字号/边距设置、双指缩放手势这些 `Activity` 层面的可变状态，
  * 不适合让 `Adapter` 自己持有一份可能过期的设置快照。[blockSpacingDpProvider] 同理，
  * 段距现在是设置面板里可拖动的值（见 `ReaderSettings.blockSpacingDp`），每次绑定
- * 都要读最新值，不能在构造时存成快照。[createParagraphView] 的第二个参数
- * （2026-08-20 新增，2026-09-06 从 Boolean 升级成分级 Int）是
- * [DisplayBlock.Text.headingLevel]，具体字号/字重由调用方决定；第三个参数
- * （2026-09-06 新增）是 [DisplayBlock.Text.isCode]，是否用等宽字体展示。
+ * 都要读最新值，不能在构造时存成快照。
+ *
+ * [createParagraphView] 的四个参数：文字块本身（标题级别/是否代码块都在里面，
+ * 2026-09-16 从散开的三个位置参数收成一个 [DisplayBlock.Text]，再往上加就没法读了）、
+ * 1-based 页码、**页内段落序号**（只数文字块，图片不占序号）、这一页所有段落的
+ * 文字。后两个是给批注用的：批注锚点记的就是"第几页第几段第几个字"，而锚点解析
+ * 在字符偏移对不上时要在整页范围内按原话重新搜，所以得把整页段落一起给过去，
+ * 见 `app.pdfreader.annotation.AnchorResolver`。
  */
 class PdfPageAdapter(
     private val session: PdfTextExtractor.Session,
-    private val createParagraphView: (String, Int, Boolean) -> View,
+    private val createParagraphView: (DisplayBlock.Text, Int, Int, List<String>) -> View,
     private val createImageView: (Bitmap) -> View,
     private val blockSpacingDpProvider: () -> Int,
 ) : RecyclerView.Adapter<PdfPageAdapter.PageViewHolder>() {
@@ -220,7 +224,7 @@ class PdfPageAdapter(
         val pageNo = position + 1
         val cached = cache[pageNo]
         if (cached != null) {
-            renderPage(holder, cached)
+            renderPage(holder, cached, pageNo)
             return
         }
         renderLoadingPlaceholder(holder)
@@ -245,7 +249,7 @@ class PdfPageAdapter(
                         onTextReady = { textBlocks ->
                             holder.itemView.post {
                                 if (holder.bindingAdapterPosition == position) {
-                                    renderProgressiveBlocks(holder, textBlocks, isFirst = true)
+                                    renderProgressiveBlocks(holder, textBlocks, isFirst = true, page = pageNo)
                                 }
                             }
                             previewShown = true
@@ -253,7 +257,7 @@ class PdfPageAdapter(
                     ) { bitmap ->
                         holder.itemView.post {
                             if (holder.bindingAdapterPosition == position) {
-                                renderProgressiveBlocks(holder, listOf(DisplayBlock.Image(bitmap)), isFirst = !previewShown)
+                                renderProgressiveBlocks(holder, listOf(DisplayBlock.Image(bitmap)), isFirst = !previewShown, page = pageNo)
                             }
                         }
                         previewShown = true
@@ -268,7 +272,7 @@ class PdfPageAdapter(
                     // 这一步是权威的最终结果——见 onImageReady KDoc，可能跟渐进预览
                     // 展示过的内容不完全一样（图片拼接、表格裁剪替换掉预览等），
                     // 整页重新渲染一次，不依赖/信任渐进阶段已经画出来的东西。
-                    if (holder.bindingAdapterPosition == position) renderPage(holder, content)
+                    if (holder.bindingAdapterPosition == position) renderPage(holder, content, pageNo)
                 }
             },
         )
@@ -282,16 +286,25 @@ class PdfPageAdapter(
      * 一致。这里画出来的东西是"边算边预览"，不是最终结果——[renderPage] 最终会
      * 整体替换掉这里画的内容。
      */
-    private fun renderProgressiveBlocks(holder: PageViewHolder, blocks: List<DisplayBlock>, isFirst: Boolean) {
+    private fun renderProgressiveBlocks(
+        holder: PageViewHolder,
+        blocks: List<DisplayBlock>,
+        isFirst: Boolean,
+        page: Int,
+    ) {
         val container = holder.itemView as LinearLayout
         if (isFirst) {
             container.removeAllViews()
             resetContainerFromPlaceholderState(container)
         }
         val spacingDp = blockSpacingDpProvider()
+        // 段落序号是"页内第几个文字块"（图片不占序号），要跟 AnchorResolver 看到的
+        // paragraphsOnPage 口径一致，见 app.pdfreader.annotation.TextAnchor。
+        val paragraphsOnPage = blocks.filterIsInstance<DisplayBlock.Text>().map { it.text }
+        var paragraphIndex = 0
         blocks.forEach { block ->
             val view = when (block) {
-                is DisplayBlock.Text -> createParagraphView(block.text, block.headingLevel, block.isCode)
+                is DisplayBlock.Text -> createParagraphView(block, page, paragraphIndex++, paragraphsOnPage)
                 is DisplayBlock.Image -> createImageView(block.bitmap)
             }
             if (container.childCount > 0) {
@@ -362,14 +375,16 @@ class PdfPageAdapter(
      * 会不一样看着别扭）。同日再改：这个值从写死常量改成可调（用户要求设置面板里
      * 加一个段距拉杆），见 `ReaderSettings.blockSpacingDp`。
      */
-    private fun renderPage(holder: PageViewHolder, content: PdfTextExtractor.PageContent) {
+    private fun renderPage(holder: PageViewHolder, content: PdfTextExtractor.PageContent, page: Int) {
         val container = holder.itemView as LinearLayout
         container.removeAllViews()
         resetContainerFromPlaceholderState(container)
         val spacingDp = blockSpacingDpProvider()
+        val paragraphsOnPage = content.blocks.filterIsInstance<DisplayBlock.Text>().map { it.text }
+        var paragraphIndex = 0
         content.blocks.forEachIndexed { index, block ->
             val view = when (block) {
-                is DisplayBlock.Text -> createParagraphView(block.text, block.headingLevel, block.isCode)
+                is DisplayBlock.Text -> createParagraphView(block, page, paragraphIndex++, paragraphsOnPage)
                 is DisplayBlock.Image -> createImageView(block.bitmap)
             }
             if (index > 0) {
