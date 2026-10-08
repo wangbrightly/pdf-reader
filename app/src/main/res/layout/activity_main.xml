@@ -267,6 +267,18 @@
             android:progressDrawable="@drawable/seekbar_track_thick_teal"
             android:thumb="@drawable/seekbar_thumb_knob_teal" />
 
+        <!-- 2026-10-08 赞赏入口：放在设置面板最底下，平时随面板收起，不打扰阅读。 -->
+        <Button
+            android:id="@+id/donateButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:background="@drawable/bg_button_secondary"
+            android:minHeight="48dp"
+            android:stateListAnimator="@null"
+            android:text="@string/donate_entry"
+            android:textSize="14sp" />
+
     </LinearLayout>
 
     <ProgressBar

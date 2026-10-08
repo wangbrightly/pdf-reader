@@ -60,6 +60,7 @@ import app.pdfreader.settings.ReaderSettingsPreferences
 import app.pdfreader.ui.IntentUriResolver
 import app.pdfreader.ui.PdfLoadReducer
 import app.pdfreader.ui.DisplayBlock
+import app.pdfreader.ui.DonateDialog
 import app.pdfreader.ui.PdfLoadState
 import app.pdfreader.ui.PdfPageAdapter
 import java.io.File
@@ -421,6 +422,7 @@ class MainActivity : AppCompatActivity() {
         tocButton.setOnClickListener { showOutlineDialog() }
         annotationsButton.setOnClickListener { showAnnotationsDialog() }
         toggleSettingsButton.setOnClickListener { toggleSettingsPanel() }
+        findViewById<Button>(R.id.donateButton).setOnClickListener { DonateDialog.show(this) }
         // 用户反馈"设置菜单默认不展开"——冷启动、还没打开任何 PDF 时也应该是收起状态。
         // 只在 savedInstanceState == null（真正的冷启动，不是配置变化触发的重建）时
         // 收起，配置变化重建时不该打断用户当时正在做的事（比如正展开着调字号）。

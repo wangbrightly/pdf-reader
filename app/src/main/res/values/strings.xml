@@ -33,4 +33,11 @@
     <string name="annotation_bookmark_added">已给第 %1$d 页加书签</string>
     <string name="annotation_export">导出</string>
     <string name="annotations_empty">这份文档还没有批注。选中正文文字可以加高亮、下划线、笔记。</string>
+    <string name="donate_entry">☕ 赞赏作者</string>
+    <string name="donate_title">喜欢这个 App？请作者喝杯咖啡</string>
+    <string name="donate_save">保存到相册</string>
+    <string name="donate_close">关闭</string>
+    <string name="donate_saved">已保存到相册，打开微信「扫一扫」→ 相册，选这张图即可</string>
+    <string name="donate_save_failed">保存失败，请直接截图后用微信扫一扫识别</string>
+    <string name="donate_save_old_android">请直接截图，再用微信扫一扫 → 相册识别</string>
 </resources>
