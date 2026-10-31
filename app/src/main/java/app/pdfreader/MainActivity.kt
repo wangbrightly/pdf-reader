@@ -370,6 +370,11 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        val lightBars = resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK != android.content.res.Configuration.UI_MODE_NIGHT_YES
+        androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = lightBars
+            isAppearanceLightNavigationBars = lightBars
+        }
         applySystemBarInsetsAsPadding()
 
         fileNameLabel = findViewById(R.id.fileNameLabel)
@@ -397,17 +402,6 @@ class MainActivity : AppCompatActivity() {
         pageScrubberTrack = findViewById(R.id.pageScrubberTrack)
         pageScrubberThumb = findViewById(R.id.pageScrubberThumb)
         pageScrubberLabel = findViewById(R.id.pageScrubberLabel)
-
-        // 工具栏这几处也统一成中文宋体，否则同一行里中英文一个黑体一个衬线体
-        // （"打开 PDF"最明显），见 [cjkSerifTypeface] KDoc。粗体是 XML 里定的，
-        // 换字体时要把原来的字形样式带上，不然滑杆标签会丢掉加粗。
-        cjkSerifTypeface?.let { serif ->
-            listOf<TextView>(
-                fileNameLabel, fontSizeLabel, lineSpacingLabel, paddingLabel,
-                blockSpacingLabel, pageScrubberLabel, openButton, tocButton, annotationsButton,
-                toggleSettingsButton,
-            ).forEach { it.setTypeface(serif, it.typeface?.style ?: Typeface.NORMAL) }
-        }
 
         currentSettings = ReaderSettingsPreferences.load(applicationContext)
         applySettingsToView(currentSettings)

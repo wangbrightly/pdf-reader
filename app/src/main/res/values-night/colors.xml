@@ -22,7 +22,14 @@
     87% 不透明黑对称。
 -->
 <resources>
-    <color name="label_text_emphasis">#DEFFFFFF</color>
+    <color name="label_text_emphasis">#F3F2EB</color>
+    <color name="button_primary_bg">#92CDBB</color>
+    <color name="button_primary_text">#17352E</color>
+    <color name="surface_soft">#29332F</color>
+    <color name="surface_disabled">#26302C</color>
+    <color name="track_unfilled">#46534C</color>
+    <color name="accent_line_spacing">#92CDBB</color>
+    <color name="accent_padding">#92CDBB</color>
 
     <!--
         2026-09-16 报纸正文方案新增了写死的纸色窗口背景（values/colors.xml 的
@@ -30,7 +37,7 @@
         系统深色模式——设计稿本身没有画深色版本，这个值是延续"墨色纸"的隐喻自己
         选的，不是从设计稿量出来的。
     -->
-    <color name="bg_paper">#1C1B1A</color>
+    <color name="bg_paper">#1C2421</color>
 
     <!--
         2026-09-16 真机深色模式实测发现的坑：报纸正文方案给"段距"滑杆选的
@@ -42,7 +49,7 @@
         另外三根滑杆不需要深色变体：青蓝/玫红/浅青蓝本身是有彩色且明度适中，
         画在自己的纯色块上，深浅背景下都看得清（真机同一张截图确认）。
     -->
-    <color name="accent_block_spacing">#BAB6B6</color>
+    <color name="accent_block_spacing">#92CDBB</color>
 
     <!--
         深色模式的批注高亮底色。不能直接用浅色模式那个 #CBEEFF——浅蓝底配深色模式

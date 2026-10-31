@@ -176,15 +176,21 @@
         settingsPanelExpanded 默认 false 保持一致，不依赖 collapseSettingsPanel()
         在 onCreate 里跑一次才收起（它现在只是个状态已经是收起时的空操作）。
     -->
-    <LinearLayout
+    <ScrollView
         android:id="@+id/settingsPanel"
+        android:fillViewport="true"
+        android:layout_width="match_parent"
+        android:layout_height="260dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_settings_panel"
+        android:visibility="gone">
+      <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
-        android:background="@drawable/bg_settings_panel"
         android:orientation="vertical"
-        android:padding="12dp"
-        android:visibility="gone">
+        android:padding="18dp">
+
+        <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="阅读设置" android:textColor="@color/label_text_emphasis" android:textSize="17sp" android:textStyle="bold" android:layout_marginBottom="16dp" />
 
         <!--
             2026-08-26 用户反馈"标签不够醒目，标签和滑杆用不同颜色，参照游戏图"——
@@ -214,7 +220,7 @@
             android:id="@+id/lineSpacingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="40dp"
+            android:layout_marginTop="20dp"
             android:textSize="15sp"
             android:textStyle="bold"
             android:textColor="@color/label_text_emphasis" />
@@ -226,14 +232,14 @@
             android:min="0"
             android:max="10"
             android:progress="2"
-            android:progressDrawable="@drawable/seekbar_track_thick_purple"
-            android:thumb="@drawable/seekbar_thumb_knob_purple" />
+            android:progressDrawable="@drawable/seekbar_track_thick"
+            android:thumb="@drawable/seekbar_thumb_knob" />
 
         <TextView
             android:id="@+id/paddingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="40dp"
+            android:layout_marginTop="20dp"
             android:textSize="15sp"
             android:textStyle="bold"
             android:textColor="@color/label_text_emphasis" />
@@ -245,14 +251,14 @@
             android:min="8"
             android:max="32"
             android:progress="16"
-            android:progressDrawable="@drawable/seekbar_track_thick_coral"
-            android:thumb="@drawable/seekbar_thumb_knob_coral" />
+            android:progressDrawable="@drawable/seekbar_track_thick"
+            android:thumb="@drawable/seekbar_thumb_knob" />
 
         <TextView
             android:id="@+id/blockSpacingLabel"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="40dp"
+            android:layout_marginTop="20dp"
             android:textSize="15sp"
             android:textStyle="bold"
             android:textColor="@color/label_text_emphasis" />
@@ -264,8 +270,8 @@
             android:min="0"
             android:max="32"
             android:progress="12"
-            android:progressDrawable="@drawable/seekbar_track_thick_teal"
-            android:thumb="@drawable/seekbar_thumb_knob_teal" />
+            android:progressDrawable="@drawable/seekbar_track_thick"
+            android:thumb="@drawable/seekbar_thumb_knob" />
 
         <!-- 2026-10-08 赞赏入口：放在设置面板最底下，平时随面板收起，不打扰阅读。 -->
         <Button
@@ -279,7 +285,8 @@
             android:text="@string/donate_entry"
             android:textSize="14sp" />
 
-    </LinearLayout>
+      </LinearLayout>
+    </ScrollView>
 
     <ProgressBar
         android:id="@+id/progressBar"

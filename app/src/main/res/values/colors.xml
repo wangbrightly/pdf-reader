@@ -20,11 +20,14 @@
         accent_line_spacing 现在是玫红不是紫色），懒得为了改名字重新过一遍所有
         引用，看到文件名别被误导。
     -->
-    <color name="button_primary_bg">#006786</color>
+    <color name="button_primary_bg">#276F65</color>
     <color name="button_primary_text">#FFFFFF</color>
 
     <!-- 2026-09-16 报纸正文方案的纸色背景，深色模式覆盖见 values-night/colors.xml。 -->
-    <color name="bg_paper">#F3F2F2</color>
+    <color name="bg_paper">#F8F7F3</color>
+    <color name="surface_soft">#F0F2ED</color>
+    <color name="surface_disabled">#E8EDE8</color>
+    <color name="track_unfilled">#D7E0DA</color>
 
     <!--
         2026-08-26 用户参照一张游戏音量滑杆截图反馈"滑杆圆点太素，想要旋钮质感"——
@@ -43,7 +46,7 @@
         这个值在 values-night/colors.xml 里有一份反色覆盖（87% 不透明白）——
         这个 App 唯一需要按系统深色模式切换的颜色，完整背景见那份文件的 KDoc。
     -->
-    <color name="label_text_emphasis">#DE000000</color>
+    <color name="label_text_emphasis">#252E2B</color>
 
     <!--
         2026-08-26 用户反馈"拉杆横线颜色不同"——参照游戏截图，"游戏音量"是紫色、
@@ -56,9 +59,9 @@
         seekbar_thumb_knob_*.xml），不是本该避免的重复——是这个具体约束下最简单
         能用的办法。
     -->
-    <color name="accent_line_spacing">#AA0B56</color>
-    <color name="accent_padding">#38A6CF</color>
-    <color name="accent_block_spacing">#444141</color>
+    <color name="accent_line_spacing">#276F65</color>
+    <color name="accent_padding">#276F65</color>
+    <color name="accent_block_spacing">#276F65</color>
 
     <!--
         2026-09-16 批注高亮的底色。设计稿用的是 accent 200 档（#CBEEFF 浅蓝）——
